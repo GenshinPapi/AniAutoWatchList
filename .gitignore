@@ -1,0 +1,42 @@
+# Python / test artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+src/*.egg-info/
+build/
+dist/
+*.egg
+
+# Local virtual environments
+.venv/
+venv/
+env/
+
+# Local app data, exports, and backups
+*.sqlite
+*.sqlite3
+*.db
+*.bak
+watchlist.json
+watchlist.csv
+watchlist-*.json
+watchlist-*.csv
+watchlist-*.sqlite3
+
+# Editor / OS noise
+.vscode/
+.idea/
+*~
+.DS_Store
+
+# The bundled patched ani-cli script should be committed, but the upstream
+# clone metadata should not be. This avoids Git treating ani-cli/ as an
+# embedded repository when someone creates the upload repo.
+ani-cli/.git/
+ani-cli/.github/
+ani-cli/.assets/

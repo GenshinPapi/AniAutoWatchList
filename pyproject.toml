@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ani-watchlist"
+version = "0.1.0"
+description = "Local ani-cli watchlist, tracker, and desktop GUI"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "GPL-3.0-or-later"}
+authors = [{name = "ani-watchlist contributors"}]
+dependencies = ["Pillow>=10"]
+keywords = ["ani-cli", "anime", "watchlist", "sqlite", "tkinter"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Desktop Environment",
+    "Topic :: Utilities",
+]
+
+[project.optional-dependencies]
+gui = []
+test = ["pytest>=8"]
+
+[project.urls]
+Homepage = "https://github.com/GenshinPapi/AniAutoWatchList"
+Issues = "https://github.com/GenshinPapi/AniAutoWatchList/issues"
+
+[project.scripts]
+ani-watch = "ani_watchlist.cli:main"
+ani-watch-gui = "ani_watchlist.gui:main"
+ani-watch-hook = "ani_watchlist.hook:main"
+ani-watch-sync = "ani_watchlist.sync:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
