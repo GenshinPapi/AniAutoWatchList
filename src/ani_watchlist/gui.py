@@ -14,6 +14,7 @@ except Exception:  # pragma: no cover - optional GUI enhancement
 
 from .config import load_config
 from .db import initialize
+from .launcher import LaunchError, launch_episode
 from .metadata import refresh_metadata_for_anime, select_match
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
@@ -305,11 +306,14 @@ class WatchlistApp:
         self.status_box.bind("<<ComboboxSelected>>", lambda _event: self.save_status())
         self.anilist_label = tk.Label(info, text="", bg=COLORS["panel"], fg=COLORS["muted"], anchor="w")
         self.anilist_label.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 12))
+        self.launch_label = tk.Label(info, text="", bg=COLORS["panel"], fg=COLORS["muted"], anchor="w")
+        self.launch_label.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
 
         actions = tk.Frame(summary, bg=COLORS["bg"])
         actions.grid(row=1, column=1, sticky="ew", pady=(10, 0))
         for idx, (text, command, style) in enumerate(
             [
+                ("Continue", self.continue_selected_episode, "Accent.TButton"),
                 ("Mark Watched", lambda: self.mark_selected_episode(True), "Accent.TButton"),
                 ("Mark Unwatched", lambda: self.mark_selected_episode(False), "Dark.TButton"),
                 ("Add Episode", self.add_episode, "Dark.TButton"),
@@ -319,7 +323,13 @@ class WatchlistApp:
                 ("Delete", self.delete_selected, "Dark.TButton"),
             ]
         ):
-            ttk.Button(actions, text=text, style=style, command=command).grid(row=0, column=idx, padx=(0, 8), pady=4)
+            ttk.Button(actions, text=text, style=style, command=command).grid(
+                row=idx // 4,
+                column=idx % 4,
+                padx=(0, 8),
+                pady=4,
+                sticky="w",
+            )
 
         notes_box = tk.Frame(summary, bg=COLORS["bg"])
         notes_box.grid(row=2, column=1, sticky="ew", pady=(8, 0))
@@ -447,6 +457,8 @@ class WatchlistApp:
     def open_detail(self, anime_id: int) -> None:
         self.selected_anime_id = anime_id
         self.show_alt_title.set(False)
+        if hasattr(self, "launch_label"):
+            self.launch_label.configure(text="", fg=COLORS["muted"])
         self.current_page = "detail"
         self.library_page.grid_forget()
         self.detail_page.grid(row=0, column=0, sticky="nsew")
@@ -630,6 +642,8 @@ class WatchlistApp:
         self.progress_label.configure(text=f"Progress: {watched}/{available}/{total}")
         self.last_label.configure(text=f"Last watched: {local_time(anime['last_watched_at'])}")
         self.anilist_label.configure(text=f"AniList ID: {anime['anilist_id'] or '-'}")
+        if not self.launch_label.cget("text"):
+            self.launch_label.configure(text="Select an episode, then Continue to open ani-cli.")
         if self.safe_focus_get() is not self.notes:
             self.notes.delete("1.0", tk.END)
             self.notes.insert("1.0", anime["notes"] or "")
@@ -729,6 +743,30 @@ class WatchlistApp:
             return
         mark_episode(self.conn, self.selected_anime_id, episode, not bool(current["watched"]))
         self.load_detail()
+
+    def continue_selected_episode(self) -> None:
+        if self.selected_anime_id is None:
+            return
+        anime = get_anime_by_id(self.conn, self.selected_anime_id)
+        if anime is None:
+            return
+        episode = self.selected_episode_key()
+        if not episode:
+            messagebox.showinfo("Episode required", "Select an episode first.")
+            return
+        title = anime["source_title"] or anime["display_title"]
+        try:
+            result = launch_episode(title, episode)
+        except LaunchError as exc:
+            self.launch_label.configure(text=f"Launch failed: {exc}", fg=COLORS["danger"])
+            messagebox.showwarning("ani-cli launch failed", str(exc))
+            return
+        title_for_message, _alt_title = split_display_title(anime["display_title"])
+        target = "terminal" if result.used_terminal else "background process"
+        self.launch_label.configure(
+            text=f"Opened {title_for_message} episode {episode} in {target}.",
+            fg=COLORS["muted"],
+        )
 
     def reorder_selected(self, direction: int) -> None:
         if self.selected_anime_id is None:
@@ -857,6 +895,11 @@ def main(argv: list[str] | None = None) -> int:
                 messagebox.showinfo = lambda *args, **kwargs: None
                 messagebox.showwarning = lambda *args, **kwargs: None
                 globals()["refresh_metadata_for_anime"] = lambda *args, **kwargs: []
+                globals()["launch_episode"] = lambda *args, **kwargs: type(
+                    "SmokeLaunchResult",
+                    (),
+                    {"used_terminal": True},
+                )()
                 app.detail_status.set(STATUS_LABELS["completed"])
                 app.save_status()
                 app.notes.delete("1.0", tk.END)
@@ -865,6 +908,7 @@ def main(argv: list[str] | None = None) -> int:
                 children = app.episode_tree.get_children()
                 if children:
                     app.episode_tree.selection_set(children[0])
+                    app.continue_selected_episode()
                     app.mark_selected_episode(True)
                     app.mark_selected_episode(False)
                 app.refresh_metadata()

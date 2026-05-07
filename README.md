@@ -14,6 +14,7 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 - Dark Tkinter desktop GUI
 - Status tabs: Watching, Completed, Dropped, On Hold, Plan to Watch
 - Episode watched/unwatched tracking
+- Continue button in the GUI for launching a selected episode through ani-cli
 - AniList metadata search and cover caching
 - English-first display titles when metadata is available
 - Notes per anime
@@ -83,6 +84,8 @@ ani-watch gui
 The GUI does not need to be open for tracking to work.
 
 By default, an episode is marked watched when the player exits successfully. Playback failures are recorded but do not mark episodes watched.
+
+In the GUI detail page, select an episode and click **Continue** to open ani-cli for that title and episode. This uses the existing ani-cli command and does not add a new playback provider.
 
 To open the GUI automatically for a single ani-cli run:
 
@@ -178,6 +181,7 @@ The GUI includes:
 - Search/filter box
 - Anime detail page
 - Episode checklist
+- Continue selected episode through ani-cli
 - Notes editor
 - Metadata refresh
 - AniList match selection
