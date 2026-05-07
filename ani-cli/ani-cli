@@ -90,6 +90,7 @@ ani_watch_run_foreground() {
 }
 
 ani_watch_run_detached() {
+    # shellcheck disable=SC2016
     nohup sh -c '
         ani_watch_title=$1
         ani_watch_episode=$2
