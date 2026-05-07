@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover - optional GUI enhancement
 
 from .config import load_config
 from .db import initialize
-from .launcher import LaunchError, launch_episode
+from .launcher import LaunchError, choose_ani_cli_search_title, launch_episode
 from .metadata import refresh_metadata_for_anime, select_match
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
@@ -754,7 +754,7 @@ class WatchlistApp:
         if not episode:
             messagebox.showinfo("Episode required", "Select an episode first.")
             return
-        title = anime["source_title"] or anime["display_title"]
+        title = choose_ani_cli_search_title(anime["display_title"], anime["source_title"])
         try:
             result = launch_episode(title, episode)
         except LaunchError as exc:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -21,6 +22,9 @@ TERMINAL_CANDIDATES: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 LAUNCH_WRAPPER = r"""
 printf 'Launching ani-cli from ani-watchlist...\n\n'
+printf 'Command:'
+printf ' %q' "$@"
+printf '\n\n'
 "$@"
 code=$?
 if [ "$code" -ne 0 ]; then
@@ -30,6 +34,9 @@ if [ "$code" -ne 0 ]; then
 fi
 exit "$code"
 """.strip()
+
+EPISODE_COUNT_SUFFIX_RE = re.compile(r"\s*\(\s*\d+(?:\.\d+)?\s+episodes?\s*\)\s*$", re.IGNORECASE)
+SHORT_SOURCE_SUFFIX_RE = re.compile(r"\s*\((?=[A-Za-z0-9_-]{1,8}\))(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\)\s*$")
 
 
 @dataclass(frozen=True)
@@ -53,6 +60,25 @@ def resolve_ani_cli() -> str:
     raise LaunchError("ani-cli was not found on PATH or at ~/.local/bin/ani-cli")
 
 
+def clean_ani_cli_search_title(title: str) -> str:
+    cleaned = title.strip()
+    if not cleaned:
+        return cleaned
+    had_episode_count = bool(EPISODE_COUNT_SUFFIX_RE.search(cleaned))
+    cleaned = EPISODE_COUNT_SUFFIX_RE.sub("", cleaned).strip()
+    if had_episode_count:
+        cleaned = SHORT_SOURCE_SUFFIX_RE.sub("", cleaned).strip()
+    return cleaned or title.strip()
+
+
+def choose_ani_cli_search_title(display_title: str, source_title: str | None = None) -> str:
+    source = clean_ani_cli_search_title(source_title or "")
+    display = clean_ani_cli_search_title(display_title)
+    if source:
+        return source
+    return display
+
+
 def build_ani_cli_command(title: str, episode: str, ani_cli: str | None = None) -> list[str]:
     cleaned_title = title.strip()
     cleaned_episode = str(episode).strip()
@@ -60,7 +86,15 @@ def build_ani_cli_command(title: str, episode: str, ani_cli: str | None = None) 
         raise LaunchError("anime title is empty")
     if not cleaned_episode:
         raise LaunchError("episode is empty")
-    return [ani_cli or resolve_ani_cli(), "--no-detach", "--episode", cleaned_episode, cleaned_title]
+    return [
+        ani_cli or resolve_ani_cli(),
+        "--no-detach",
+        "--select-nth",
+        "1",
+        "--episode",
+        cleaned_episode,
+        cleaned_title,
+    ]
 
 
 def terminal_args_for(terminal_name: str, terminal_path: str) -> tuple[str, ...]:

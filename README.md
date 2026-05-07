@@ -85,7 +85,7 @@ The GUI does not need to be open for tracking to work.
 
 By default, an episode is marked watched when the player exits successfully. Playback failures are recorded but do not mark episodes watched.
 
-In the GUI detail page, select an episode and click **Continue** to open ani-cli for that title and episode. This uses the existing ani-cli command and does not add a new playback provider.
+In the GUI detail page, select an episode and click **Continue** to open ani-cli for that title and episode. Continue cleans ani-cli's stored title labels, selects the first ani-cli search result, and uses the existing ani-cli command without adding a new playback provider.
 
 To open the GUI automatically for a single ani-cli run:
 

@@ -6,7 +6,29 @@ from ani_watchlist import launcher
 def test_build_ani_cli_command_uses_episode_option() -> None:
     command = launcher.build_ani_cli_command("Frieren", "12", ani_cli="/home/me/.local/bin/ani-cli")
 
-    assert command == ["/home/me/.local/bin/ani-cli", "--no-detach", "--episode", "12", "Frieren"]
+    assert command == [
+        "/home/me/.local/bin/ani-cli",
+        "--no-detach",
+        "--select-nth",
+        "1",
+        "--episode",
+        "12",
+        "Frieren",
+    ]
+
+
+def test_clean_ani_cli_search_title_removes_episode_count_and_source_id() -> None:
+    assert launcher.clean_ani_cli_search_title("One Piece (1P) (1161 episodes)") == "One Piece"
+
+
+def test_clean_ani_cli_search_title_preserves_meaningful_year_suffix() -> None:
+    assert launcher.clean_ani_cli_search_title("Fruits Basket (2019) (25 episodes)") == "Fruits Basket (2019)"
+
+
+def test_choose_search_title_prefers_cleaned_source_title() -> None:
+    title = launcher.choose_ani_cli_search_title("ONE PIECE", "One Piece (1P) (1161 episodes)")
+
+    assert title == "One Piece"
 
 
 def test_terminal_args_use_x_terminal_compatible_e_flag() -> None:
@@ -26,7 +48,7 @@ def test_terminal_command_uses_shell_wrapper(monkeypatch) -> None:
     monkeypatch.setattr(launcher.shutil, "which", fake_which)
 
     command, used_terminal = launcher.build_terminal_command(
-        ["/home/me/.local/bin/ani-cli", "--no-detach", "--episode", "1", "Test"]
+        ["/home/me/.local/bin/ani-cli", "--no-detach", "--select-nth", "1", "--episode", "1", "Test"]
     )
 
     assert used_terminal is True
@@ -35,6 +57,8 @@ def test_terminal_command_uses_shell_wrapper(monkeypatch) -> None:
         "ani-watch-launch",
         "/home/me/.local/bin/ani-cli",
         "--no-detach",
+        "--select-nth",
+        "1",
         "--episode",
         "1",
         "Test",
@@ -69,6 +93,8 @@ def test_launch_episode_resolves_ani_cli_and_does_not_block(monkeypatch) -> None
         "ani-watch-launch",
         "/home/me/.local/bin/ani-cli",
         "--no-detach",
+        "--select-nth",
+        "1",
         "--episode",
         "1090",
         "One Piece",
