@@ -16,7 +16,7 @@ def _cover_url(payload: dict[str, Any]) -> str | None:
     return cover.get("extraLarge") or cover.get("large") or cover.get("medium")
 
 
-def _display_title(payload: dict[str, Any]) -> str | None:
+def _display_title(payload: dict[str, Any], current_title: str | None = None) -> str | None:
     title = payload.get("title") or {}
     english = (title.get("english") or "").strip()
     romaji = (title.get("romaji") or "").strip()
@@ -24,7 +24,11 @@ def _display_title(payload: dict[str, Any]) -> str | None:
     native = (title.get("native") or "").strip()
     if english and romaji and english.casefold() != romaji.casefold():
         return f"{english} ({romaji})"
-    return english or preferred or romaji or native or None
+    if english:
+        return english
+    if current_title and current_title != "Unknown title":
+        return None
+    return preferred or romaji or native or None
 
 
 def _display_title_exact_match(match: MetadataSearchResult, title: str) -> bool:
@@ -122,12 +126,13 @@ def apply_selected_metadata(
     payload: dict[str, Any],
     cover_path: str | None = None,
 ) -> None:
+    anime = get_anime_by_id(conn, anime_id)
     fields: dict[str, Any] = {
         "anilist_id": int(provider_media_id),
         "total_episodes": payload.get("episodes"),
         "cover_url": _cover_url(payload),
     }
-    title = _display_title(payload)
+    title = _display_title(payload, anime["display_title"] if anime is not None else None)
     if title:
         fields["display_title"] = title
     if cover_path:

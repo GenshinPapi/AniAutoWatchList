@@ -102,3 +102,22 @@ def test_exact_display_title_can_autolink_when_other_matches_are_close(app_env):
 
     stored = conn.execute("SELECT * FROM anime WHERE id = ?", (anime["id"],)).fetchone()
     assert stored["anilist_id"] == 21
+
+
+def test_metadata_without_english_title_preserves_current_display_title(app_env):
+    conn = initialize()
+    anime, _ = get_or_create_anime(conn, "Spare Me, Great Lord! (Da Wang Rao Ming)")
+    result = MetadataSearchResult(
+        "anilist",
+        "120220",
+        "Dawang Raoming",
+        1.0,
+        payload(120220, "Dawang Raoming", 12) | {"title": {"romaji": "Dawang Raoming", "userPreferred": "Dawang Raoming"}},
+    )
+    config = AppConfig(metadata=MetadataConfig(search_on_new_title=True), anilist=AniListConfig(enabled=True))
+
+    search_and_store_matches(conn, anime["id"], "Spare Me, Great Lord! (Da Wang Rao Ming)", config, FakeProvider([result]))
+
+    stored = conn.execute("SELECT * FROM anime WHERE id = ?", (anime["id"],)).fetchone()
+    assert stored["display_title"] == "Spare Me, Great Lord! (Da Wang Rao Ming)"
+    assert stored["anilist_id"] == 120220
