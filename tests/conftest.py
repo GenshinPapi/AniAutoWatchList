@@ -14,7 +14,7 @@ def app_env(tmp_path, monkeypatch):
     cfg = cfg_dir / "config.toml"
     cfg.write_text(
         """[tracking]
-mark_watched_after_seconds = 120
+mark_watched_after_seconds = 0
 
 [metadata]
 search_on_new_title = false

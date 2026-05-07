@@ -82,6 +82,8 @@ ani-watch gui
 
 The GUI does not need to be open for tracking to work.
 
+By default, an episode is marked watched when the player exits successfully. Playback failures are recorded but do not mark episodes watched.
+
 To open the GUI automatically for a single ani-cli run:
 
 ```sh
@@ -161,9 +163,11 @@ ani-watch merge "Title A" "Title B" --yes
 ani-watch repair
 ani-watch repair --yes
 ani-watch config get tracking.mark_watched_after_seconds
-ani-watch config set tracking.mark_watched_after_seconds 180
+ani-watch config set tracking.mark_watched_after_seconds 120
 ani-watch install-desktop-entry
 ```
+
+`tracking.mark_watched_after_seconds` defaults to `0`, which means any successful player exit marks the episode watched. Set it higher if you want a minimum watch time.
 
 ## GUI
 

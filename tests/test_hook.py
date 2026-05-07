@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ani_watchlist.config import set_config_value
 from ani_watchlist.db import initialize
 from ani_watchlist.hook import run
 from ani_watchlist.store import episodes_for_anime, get_anime
@@ -14,7 +15,7 @@ def test_hook_parses_episode_list(app_env):
     assert [row["episode_key"] for row in episodes_for_anime(conn, anime["id"])] == ["1", "2"]
 
 
-def test_hook_short_success_does_not_mark_watched(app_env):
+def test_hook_success_marks_watched_without_duration_threshold(app_env):
     run(["playback-started", "--title", "Test Show", "--episode", "1"])
     run(
         [
@@ -33,6 +34,31 @@ def test_hook_short_success_does_not_mark_watched(app_env):
     anime = get_anime(conn, "Test Show")
     episode = episodes_for_anime(conn, anime["id"])[0]
     assert episode["first_started_at"] is not None
+    assert episode["watched"] == 1
+    assert episode["watched_at"] is not None
+
+
+def test_configured_threshold_can_leave_short_playback_unwatched(app_env):
+    set_config_value("tracking.mark_watched_after_seconds", "120")
+
+    run(["playback-started", "--title", "Test Show", "--episode", "1"])
+    run(
+        [
+            "playback-finished",
+            "--title",
+            "Test Show",
+            "--episode",
+            "1",
+            "--exit-code",
+            "0",
+            "--duration-seconds",
+            "10",
+        ]
+    )
+
+    conn = initialize()
+    anime = get_anime(conn, "Test Show")
+    episode = episodes_for_anime(conn, anime["id"])[0]
     assert episode["watched"] == 0
 
 

@@ -13,7 +13,7 @@ from .paths import get_paths
 
 
 DEFAULT_CONFIG_TEXT = """[tracking]
-mark_watched_after_seconds = 120
+mark_watched_after_seconds = 0
 
 [metadata]
 search_on_new_title = true
@@ -28,7 +28,7 @@ timeout_seconds = 8
 
 @dataclass(frozen=True)
 class TrackingConfig:
-    mark_watched_after_seconds: int = 120
+    mark_watched_after_seconds: int = 0
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     anilist = raw.get("anilist", {})
     return AppConfig(
         tracking=TrackingConfig(
-            mark_watched_after_seconds=int(tracking.get("mark_watched_after_seconds", 120)),
+            mark_watched_after_seconds=int(tracking.get("mark_watched_after_seconds", 0)),
         ),
         metadata=MetadataConfig(
             search_on_new_title=bool(metadata.get("search_on_new_title", True)),

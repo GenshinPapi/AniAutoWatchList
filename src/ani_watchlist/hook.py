@@ -111,7 +111,8 @@ def _handle_playback_finished(args: argparse.Namespace) -> None:
     with initialize() as conn:
         anime, created = get_or_create_anime(conn, args.title, args.source_title or args.title)
         episode, _ = get_or_create_episode(conn, anime["id"], args.episode)
-        should_mark = exit_code == 0 and duration >= config.tracking.mark_watched_after_seconds
+        threshold = max(0, config.tracking.mark_watched_after_seconds)
+        should_mark = exit_code == 0 and duration >= threshold
         if should_mark:
             episode = mark_episode(conn, anime["id"], args.episode, watched=True)
         record_event(
