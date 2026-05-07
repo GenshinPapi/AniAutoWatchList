@@ -60,3 +60,15 @@ def test_source_title_still_matches_after_english_metadata_rename(app_env):
 
     assert created is False
     assert found["id"] == anime["id"]
+
+
+def test_display_title_update_does_not_fail_on_existing_canonical(app_env):
+    conn = initialize()
+    anime, _ = get_or_create_anime(conn, "Spare Me, Great Lord! (Da Wang Rao Ming)")
+    existing, _ = get_or_create_anime(conn, "Dawang Raoming")
+
+    updated = update_anime_fields(conn, anime["id"], display_title="Dawang Raoming")
+
+    assert updated["display_title"] == "Dawang Raoming"
+    assert updated["canonical_title"] == "spare me great lord da wang rao ming"
+    assert existing["canonical_title"] == "dawang raoming"

@@ -16,6 +16,7 @@ from .config import load_config
 from .db import initialize
 from .metadata import refresh_metadata_for_anime, select_match
 from .providers.anilist import AniListProvider
+from .timefmt import local_time
 from .store import (
     STATUSES,
     clean_display_title,
@@ -550,7 +551,7 @@ class WatchlistApp:
         progress.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 0))
         last = tk.Label(
             card,
-            text=(row["last_watched_at"] or "Not watched")[:10],
+            text=local_time(row["last_watched_at"], date_only=True) if row["last_watched_at"] else "Not watched",
             bg=COLORS["panel"],
             fg=COLORS["muted"],
             anchor="w",
@@ -587,7 +588,7 @@ class WatchlistApp:
         self.activity_list.delete(0, tk.END)
         for event in watch_events(self.conn, recent=12):
             title, _alt_title = split_display_title(event["anime_title"] or "-")
-            self.activity_list.insert(tk.END, f"{event['created_at'][:16]}  {event['event_type']}  {title}")
+            self.activity_list.insert(tk.END, f"{local_time(event['created_at'])}  {event['event_type']}  {title}")
 
     def selected_episode_key(self) -> str | None:
         selection = self.episode_tree.selection()
@@ -627,7 +628,7 @@ class WatchlistApp:
         available = anime["available_episode_count"] if anime["available_episode_count"] is not None else len(episodes) or "?"
         total = anime["total_episodes"] if anime["total_episodes"] is not None else "?"
         self.progress_label.configure(text=f"Progress: {watched}/{available}/{total}")
-        self.last_label.configure(text=f"Last watched: {anime['last_watched_at'] or '-'}")
+        self.last_label.configure(text=f"Last watched: {local_time(anime['last_watched_at'])}")
         self.anilist_label.configure(text=f"AniList ID: {anime['anilist_id'] or '-'}")
         if self.safe_focus_get() is not self.notes:
             self.notes.delete("1.0", tk.END)
@@ -642,8 +643,8 @@ class WatchlistApp:
                 values=(
                     WATCHED_ICON if episode["watched"] else UNWATCHED_ICON,
                     episode["episode_key"],
-                    episode["last_started_at"] or "-",
-                    episode["watched_at"] or "-",
+                    local_time(episode["last_started_at"]),
+                    local_time(episode["watched_at"]),
                 ),
             )
         if selected_episode and self.episode_tree.exists(selected_episode):

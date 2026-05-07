@@ -77,3 +77,28 @@ def test_metadata_display_title_prefers_english_with_romaji(app_env):
 
     stored = conn.execute("SELECT * FROM anime WHERE id = ?", (anime["id"],)).fetchone()
     assert stored["display_title"] == "Wistoria: Wand and Sword (Tsue to Tsurugi no Wistoria)"
+
+
+def test_exact_display_title_can_autolink_when_other_matches_are_close(app_env):
+    conn = initialize()
+    anime, _ = get_or_create_anime(conn, "One Piece (1P)")
+    exact = MetadataSearchResult(
+        "anilist",
+        "21",
+        "ONE PIECE",
+        1.0,
+        payload(21, "ONE PIECE", None) | {"title": {"english": "ONE PIECE", "romaji": "ONE PIECE"}},
+    )
+    special = MetadataSearchResult(
+        "anilist",
+        "19123",
+        "One Piece: Episode of Merry",
+        1.0,
+        payload(19123, "One Piece: Episode of Merry", 1),
+    )
+    config = AppConfig(metadata=MetadataConfig(search_on_new_title=True), anilist=AniListConfig(enabled=True))
+
+    search_and_store_matches(conn, anime["id"], "One Piece (1P)", config, FakeProvider([exact, special]))
+
+    stored = conn.execute("SELECT * FROM anime WHERE id = ?", (anime["id"],)).fetchone()
+    assert stored["anilist_id"] == 21

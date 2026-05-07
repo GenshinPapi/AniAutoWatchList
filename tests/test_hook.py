@@ -34,3 +34,27 @@ def test_hook_short_success_does_not_mark_watched(app_env):
     episode = episodes_for_anime(conn, anime["id"])[0]
     assert episode["first_started_at"] is not None
     assert episode["watched"] == 0
+
+
+def test_playback_finished_does_not_replace_started_timestamp(app_env):
+    run(["playback-started", "--title", "Test Show", "--episode", "1"])
+    conn = initialize()
+    anime = get_anime(conn, "Test Show")
+    before = episodes_for_anime(conn, anime["id"])[0]["last_started_at"]
+
+    run(
+        [
+            "playback-finished",
+            "--title",
+            "Test Show",
+            "--episode",
+            "1",
+            "--exit-code",
+            "0",
+            "--duration-seconds",
+            "10",
+        ]
+    )
+
+    episode = episodes_for_anime(conn, anime["id"])[0]
+    assert episode["last_started_at"] == before

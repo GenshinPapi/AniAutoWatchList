@@ -12,7 +12,9 @@ from ani_watchlist.store import (
     get_or_create_anime,
     likely_duplicates,
     merge_anime,
+    repair_database,
     upsert_episodes,
+    update_anime_fields,
 )
 
 
@@ -117,3 +119,20 @@ def test_import_history_adds_watching_entry(app_env, tmp_path):
     assert len(episodes) == 12
     assert episodes[0]["episode_key"] == "1"
     assert episodes[0]["watched"] == 1
+
+
+def test_repair_restores_started_timestamps_from_events(app_env):
+    run(["playback-started", "--title", "Repair Show", "--episode", "1"])
+    conn = initialize()
+    anime = get_anime(conn, "Repair Show")
+    episode = episodes_for_anime(conn, anime["id"])[0]
+    event_started = episode["last_started_at"]
+    update_anime_fields(conn, anime["id"], notes="keep")
+    conn.execute("UPDATE episodes SET first_started_at = ?, last_started_at = ? WHERE id = ?", ("2099-01-01T00:00:00+00:00", "2099-01-01T00:00:00+00:00", episode["id"]))
+
+    report = repair_database(conn, fix=True)
+
+    fixed = episodes_for_anime(conn, anime["id"])[0]
+    assert report["started_timestamps_differ_from_events"] == 1
+    assert fixed["first_started_at"] == event_started
+    assert fixed["last_started_at"] == event_started

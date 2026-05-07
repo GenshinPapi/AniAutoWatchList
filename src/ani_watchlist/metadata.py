@@ -6,9 +6,9 @@ from typing import Any
 
 from .config import AppConfig
 from .paths import get_paths
-from .providers.anilist import AniListProvider
+from .providers.anilist import AniListProvider, search_title_variants
 from .providers.base import MetadataSearchResult
-from .store import get_anime_by_id, now_iso, update_anime_fields
+from .store import canonicalize_title, get_anime_by_id, now_iso, update_anime_fields
 
 
 def _cover_url(payload: dict[str, Any]) -> str | None:
@@ -25,6 +25,12 @@ def _display_title(payload: dict[str, Any]) -> str | None:
     if english and romaji and english.casefold() != romaji.casefold():
         return f"{english} ({romaji})"
     return english or preferred or romaji or native or None
+
+
+def _display_title_exact_match(match: MetadataSearchResult, title: str) -> bool:
+    display_title = _display_title(match.payload) or match.title
+    display_canonical = canonicalize_title(display_title)
+    return any(display_canonical == canonicalize_title(variant) for variant in search_title_variants(title))
 
 
 def placeholder_cover_path() -> str:
@@ -48,12 +54,32 @@ def placeholder_cover_path() -> str:
     return str(dest)
 
 
-def _has_selected_match(conn: sqlite3.Connection, anime_id: int, provider: str = "anilist") -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM metadata_matches WHERE anime_id = ? AND provider = ? AND selected = 1 LIMIT 1",
+def _selected_match(conn: sqlite3.Connection, anime_id: int, provider: str = "anilist") -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT * FROM metadata_matches
+        WHERE anime_id = ? AND provider = ? AND selected = 1
+        ORDER BY confidence_score DESC, id
+        LIMIT 1
+        """,
         (anime_id, provider),
     ).fetchone()
-    return row is not None
+
+
+def _apply_selected_match(
+    conn: sqlite3.Connection,
+    anime_id: int,
+    row: sqlite3.Row,
+    provider: AniListProvider,
+) -> None:
+    payload = json.loads(row["payload_json"])
+    cover_path = None
+    if _cover_url(payload):
+        try:
+            cover_path = provider.cache_cover(row["provider_media_id"], _cover_url(payload))
+        except Exception:
+            cover_path = placeholder_cover_path()
+    apply_selected_metadata(conn, anime_id, row["provider_media_id"], payload, cover_path)
 
 
 def store_matches(conn: sqlite3.Connection, anime_id: int, matches: list[MetadataSearchResult]) -> None:
@@ -127,12 +153,17 @@ def search_and_store_matches(
     anime = get_anime_by_id(conn, anime_id)
     if anime is None:
         return matches
-    if anime["anilist_id"] or _has_selected_match(conn, anime_id):
+    if anime["anilist_id"]:
+        return matches
+    selected = _selected_match(conn, anime_id)
+    if selected is not None:
+        _apply_selected_match(conn, anime_id, selected, provider)
         return matches
 
     best = matches[0]
     close = [match for match in matches if best.confidence_score - match.confidence_score < 0.03]
-    if best.confidence_score >= config.metadata.auto_link_confidence and len(close) == 1:
+    exact_display_match = _display_title_exact_match(best, title)
+    if best.confidence_score >= config.metadata.auto_link_confidence and (len(close) == 1 or exact_display_match):
         cover_path = None
         try:
             cover_path = provider.cache_cover(best.media_id, _cover_url(best.payload)) if _cover_url(best.payload) else None

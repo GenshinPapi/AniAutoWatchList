@@ -13,6 +13,7 @@ from .metadata import search_and_store_matches
 from .paths import get_paths
 from .store import (
     get_or_create_anime,
+    get_or_create_episode,
     mark_episode,
     mark_started,
     record_event,
@@ -109,7 +110,7 @@ def _handle_playback_finished(args: argparse.Namespace) -> None:
     event_type = "playback_finished" if exit_code == 0 else "playback_failed"
     with initialize() as conn:
         anime, created = get_or_create_anime(conn, args.title, args.source_title or args.title)
-        episode = mark_started(conn, anime["id"], args.episode)
+        episode, _ = get_or_create_episode(conn, anime["id"], args.episode)
         should_mark = exit_code == 0 and duration >= config.tracking.mark_watched_after_seconds
         if should_mark:
             episode = mark_episode(conn, anime["id"], args.episode, watched=True)

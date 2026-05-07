@@ -56,9 +56,43 @@ def episode_title(value: Any) -> str | None:
 
 def get_anime(conn: sqlite3.Connection, title: str) -> sqlite3.Row | None:
     canonical = canonicalize_title(title)
+    clean_title = clean_display_title(title)
     return conn.execute(
-        "SELECT * FROM anime WHERE canonical_title = ? OR source_title = ? OR display_title = ? ORDER BY id LIMIT 1",
-        (canonical, title, title),
+        """
+        SELECT * FROM anime
+        WHERE canonical_title = ?
+            OR source_title IN (?, ?)
+            OR source_title LIKE ?
+            OR display_title IN (?, ?)
+            OR canonical_title LIKE ?
+        ORDER BY
+            CASE
+                WHEN canonical_title = ? THEN 0
+                WHEN source_title IN (?, ?) THEN 1
+                WHEN source_title LIKE ? THEN 2
+                WHEN display_title IN (?, ?) THEN 3
+                WHEN canonical_title LIKE ? THEN 4
+                ELSE 5
+            END,
+            id
+        LIMIT 1
+        """,
+        (
+            canonical,
+            title,
+            clean_title,
+            f"{clean_title} (%",
+            title,
+            clean_title,
+            f"{canonical} %",
+            canonical,
+            title,
+            clean_title,
+            f"{clean_title} (%",
+            title,
+            clean_title,
+            f"{canonical} %",
+        ),
     ).fetchone()
 
 
@@ -124,7 +158,13 @@ def update_anime_fields(conn: sqlite3.Connection, anime_id: int, **fields: Any) 
     }
     updates = {key: value for key, value in fields.items() if key in allowed}
     if "display_title" in updates:
-        updates["canonical_title"] = canonicalize_title(str(updates["display_title"]))
+        canonical = canonicalize_title(str(updates["display_title"]))
+        existing = conn.execute(
+            "SELECT id FROM anime WHERE canonical_title = ? AND id != ?",
+            (canonical, anime_id),
+        ).fetchone()
+        if existing is None:
+            updates["canonical_title"] = canonical
     if not updates:
         row = get_anime_by_id(conn, anime_id)
         if row is None:
@@ -655,6 +695,27 @@ def repair_database(conn: sqlite3.Connection, fix: bool = False) -> dict[str, An
         for row in conn.execute("SELECT * FROM anime WHERE cover_path IS NOT NULL")
         if not Path(row["cover_path"]).expanduser().exists()
     ]
+    started_from_events = list(
+        conn.execute(
+            """
+            SELECT
+                episodes.id AS episode_id,
+                episodes.first_started_at,
+                episodes.last_started_at,
+                MIN(watch_events.created_at) AS first_event_started_at,
+                MAX(watch_events.created_at) AS last_event_started_at
+            FROM episodes
+            JOIN watch_events ON watch_events.episode_id = episodes.id
+            WHERE watch_events.event_type = 'playback_started'
+            GROUP BY episodes.id
+            HAVING
+                episodes.first_started_at IS NULL
+                OR episodes.last_started_at IS NULL
+                OR episodes.first_started_at != first_event_started_at
+                OR episodes.last_started_at != last_event_started_at
+            """
+        )
+    )
     report.update(
         {
             "orphaned_episodes": len(orphaned),
@@ -662,6 +723,7 @@ def repair_database(conn: sqlite3.Connection, fix: bool = False) -> dict[str, An
             "watched_missing_watched_at": len(missing_watched_at),
             "started_missing_first_started_at": len(missing_started_at),
             "broken_cover_paths": len(broken_covers),
+            "started_timestamps_differ_from_events": len(started_from_events),
         }
     )
     if fix:
@@ -682,6 +744,17 @@ def repair_database(conn: sqlite3.Connection, fix: bool = False) -> dict[str, An
             conn.execute(
                 "UPDATE episodes SET first_started_at = last_started_at WHERE last_started_at IS NOT NULL AND first_started_at IS NULL"
             )
+            for row in started_from_events:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET first_started_at = ?,
+                        last_started_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (row["first_event_started_at"], row["last_event_started_at"], ts, row["episode_id"]),
+                )
             for row in broken_covers:
                 conn.execute("UPDATE anime SET cover_path = NULL, updated_at = ? WHERE id = ?", (ts, row["id"]))
         report["fixed"] = True

@@ -56,6 +56,26 @@ def _norm(text: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def search_title_variants(title: str) -> list[str]:
+    title = re.sub(r"\s*\(\s*\d+(?:\.\d+)?\s+episodes?\s*\)\s*$", "", title.strip(), flags=re.I)
+    title = re.sub(r"\s+", " ", title)
+    variants: list[str] = []
+
+    def add(value: str | None) -> None:
+        value = re.sub(r"\s+", " ", (value or "").strip())
+        if value and value.casefold() not in {item.casefold() for item in variants}:
+            variants.append(value)
+
+    add(title)
+    if title.endswith(")") and " (" in title:
+        primary, secondary = title.rsplit(" (", 1)
+        add(primary)
+        add(secondary[:-1])
+    without_parenthetical = re.sub(r"\s*\([^)]*\)", "", title).strip()
+    add(without_parenthetical)
+    return variants[:4]
+
+
 def _best_title(payload: dict[str, Any]) -> str:
     title = payload.get("title") or {}
     english = (title.get("english") or "").strip()
@@ -122,19 +142,25 @@ class AniListProvider:
         return payload.get("data") or {}
 
     def search_title(self, title: str) -> list[MetadataSearchResult]:
-        data = self._request(SEARCH_QUERY, {"search": title})
-        media = ((data.get("Page") or {}).get("media")) or []
-        results = []
-        for item in media:
-            results.append(
-                MetadataSearchResult(
+        results_by_id: dict[str, MetadataSearchResult] = {}
+        variants = search_title_variants(title)
+        for variant in variants:
+            data = self._request(SEARCH_QUERY, {"search": variant})
+            media = ((data.get("Page") or {}).get("media")) or []
+            for item in media:
+                media_id = str(item["id"])
+                score = max(confidence(query, item) for query in variants)
+                result = MetadataSearchResult(
                     provider=self.name,
-                    media_id=str(item["id"]),
+                    media_id=media_id,
                     title=_best_title(item),
-                    confidence_score=confidence(title, item),
+                    confidence_score=score,
                     payload=item,
                 )
-            )
+                existing = results_by_id.get(media_id)
+                if existing is None or result.confidence_score > existing.confidence_score:
+                    results_by_id[media_id] = result
+        results = list(results_by_id.values())
         return sorted(results, key=lambda item: item.confidence_score, reverse=True)
 
     def get_media(self, media_id: str) -> dict[str, Any]:

@@ -17,6 +17,7 @@ from .doctor import run_doctor
 from .metadata import refresh_metadata_for_anime, search_and_store_matches, select_match, set_anilist_id
 from .paths import get_paths
 from .providers.anilist import AniListProvider
+from .timefmt import local_time
 from .store import (
     STATUSES,
     backup_database,
@@ -86,7 +87,7 @@ def _print_grouped_anime(rows) -> None:
         print(
             _table(
                 ["Title", "Progress", "Last Watched"],
-                [[row["display_title"], _progress(row), row["last_watched_at"] or "-"] for row in items],
+                [[row["display_title"], _progress(row), local_time(row["last_watched_at"])] for row in items],
             )
         )
         print()
@@ -119,7 +120,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         print(f"AniList ID: {anime['anilist_id'] or '-'}")
         print(f"Total Episodes: {anime['total_episodes'] or '?'}")
         print(f"Available Episodes: {anime['available_episode_count'] or '?'}")
-        print(f"Last Watched: {anime['last_watched_at'] or '-'}")
+        print(f"Last Watched: {local_time(anime['last_watched_at'])}")
         print(f"Cover: {anime['cover_path'] or anime['cover_url'] or '-'}")
         print(f"Notes: {anime['notes'] or ''}")
         episodes = episodes_for_anime(conn, anime["id"])
@@ -133,8 +134,8 @@ def cmd_show(args: argparse.Namespace) -> int:
                             "yes" if episode["watched"] else "no",
                             episode["episode_key"],
                             episode["title"] or "",
-                            episode["last_started_at"] or "-",
-                            episode["watched_at"] or "-",
+                            local_time(episode["last_started_at"]),
+                            local_time(episode["watched_at"]),
                         ]
                         for episode in episodes
                     ],
@@ -194,7 +195,7 @@ def cmd_dashboard(args: argparse.Namespace) -> int:
         if recent:
             print()
             print("Recently Watched")
-            print(_table(["Title", "Last Watched"], [[row["display_title"], row["last_watched_at"]] for row in recent]))
+            print(_table(["Title", "Last Watched"], [[row["display_title"], local_time(row["last_watched_at"])] for row in recent]))
         watching = list_anime(conn, status="watching")
         next_rows = []
         for anime in watching:
@@ -226,7 +227,7 @@ def cmd_continue(args: argparse.Namespace) -> int:
         rows = []
         for anime in recently_watched_anime(conn, limit=args.limit):
             episode = next_unwatched_episode(conn, anime["id"])
-            rows.append([anime["display_title"], anime["last_watched_at"], episode["episode_key"] if episode else "-"])
+            rows.append([anime["display_title"], local_time(anime["last_watched_at"]), episode["episode_key"] if episode else "-"])
         print(_table(["Title", "Last Watched", "Next Episode"], rows) if rows else "No recently watched anime.")
     return 0
 
@@ -268,9 +269,12 @@ def cmd_merge(args: argparse.Namespace) -> int:
 def cmd_metadata_search(args: argparse.Namespace) -> int:
     config = load_config()
     with initialize() as conn:
-        anime, _ = get_or_create_anime(conn, args.title)
         try:
-            matches = search_and_store_matches(conn, anime["id"], args.title, config)
+            anime = get_anime(conn, args.title)
+            if anime is None:
+                matches = AniListProvider(config.anilist).search_title(args.title)
+            else:
+                matches = search_and_store_matches(conn, anime["id"], args.title, config)
         except Exception as exc:
             print(f"metadata search failed: {exc}", file=sys.stderr)
             return 1
@@ -327,7 +331,7 @@ def cmd_events(args: argparse.Namespace) -> int:
             payload = json.loads(event["payload_json"])
             rows.append(
                 [
-                    event["created_at"],
+                    local_time(event["created_at"]),
                     event["event_type"],
                     event["anime_title"] or "-",
                     event["episode_key"] or payload.get("episode", "-"),
