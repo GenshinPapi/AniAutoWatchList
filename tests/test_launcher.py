@@ -9,8 +9,12 @@ def test_build_ani_cli_command_uses_episode_option() -> None:
     assert command == ["/home/me/.local/bin/ani-cli", "--no-detach", "--episode", "12", "Frieren"]
 
 
-def test_terminal_args_detect_gnome_terminal_wrapper() -> None:
-    assert launcher.terminal_args_for("x-terminal-emulator", "/usr/bin/gnome-terminal.wrapper") == ("--",)
+def test_terminal_args_use_x_terminal_compatible_e_flag() -> None:
+    assert launcher.terminal_args_for("x-terminal-emulator", "/usr/bin/gnome-terminal.wrapper") == ("-e",)
+
+
+def test_terminal_args_detect_direct_gnome_terminal() -> None:
+    assert launcher.terminal_args_for("gnome-terminal", "/usr/bin/gnome-terminal") == ("--",)
 
 
 def test_terminal_command_uses_shell_wrapper(monkeypatch) -> None:
@@ -26,7 +30,7 @@ def test_terminal_command_uses_shell_wrapper(monkeypatch) -> None:
     )
 
     assert used_terminal is True
-    assert command[:5] == ["/usr/bin/gnome-terminal.wrapper", "--", "bash", "-lc", launcher.LAUNCH_WRAPPER]
+    assert command[:5] == ["/usr/bin/gnome-terminal.wrapper", "-e", "bash", "-lc", launcher.LAUNCH_WRAPPER]
     assert command[5:] == [
         "ani-watch-launch",
         "/home/me/.local/bin/ani-cli",

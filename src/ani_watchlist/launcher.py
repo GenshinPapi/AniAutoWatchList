@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 TERMINAL_CANDIDATES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("x-terminal-emulator", ()),
+    ("x-terminal-emulator", ("-e",)),
     ("gnome-terminal", ()),
     ("mate-terminal", ("-x",)),
     ("xfce4-terminal", ("-x",)),
@@ -70,6 +70,8 @@ def terminal_args_for(terminal_name: str, terminal_path: str) -> tuple[str, ...]
     except OSError:
         pass
     joined = " ".join(sorted(names))
+    if "x-terminal-emulator" in joined:
+        return ("-e",)
     if "gnome-terminal" in joined:
         return ("--",)
     if "kitty" in joined:
