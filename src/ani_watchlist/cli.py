@@ -13,6 +13,7 @@ from typing import Any
 
 from .config import get_config_value, load_config, set_config_value
 from .db import initialize
+from .discovery import load_discovery, refresh_discovery
 from .doctor import run_doctor
 from .metadata import refresh_metadata_for_anime, search_and_store_matches, select_match, set_anilist_id
 from .paths import get_paths
@@ -229,6 +230,65 @@ def cmd_continue(args: argparse.Namespace) -> int:
             episode = next_unwatched_episode(conn, anime["id"])
             rows.append([anime["display_title"], local_time(anime["last_watched_at"]), episode["episode_key"] if episode else "-"])
         print(_table(["Title", "Last Watched", "Next Episode"], rows) if rows else "No recently watched anime.")
+    return 0
+
+
+def cmd_discover_trending(args: argparse.Namespace) -> int:
+    with initialize() as conn:
+        if args.refresh:
+            refresh_discovery(conn, load_config(), force=True)
+        data = load_discovery(conn)["trending"]
+    items = list(data.get("items") or [])[: args.limit]
+    if data.get("error"):
+        print(f"warning: {data['error']}", file=sys.stderr)
+    if not items:
+        print("No trending data cached. Re-run with --refresh or open the GUI.")
+        return 0
+    print(
+        _table(
+            ["Title", "Score", "Trending", "Status", "Next"],
+            [
+                [
+                    item.get("display_title") or "-",
+                    item.get("average_score") or "-",
+                    item.get("trending") or "-",
+                    item.get("status") or "-",
+                    (item.get("next_airing_episode") or {}).get("episode") or "-",
+                ]
+                for item in items
+            ],
+        )
+    )
+    print(f"Last updated: {local_time(data.get('fetched_at'))}")
+    return 0
+
+
+def cmd_schedule(args: argparse.Namespace) -> int:
+    with initialize() as conn:
+        if args.refresh:
+            refresh_discovery(conn, load_config(), force=True)
+        data = load_discovery(conn)["schedule"]
+    items = list(data.get("items") or [])
+    if data.get("error"):
+        print(f"warning: {data['error']}", file=sys.stderr)
+    if not items:
+        print("No schedule data cached. Re-run with --refresh or open the GUI.")
+        return 0
+    print(
+        _table(
+            ["Day", "Time", "Episode", "Title"],
+            [
+                [
+                    item.get("local_day") or "-",
+                    item.get("local_time") or "-",
+                    item.get("episode") or "-",
+                    ((item.get("media") or {}).get("display_title") if isinstance(item.get("media"), dict) else "-"),
+                ]
+                for item in items
+            ],
+        )
+    )
+    print(f"Last updated: {local_time(data.get('fetched_at'))}")
     return 0
 
 
@@ -604,6 +664,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("continue")
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=cmd_continue)
+
+    discover = sub.add_parser("discover")
+    discover_sub = discover.add_subparsers(dest="discover_command", required=True)
+    p = discover_sub.add_parser("trending")
+    p.add_argument("--refresh", action="store_true")
+    p.add_argument("--limit", type=int, default=20)
+    p.set_defaults(func=cmd_discover_trending)
+
+    p = sub.add_parser("schedule")
+    p.add_argument("--refresh", action="store_true")
+    p.set_defaults(func=cmd_schedule)
 
     sub.add_parser("duplicates").set_defaults(func=cmd_duplicates)
 

@@ -17,8 +17,8 @@ def test_migrations_create_required_tables(app_env):
         row["name"]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
-    assert current_version(conn) == 1
-    assert {"anime", "episodes", "watch_events", "metadata_matches"}.issubset(tables)
+    assert current_version(conn) == 2
+    assert {"anime", "episodes", "watch_events", "metadata_matches", "discovery_cache"}.issubset(tables)
 
 
 def test_add_anime_update_episode_list_and_mark_watched(app_env):

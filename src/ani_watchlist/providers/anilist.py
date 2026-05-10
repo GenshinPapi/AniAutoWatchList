@@ -50,6 +50,68 @@ query ($id: Int) {
 """
 
 
+TRENDING_QUERY = """
+query ($page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: TRENDING_DESC, isAdult: false) {
+      id
+      title { romaji english native userPreferred }
+      synonyms
+      episodes
+      status
+      format
+      isAdult
+      season
+      seasonYear
+      averageScore
+      popularity
+      trending
+      coverImage { extraLarge large medium color }
+      bannerImage
+      siteUrl
+      nextAiringEpisode { airingAt timeUntilAiring episode }
+    }
+  }
+}
+"""
+
+
+AIRING_SCHEDULE_QUERY = """
+query ($page: Int, $perPage: Int, $start: Int, $end: Int) {
+  Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage currentPage }
+    airingSchedules(
+      airingAt_greater: $start,
+      airingAt_lesser: $end,
+      sort: TIME
+    ) {
+      id
+      airingAt
+      timeUntilAiring
+      episode
+      mediaId
+      media {
+        id
+        title { romaji english native userPreferred }
+        synonyms
+        episodes
+        status
+        format
+        isAdult
+        averageScore
+        popularity
+        trending
+        coverImage { extraLarge large medium color }
+        bannerImage
+        siteUrl
+        nextAiringEpisode { airingAt timeUntilAiring episode }
+      }
+    }
+  }
+}
+"""
+
+
 def _norm(text: str) -> str:
     text = text.casefold()
     text = re.sub(r"[^0-9a-z]+", " ", text)
@@ -85,6 +147,10 @@ def _best_title(payload: dict[str, Any]) -> str:
     if english and romaji and english.casefold() != romaji.casefold():
         return f"{english} ({romaji})"
     return english or preferred or romaji or native or "Unknown title"
+
+
+def display_title_from_media(payload: dict[str, Any]) -> str:
+    return _best_title(payload)
 
 
 def _candidate_titles(payload: dict[str, Any]) -> list[str]:
@@ -186,10 +252,41 @@ class AniListProvider:
         links = self.get_external_links(media_id)
         return [link for link in links if str(link.get("type", "")).upper() == "STREAMING"]
 
+    def get_trending_anime(self, limit: int = 20) -> list[dict[str, Any]]:
+        per_page = max(1, min(int(limit), 50))
+        data = self._request(TRENDING_QUERY, {"page": 1, "perPage": per_page})
+        return list(((data.get("Page") or {}).get("media")) or [])[:limit]
+
+    def get_airing_schedule(
+        self,
+        start_timestamp: int,
+        end_timestamp: int,
+        *,
+        limit: int = 140,
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        page = 1
+        per_page = 50
+        max_pages = max(1, (int(limit) + per_page - 1) // per_page)
+        while page <= max_pages and len(items) < limit:
+            data = self._request(
+                AIRING_SCHEDULE_QUERY,
+                {"page": page, "perPage": per_page, "start": int(start_timestamp), "end": int(end_timestamp)},
+            )
+            page_data = data.get("Page") or {}
+            items.extend(list(page_data.get("airingSchedules") or []))
+            page_info = page_data.get("pageInfo") or {}
+            if not page_info.get("hasNextPage"):
+                break
+            page += 1
+        return items[:limit]
+
     def cache_cover(self, media_id: str, url: str) -> str:
         self.cover_dir.mkdir(parents=True, exist_ok=True)
         suffix = Path(urllib.parse.urlparse(url).path).suffix or ".jpg"
         dest = self.cover_dir / f"anilist-{media_id}{suffix}"
+        if dest.exists():
+            return str(dest)
         req = urllib.request.Request(url, headers={"User-Agent": "ani-watchlist/0.1"})
         with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as response:
             dest.write_bytes(response.read())
