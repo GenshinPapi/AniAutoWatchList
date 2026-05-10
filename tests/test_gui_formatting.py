@@ -2,7 +2,14 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from ani_watchlist.gui import UNWATCHED_ICON, WATCHED_ICON, scroll_units_from_mousewheel, split_display_title
+from ani_watchlist.gui import (
+    UNWATCHED_ICON,
+    WATCHED_ICON,
+    WATCHLIST_AUTO_REFRESH_MS,
+    discovery_title_preview,
+    scroll_units_from_mousewheel,
+    split_display_title,
+)
 
 
 def test_split_display_title_hides_alternate_title_by_default() -> None:
@@ -29,3 +36,19 @@ def test_scroll_units_support_common_mousewheel_events() -> None:
     assert scroll_units_from_mousewheel(SimpleNamespace(delta=1)) == -1
     assert scroll_units_from_mousewheel(SimpleNamespace(num=4)) == -1
     assert scroll_units_from_mousewheel(SimpleNamespace(num=5)) == 1
+
+
+def test_discovery_title_preview_preserves_start_of_long_titles() -> None:
+    preview = discovery_title_preview(
+        "This Is an Extremely Long Anime Title That Would Otherwise Overrun the Trending Card",
+        max_lines=2,
+        line_chars=22,
+    )
+
+    assert preview.startswith("This Is an Extremely")
+    assert preview.endswith("...")
+    assert len(preview.splitlines()) == 2
+
+
+def test_watchlist_auto_refresh_is_thirty_seconds() -> None:
+    assert WATCHLIST_AUTO_REFRESH_MS == 30_000

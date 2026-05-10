@@ -5,6 +5,7 @@ import json
 import threading
 import webbrowser
 from datetime import datetime, timedelta
+from textwrap import wrap
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
 
@@ -62,12 +63,15 @@ COLORS = {
 
 CARD_W = 178
 DISCOVERY_CARD_W = 190
-DISCOVERY_CARD_H = 356
+DISCOVERY_CARD_H = 376
 DISCOVERY_GRID_W = DISCOVERY_CARD_W + 16
+DISCOVERY_TITLE_LINES = 3
+DISCOVERY_TITLE_CHARS = 24
 COVER_W = 142
 COVER_H = 204
 DETAIL_COVER_W = 170
 DETAIL_COVER_H = 244
+WATCHLIST_AUTO_REFRESH_MS = 30_000
 WATCHED_ICON = "✅"
 UNWATCHED_ICON = "❌"
 
@@ -96,6 +100,19 @@ def scroll_units_from_mousewheel(event) -> int:
     return -steps if delta > 0 else steps
 
 
+def discovery_title_preview(title: str, *, max_lines: int = DISCOVERY_TITLE_LINES, line_chars: int = DISCOVERY_TITLE_CHARS) -> str:
+    title = " ".join(str(title).split())
+    if not title or max_lines <= 0:
+        return ""
+    line_chars = max(1, line_chars)
+    lines = wrap(title, width=line_chars, break_long_words=True, break_on_hyphens=True)
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    preview = lines[:max_lines]
+    preview[-1] = preview[-1][: max(0, line_chars - 3)].rstrip() + "..."
+    return "\n".join(preview)
+
+
 class WatchlistApp:
     def __init__(self, root: tk.Tk, *, auto_discovery: bool = True):
         self.root = root
@@ -104,7 +121,7 @@ class WatchlistApp:
         self.root.minsize(780, 540)
         self.root.configure(bg=COLORS["bg"])
         self.conn = initialize()
-        self.auto_refresh_ms = 3000
+        self.auto_refresh_ms = WATCHLIST_AUTO_REFRESH_MS
         self.auto_discovery_enabled = auto_discovery
         self.selected_status = tk.StringVar(value="watching")
         self.search_text = tk.StringVar()
@@ -601,8 +618,6 @@ class WatchlistApp:
         self._hide_pages()
         self.trending_page.grid(row=0, column=0, sticky="nsew")
         self.render_trending()
-        if self.auto_discovery_enabled:
-            self.start_discovery_refresh(force=False)
 
     def show_schedule(self) -> None:
         self.current_page = "schedule"
@@ -610,8 +625,6 @@ class WatchlistApp:
         self._hide_pages()
         self.schedule_page.grid(row=0, column=0, sticky="nsew")
         self.render_schedule()
-        if self.auto_discovery_enabled:
-            self.start_discovery_refresh(force=False)
 
     def open_detail(self, anime_id: int) -> None:
         self.selected_anime_id = anime_id
@@ -886,14 +899,14 @@ class WatchlistApp:
         cover.grid(row=0, column=0, pady=(10, 8))
         title = tk.Label(
             card,
-            text=title_text,
+            text=discovery_title_preview(title_text),
             bg=COLORS["panel"],
             fg=COLORS["text"],
             font=("", 10, "bold"),
-            wraplength=COVER_W,
-            height=2,
+            wraplength=COVER_W + 10,
+            height=DISCOVERY_TITLE_LINES,
             justify="left",
-            anchor="w",
+            anchor="nw",
         )
         title.grid(row=1, column=0, sticky="ew", padx=12)
         score = item.get("average_score") or "-"
