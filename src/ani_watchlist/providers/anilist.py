@@ -53,6 +53,7 @@ query ($id: Int) {
 TRENDING_QUERY = """
 query ($page: Int, $perPage: Int) {
   Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage currentPage }
     media(type: ANIME, sort: TRENDING_DESC, isAdult: false) {
       id
       title { romaji english native userPreferred }
@@ -79,6 +80,7 @@ query ($page: Int, $perPage: Int) {
 POPULAR_MEDIA_QUERY = """
 query ($page: Int, $perPage: Int) {
   Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage currentPage }
     media(type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
       id
       title { romaji english native userPreferred }
@@ -105,6 +107,7 @@ query ($page: Int, $perPage: Int) {
 TOP_AIRING_QUERY = """
 query ($page: Int, $perPage: Int) {
   Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage currentPage }
     media(type: ANIME, sort: POPULARITY_DESC, status: RELEASING, isAdult: false) {
       id
       title { romaji english native userPreferred }
@@ -304,20 +307,29 @@ class AniListProvider:
         links = self.get_external_links(media_id)
         return [link for link in links if str(link.get("type", "")).upper() == "STREAMING"]
 
-    def get_trending_anime(self, limit: int = 20) -> list[dict[str, Any]]:
+    def _get_media_list(self, query: str, limit: int) -> list[dict[str, Any]]:
         per_page = max(1, min(int(limit), 50))
-        data = self._request(TRENDING_QUERY, {"page": 1, "perPage": per_page})
-        return list(((data.get("Page") or {}).get("media")) or [])[:limit]
+        page = 1
+        items: list[dict[str, Any]] = []
+        max_pages = max(1, (int(limit) + per_page - 1) // per_page)
+        while page <= max_pages and len(items) < limit:
+            data = self._request(query, {"page": page, "perPage": per_page})
+            page_data = data.get("Page") or {}
+            items.extend(list(page_data.get("media") or []))
+            page_info = page_data.get("pageInfo") or {}
+            if not page_info or not page_info.get("hasNextPage"):
+                break
+            page += 1
+        return items[:limit]
+
+    def get_trending_anime(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self._get_media_list(TRENDING_QUERY, limit)
 
     def get_popular_anime(self, limit: int = 20) -> list[dict[str, Any]]:
-        per_page = max(1, min(int(limit), 50))
-        data = self._request(POPULAR_MEDIA_QUERY, {"page": 1, "perPage": per_page})
-        return list(((data.get("Page") or {}).get("media")) or [])[:limit]
+        return self._get_media_list(POPULAR_MEDIA_QUERY, limit)
 
     def get_top_airing_anime(self, limit: int = 20) -> list[dict[str, Any]]:
-        per_page = max(1, min(int(limit), 50))
-        data = self._request(TOP_AIRING_QUERY, {"page": 1, "perPage": per_page})
-        return list(((data.get("Page") or {}).get("media")) or [])[:limit]
+        return self._get_media_list(TOP_AIRING_QUERY, limit)
 
     def get_airing_schedule(
         self,

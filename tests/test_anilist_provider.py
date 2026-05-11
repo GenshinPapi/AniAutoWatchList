@@ -68,6 +68,27 @@ def test_popular_query_all_time_omits_status_filter(app_env) -> None:
     assert FakeAniListProvider().get_popular_anime(limit=1) == [{"id": 21}]
 
 
+def test_popular_query_pages_until_requested_limit(app_env) -> None:
+    calls = []
+
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            calls.append(variables)
+            page = variables["page"]
+            return {
+                "Page": {
+                    "pageInfo": {"hasNextPage": page == 1},
+                    "media": [{"id": page * 100 + idx} for idx in range(50)],
+                }
+            }
+
+    rows = FakeAniListProvider().get_popular_anime(limit=51)
+
+    assert calls == [{"page": 1, "perPage": 50}, {"page": 2, "perPage": 50}]
+    assert len(rows) == 51
+    assert rows[-1]["id"] == 200
+
+
 def test_airing_schedule_pages_until_limit(app_env) -> None:
     calls = []
 

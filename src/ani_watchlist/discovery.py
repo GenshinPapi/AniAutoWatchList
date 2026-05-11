@@ -12,10 +12,11 @@ from .store import now_iso
 
 TRENDING_CACHE_KEY = "anilist_trending_v1"
 TOP_AIRING_CACHE_KEY = "anilist_top_airing_v1"
-POPULAR_CACHE_KEY = "anilist_popular_v2"
+POPULAR_CACHE_KEY = "anilist_popular_v3"
 SCHEDULE_CACHE_KEY = "anilist_schedule_week_v1"
 DISCOVERY_CACHE_KEYS = (TRENDING_CACHE_KEY, TOP_AIRING_CACHE_KEY, POPULAR_CACHE_KEY, SCHEDULE_CACHE_KEY)
 EMPTY_MEDIA_LIST = {"items": [], "error": None, "fetched_at": None}
+POPULAR_MEDIA_LIMIT = 100
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -234,7 +235,7 @@ def refresh_popular(
     *,
     force: bool = False,
     provider: AniListProvider | None = None,
-    limit: int = 20,
+    limit: int = POPULAR_MEDIA_LIMIT,
 ) -> dict[str, Any]:
     return refresh_media_list(
         conn,

@@ -6,6 +6,8 @@ from ani_watchlist.gui import (
     UNWATCHED_ICON,
     WATCHED_ICON,
     WATCHLIST_AUTO_REFRESH_MS,
+    discovery_page_count,
+    discovery_page_items,
     discovery_title_preview,
     scroll_units_from_mousewheel,
     split_display_title,
@@ -52,3 +54,12 @@ def test_discovery_title_preview_preserves_start_of_long_titles() -> None:
 
 def test_watchlist_auto_refresh_is_thirty_seconds() -> None:
     assert WATCHLIST_AUTO_REFRESH_MS == 30_000
+
+
+def test_discovery_paging_splits_items_into_twenty_item_pages() -> None:
+    items = list(range(45))
+
+    assert discovery_page_count(len(items)) == 3
+    assert discovery_page_items(items, 0) == list(range(20))
+    assert discovery_page_items(items, 1) == list(range(20, 40))
+    assert discovery_page_items(items, 2) == list(range(40, 45))

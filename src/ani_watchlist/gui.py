@@ -67,6 +67,7 @@ DISCOVERY_CARD_H = 376
 DISCOVERY_GRID_W = DISCOVERY_CARD_W + 16
 DISCOVERY_TITLE_LINES = 3
 DISCOVERY_TITLE_CHARS = 24
+DISCOVERY_PAGE_SIZE = 20
 COVER_W = 142
 COVER_H = 204
 DETAIL_COVER_W = 170
@@ -131,6 +132,18 @@ def discovery_title_preview(title: str, *, max_lines: int = DISCOVERY_TITLE_LINE
     return "\n".join(preview)
 
 
+def discovery_page_count(item_count: int, *, page_size: int = DISCOVERY_PAGE_SIZE) -> int:
+    page_size = max(1, int(page_size))
+    return max(1, (max(0, int(item_count)) + page_size - 1) // page_size)
+
+
+def discovery_page_items(items: list[object], page_index: int, *, page_size: int = DISCOVERY_PAGE_SIZE) -> list[object]:
+    page_size = max(1, int(page_size))
+    page_index = max(0, int(page_index))
+    start = page_index * page_size
+    return items[start : start + page_size]
+
+
 class WatchlistApp:
     def __init__(self, root: tk.Tk, *, auto_discovery: bool = True):
         self.root = root
@@ -158,10 +171,14 @@ class WatchlistApp:
         self.grid_columns = 1
         self.discovery_pages: dict[str, tk.Frame] = {}
         self.discovery_status_labels: dict[str, tk.Label] = {}
+        self.discovery_page_labels: dict[str, tk.Label] = {}
+        self.discovery_prev_buttons: dict[str, ttk.Button] = {}
+        self.discovery_next_buttons: dict[str, ttk.Button] = {}
         self.discovery_canvases: dict[str, tk.Canvas] = {}
         self.discovery_frames: dict[str, tk.Frame] = {}
         self.discovery_windows: dict[str, int] = {}
         self.discovery_columns = {name: 1 for name in DISCOVERY_MEDIA_PAGES}
+        self.discovery_page_indexes = {name: 0 for name in DISCOVERY_MEDIA_PAGES}
         self._configure_style()
         self._build()
         self.show_trending()
@@ -384,11 +401,34 @@ class WatchlistApp:
         header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text=page_config["title"], style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="Refresh", style="Dark.TButton", command=lambda: self.start_discovery_refresh(force=True)).grid(
-            row=0, column=1, padx=(8, 0), sticky="e"
+        controls = tk.Frame(header, bg=COLORS["bg"])
+        controls.grid(row=0, column=1, sticky="e")
+        prev_button = ttk.Button(
+            controls,
+            text="Prev",
+            width=6,
+            style="Dark.TButton",
+            command=lambda value=page_name: self.change_discovery_page(value, -1),
         )
+        prev_button.grid(row=0, column=0, padx=(8, 0))
+        page_label = tk.Label(controls, text="", bg=COLORS["bg"], fg=COLORS["muted"], width=10, anchor="center")
+        page_label.grid(row=0, column=1, padx=(8, 0))
+        next_button = ttk.Button(
+            controls,
+            text="Next",
+            width=6,
+            style="Dark.TButton",
+            command=lambda value=page_name: self.change_discovery_page(value, 1),
+        )
+        next_button.grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(header, text="Refresh", style="Dark.TButton", command=lambda: self.start_discovery_refresh(force=True)).grid(
+            row=0, column=2, padx=(8, 0), sticky="e"
+        )
+        self.discovery_prev_buttons[page_name] = prev_button
+        self.discovery_page_labels[page_name] = page_label
+        self.discovery_next_buttons[page_name] = next_button
         status_label = tk.Label(header, text="", bg=COLORS["bg"], fg=COLORS["muted"], anchor="e")
-        status_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        status_label.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
         self.discovery_status_labels[page_name] = status_label
 
         body = tk.Frame(page, bg=COLORS["bg"])
@@ -663,6 +703,18 @@ class WatchlistApp:
     def show_popular(self) -> None:
         self.show_discovery_list("popular")
 
+    def change_discovery_page(self, page_name: str, direction: int) -> None:
+        items = list(((self.discovery_data.get(page_name) or {}).get("items")) or [])
+        page_count = discovery_page_count(len(items))
+        current = max(0, min(self.discovery_page_indexes.get(page_name, 0), page_count - 1))
+        next_page = max(0, min(current + direction, page_count - 1))
+        if next_page == current:
+            self.update_discovery_page_controls(page_name, len(items))
+            return
+        self.discovery_page_indexes[page_name] = next_page
+        self.render_discovery_list(page_name)
+        self.discovery_canvases[page_name].yview_moveto(0)
+
     def show_schedule(self) -> None:
         self.current_page = "schedule"
         self._set_active_nav("schedule")
@@ -914,6 +966,14 @@ class WatchlistApp:
     def render_trending(self) -> None:
         self.render_discovery_list("trending")
 
+    def update_discovery_page_controls(self, page_name: str, item_count: int) -> None:
+        page_count = discovery_page_count(item_count)
+        page_index = max(0, min(self.discovery_page_indexes.get(page_name, 0), page_count - 1))
+        self.discovery_page_indexes[page_name] = page_index
+        self.discovery_page_labels[page_name].configure(text=f"{page_index + 1}/{page_count}")
+        self.discovery_prev_buttons[page_name].configure(state="normal" if page_index > 0 else "disabled")
+        self.discovery_next_buttons[page_name].configure(state="normal" if page_index < page_count - 1 else "disabled")
+
     def render_discovery_list(self, page_name: str) -> None:
         self.update_discovery_status(refreshing=self.discovery_refreshing)
         frame = self.discovery_frames[page_name]
@@ -921,10 +981,14 @@ class WatchlistApp:
         for child in frame.winfo_children():
             child.destroy()
         items = list(((self.discovery_data.get(page_name) or {}).get("items")) or [])
+        page_count = discovery_page_count(len(items))
+        if self.discovery_page_indexes[page_name] >= page_count:
+            self.discovery_page_indexes[page_name] = page_count - 1
+        page_items = discovery_page_items(items, self.discovery_page_indexes[page_name])
         width = max(canvas.winfo_width(), DISCOVERY_GRID_W)
         columns = max(1, width // DISCOVERY_GRID_W)
         self.discovery_columns[page_name] = columns
-        for index, item in enumerate(items):
+        for index, item in enumerate(page_items):
             card = self.create_discovery_card(frame, item)
             card.grid(row=index // columns, column=index % columns, padx=8, pady=8, sticky="nw")
         if not items:
@@ -936,6 +1000,7 @@ class WatchlistApp:
                 font=("", 13),
             )
             empty.grid(row=0, column=0, sticky="w", padx=10, pady=20)
+        self.update_discovery_page_controls(page_name, len(items))
         self._update_discovery_scroll_region(page_name)
 
     def create_discovery_card(self, parent: tk.Frame, item: dict[str, object]) -> tk.Frame:
