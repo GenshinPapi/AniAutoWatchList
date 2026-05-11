@@ -75,6 +75,24 @@ WATCHLIST_AUTO_REFRESH_MS = 30_000
 WATCHED_ICON = "✅"
 UNWATCHED_ICON = "❌"
 
+DISCOVERY_MEDIA_PAGES = {
+    "trending": {
+        "nav": "Trending",
+        "title": "Trending",
+        "empty": "Trending data will appear here after AniList refreshes.",
+    },
+    "top_airing": {
+        "nav": "Top Airing",
+        "title": "Top Airing",
+        "empty": "Top airing anime will appear here after AniList refreshes.",
+    },
+    "popular": {
+        "nav": "Most Popular",
+        "title": "Most Popular",
+        "empty": "Most popular anime will appear here after AniList refreshes.",
+    },
+}
+
 
 def split_display_title(title: str) -> tuple[str, str | None]:
     title = clean_display_title(title)
@@ -138,7 +156,12 @@ class WatchlistApp:
         self.discovery_error: str | None = None
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
-        self.trending_columns = 1
+        self.discovery_pages: dict[str, tk.Frame] = {}
+        self.discovery_status_labels: dict[str, tk.Label] = {}
+        self.discovery_canvases: dict[str, tk.Canvas] = {}
+        self.discovery_frames: dict[str, tk.Frame] = {}
+        self.discovery_windows: dict[str, int] = {}
+        self.discovery_columns = {name: 1 for name in DISCOVERY_MEDIA_PAGES}
         self._configure_style()
         self._build()
         self.show_trending()
@@ -225,11 +248,13 @@ class WatchlistApp:
         self.root.rowconfigure(1, weight=1)
         self.nav_bar = tk.Frame(self.root, bg=COLORS["bg"])
         self.nav_bar.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 0))
-        self.nav_bar.columnconfigure(4, weight=1)
+        self.nav_bar.columnconfigure(5, weight=1)
         self.nav_buttons: dict[str, tk.Button] = {}
         for idx, (page, label, command) in enumerate(
             [
                 ("trending", "Trending", self.show_trending),
+                ("top_airing", "Top Airing", self.show_top_airing),
+                ("popular", "Most Popular", self.show_popular),
                 ("schedule", "Schedule", self.show_schedule),
                 ("library", "Watchlist", self.show_library),
             ]
@@ -254,11 +279,16 @@ class WatchlistApp:
         self.container.columnconfigure(0, weight=1)
         self.container.rowconfigure(0, weight=1)
         self.library_page = tk.Frame(self.container, bg=COLORS["bg"])
-        self.trending_page = tk.Frame(self.container, bg=COLORS["bg"])
+        for page_name in DISCOVERY_MEDIA_PAGES:
+            self.discovery_pages[page_name] = tk.Frame(self.container, bg=COLORS["bg"])
+        self.trending_page = self.discovery_pages["trending"]
+        self.top_airing_page = self.discovery_pages["top_airing"]
+        self.popular_page = self.discovery_pages["popular"]
         self.schedule_page = tk.Frame(self.container, bg=COLORS["bg"])
         self.detail_page = tk.Frame(self.container, bg=COLORS["bg"])
         self._build_library_page()
-        self._build_trending_page()
+        for page_name in DISCOVERY_MEDIA_PAGES:
+            self._build_discovery_page(page_name)
         self._build_schedule_page()
         self._build_detail_page()
         self._bind_mousewheel()
@@ -276,7 +306,7 @@ class WatchlistApp:
             )
 
     def _hide_pages(self) -> None:
-        for page in (self.library_page, self.trending_page, self.schedule_page, self.detail_page):
+        for page in (self.library_page, *self.discovery_pages.values(), self.schedule_page, self.detail_page):
             page.grid_forget()
 
     def _build_library_page(self) -> None:
@@ -344,34 +374,39 @@ class WatchlistApp:
         self.grid_frame.bind("<Configure>", self._update_grid_scroll_region)
         self.grid_canvas.bind("<Configure>", self._on_grid_resize)
 
-    def _build_trending_page(self) -> None:
-        page = self.trending_page
+    def _build_discovery_page(self, page_name: str) -> None:
+        page = self.discovery_pages[page_name]
+        page_config = DISCOVERY_MEDIA_PAGES[page_name]
         page.columnconfigure(0, weight=1)
         page.rowconfigure(2, weight=1)
 
         header = tk.Frame(page, bg=COLORS["bg"])
         header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text="Trending", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text=page_config["title"], style="Title.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Button(header, text="Refresh", style="Dark.TButton", command=lambda: self.start_discovery_refresh(force=True)).grid(
             row=0, column=1, padx=(8, 0), sticky="e"
         )
-        self.trending_status_label = tk.Label(header, text="", bg=COLORS["bg"], fg=COLORS["muted"], anchor="e")
-        self.trending_status_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        status_label = tk.Label(header, text="", bg=COLORS["bg"], fg=COLORS["muted"], anchor="e")
+        status_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.discovery_status_labels[page_name] = status_label
 
         body = tk.Frame(page, bg=COLORS["bg"])
         body.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 16))
         body.columnconfigure(0, weight=1)
         body.rowconfigure(0, weight=1)
-        self.trending_canvas = tk.Canvas(body, bg=COLORS["bg"], highlightthickness=0)
-        self.trending_canvas.grid(row=0, column=0, sticky="nsew")
-        self.trending_scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.trending_canvas.yview)
-        self.trending_scrollbar.grid(row=0, column=1, sticky="ns")
-        self.trending_canvas.configure(yscrollcommand=self.trending_scrollbar.set)
-        self.trending_frame = tk.Frame(self.trending_canvas, bg=COLORS["bg"])
-        self.trending_window = self.trending_canvas.create_window((0, 0), window=self.trending_frame, anchor="nw")
-        self.trending_frame.bind("<Configure>", self._update_trending_scroll_region)
-        self.trending_canvas.bind("<Configure>", self._on_trending_resize)
+        canvas = tk.Canvas(body, bg=COLORS["bg"], highlightthickness=0)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(body, orient="vertical", command=canvas.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scrollbar.set)
+        frame = tk.Frame(canvas, bg=COLORS["bg"])
+        window = canvas.create_window((0, 0), window=frame, anchor="nw")
+        frame.bind("<Configure>", lambda _event, value=page_name: self._update_discovery_scroll_region(value))
+        canvas.bind("<Configure>", lambda event, value=page_name: self._on_discovery_resize(value, event))
+        self.discovery_canvases[page_name] = canvas
+        self.discovery_frames[page_name] = frame
+        self.discovery_windows[page_name] = int(window)
 
     def _build_schedule_page(self) -> None:
         page = self.schedule_page
@@ -612,12 +647,21 @@ class WatchlistApp:
         self.library_page.grid(row=0, column=0, sticky="nsew")
         self.refresh_library()
 
-    def show_trending(self) -> None:
-        self.current_page = "trending"
-        self._set_active_nav("trending")
+    def show_discovery_list(self, page_name: str) -> None:
+        self.current_page = page_name
+        self._set_active_nav(page_name)
         self._hide_pages()
-        self.trending_page.grid(row=0, column=0, sticky="nsew")
-        self.render_trending()
+        self.discovery_pages[page_name].grid(row=0, column=0, sticky="nsew")
+        self.render_discovery_list(page_name)
+
+    def show_trending(self) -> None:
+        self.show_discovery_list("trending")
+
+    def show_top_airing(self) -> None:
+        self.show_discovery_list("top_airing")
+
+    def show_popular(self) -> None:
+        self.show_discovery_list("popular")
 
     def show_schedule(self) -> None:
         self.current_page = "schedule"
@@ -700,7 +744,7 @@ class WatchlistApp:
         card = tk.Frame(
             self.grid_frame,
             width=CARD_W - 16,
-            height=292,
+            height=326,
             bg=COLORS["panel"],
             highlightthickness=1,
             highlightbackground=COLORS["border"],
@@ -713,13 +757,14 @@ class WatchlistApp:
         cover.grid(row=0, column=0, pady=(10, 8))
         title = tk.Label(
             card,
-            text=primary_title,
+            text=discovery_title_preview(primary_title),
             bg=COLORS["panel"],
             fg=COLORS["text"],
             font=("", 10, "bold"),
-            wraplength=COVER_W,
+            wraplength=COVER_W + 10,
+            height=DISCOVERY_TITLE_LINES,
             justify="left",
-            anchor="w",
+            anchor="nw",
             cursor="hand2",
         )
         title.grid(row=1, column=0, sticky="ew", padx=12)
@@ -751,8 +796,10 @@ class WatchlistApp:
     def _update_grid_scroll_region(self, _event=None) -> None:
         self.grid_canvas.configure(scrollregion=self.grid_canvas.bbox("all"))
 
-    def _update_trending_scroll_region(self, _event=None) -> None:
-        self.trending_canvas.configure(scrollregion=self.trending_canvas.bbox("all"))
+    def _update_discovery_scroll_region(self, page_name: str, _event=None) -> None:
+        canvas = self.discovery_canvases.get(page_name)
+        if canvas is not None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
 
     def _update_schedule_scroll_region(self, _event=None) -> None:
         self.schedule_canvas.configure(scrollregion=self.schedule_canvas.bbox("all"))
@@ -763,11 +810,11 @@ class WatchlistApp:
         if columns != self.grid_columns:
             self.render_grid()
 
-    def _on_trending_resize(self, event) -> None:
-        self.trending_canvas.itemconfigure(self.trending_window, width=event.width)
+    def _on_discovery_resize(self, page_name: str, event) -> None:
+        self.discovery_canvases[page_name].itemconfigure(self.discovery_windows[page_name], width=event.width)
         columns = max(1, event.width // DISCOVERY_GRID_W)
-        if columns != self.trending_columns:
-            self.render_trending()
+        if columns != self.discovery_columns[page_name]:
+            self.render_discovery_list(page_name)
 
     def _on_schedule_resize(self, event) -> None:
         self.schedule_canvas.itemconfigure(self.schedule_window, width=event.width)
@@ -778,8 +825,8 @@ class WatchlistApp:
             return None
         if self.current_page == "library":
             self.grid_canvas.yview_scroll(scroll_units, "units")
-        elif self.current_page == "trending":
-            self.trending_canvas.yview_scroll(scroll_units, "units")
+        elif self.current_page in self.discovery_canvases:
+            self.discovery_canvases[self.current_page].yview_scroll(scroll_units, "units")
         elif self.current_page == "schedule":
             self.schedule_canvas.yview_scroll(scroll_units, "units")
         else:
@@ -803,7 +850,11 @@ class WatchlistApp:
     def start_discovery_refresh(self, *, force: bool = False) -> None:
         if self.discovery_refreshing:
             return
-        if not force and self.discovery_data.get("trending_fresh") and self.discovery_data.get("schedule_fresh"):
+        discovery_fresh = all(
+            self.discovery_data.get(f"{page_name}_fresh")
+            for page_name in (*DISCOVERY_MEDIA_PAGES.keys(), "schedule")
+        )
+        if not force and discovery_fresh:
             self.update_discovery_status()
             return
         self.discovery_refreshing = True
@@ -826,64 +877,72 @@ class WatchlistApp:
         self.discovery_error = error
         self.discovery_data = load_discovery(self.conn)
         self.update_discovery_status()
-        if self.current_page == "trending":
-            self.render_trending()
+        if self.current_page in DISCOVERY_MEDIA_PAGES:
+            self.render_discovery_list(self.current_page)
         elif self.current_page == "schedule":
             self.render_schedule()
 
     def update_discovery_status(self, *, refreshing: bool = False) -> None:
-        if not hasattr(self, "trending_status_label"):
+        if not self.discovery_status_labels or not hasattr(self, "schedule_status_label"):
             return
-        trending = self.discovery_data.get("trending") or {}
         schedule = self.discovery_data.get("schedule") or {}
         if refreshing:
             text = "Refreshing AniList discovery data..."
-            self.trending_status_label.configure(text=text, fg=COLORS["muted"])
+            for label in self.discovery_status_labels.values():
+                label.configure(text=text, fg=COLORS["muted"])
             self.schedule_status_label.configure(text=text, fg=COLORS["muted"])
             return
         if self.discovery_error:
             text = f"Refresh failed: {self.discovery_error}"
-            self.trending_status_label.configure(text=text, fg=COLORS["danger"])
+            for label in self.discovery_status_labels.values():
+                label.configure(text=text, fg=COLORS["danger"])
             self.schedule_status_label.configure(text=text, fg=COLORS["danger"])
             return
-        trending_error = trending.get("error")
+        for page_name, label in self.discovery_status_labels.items():
+            data = self.discovery_data.get(page_name) or {}
+            error = data.get("error")
+            label.configure(
+                text=f"Last updated: {local_time(data.get('fetched_at'))}" + (f"  |  {error}" if error else ""),
+                fg=COLORS["danger"] if error else COLORS["muted"],
+            )
         schedule_error = schedule.get("error")
-        self.trending_status_label.configure(
-            text=f"Last updated: {local_time(trending.get('fetched_at'))}" + (f"  |  {trending_error}" if trending_error else ""),
-            fg=COLORS["danger"] if trending_error else COLORS["muted"],
-        )
         self.schedule_status_label.configure(
             text=f"Last updated: {local_time(schedule.get('fetched_at'))}" + (f"  |  {schedule_error}" if schedule_error else ""),
             fg=COLORS["danger"] if schedule_error else COLORS["muted"],
         )
 
     def render_trending(self) -> None:
+        self.render_discovery_list("trending")
+
+    def render_discovery_list(self, page_name: str) -> None:
         self.update_discovery_status(refreshing=self.discovery_refreshing)
-        for child in self.trending_frame.winfo_children():
+        frame = self.discovery_frames[page_name]
+        canvas = self.discovery_canvases[page_name]
+        for child in frame.winfo_children():
             child.destroy()
-        items = list(((self.discovery_data.get("trending") or {}).get("items")) or [])
-        width = max(self.trending_canvas.winfo_width(), DISCOVERY_GRID_W)
+        items = list(((self.discovery_data.get(page_name) or {}).get("items")) or [])
+        width = max(canvas.winfo_width(), DISCOVERY_GRID_W)
         columns = max(1, width // DISCOVERY_GRID_W)
-        self.trending_columns = columns
+        self.discovery_columns[page_name] = columns
         for index, item in enumerate(items):
-            card = self.create_discovery_card(item)
+            card = self.create_discovery_card(frame, item)
             card.grid(row=index // columns, column=index % columns, padx=8, pady=8, sticky="nw")
         if not items:
             empty = tk.Label(
-                self.trending_frame,
-                text="Trending data will appear here after AniList refreshes.",
+                frame,
+                text=DISCOVERY_MEDIA_PAGES[page_name]["empty"],
                 bg=COLORS["bg"],
                 fg=COLORS["muted"],
                 font=("", 13),
             )
             empty.grid(row=0, column=0, sticky="w", padx=10, pady=20)
-        self._update_trending_scroll_region()
+        self._update_discovery_scroll_region(page_name)
 
-    def create_discovery_card(self, item: dict[str, object]) -> tk.Frame:
+    def create_discovery_card(self, parent: tk.Frame, item: dict[str, object]) -> tk.Frame:
         title_text, _alt_title = split_display_title(str(item.get("display_title") or "Unknown title"))
         media_id = int(item.get("id") or 0)
         card = tk.Frame(
-            self.trending_frame,
+            parent,
             width=DISCOVERY_CARD_W,
             height=DISCOVERY_CARD_H,
             bg=COLORS["panel"],
@@ -1025,10 +1084,12 @@ class WatchlistApp:
         if created:
             updates["status"] = "plan_to_watch"
         update_anime_fields(self.conn, anime["id"], **updates)
-        self.trending_status_label.configure(
-            text=f"{split_display_title(title)[0]} {'added to' if created else 'is already in'} your watchlist.",
-            fg=COLORS["muted"],
-        )
+        label = self.discovery_status_labels.get(self.current_page) or self.discovery_status_labels.get("trending")
+        if label is not None:
+            label.configure(
+                text=f"{split_display_title(title)[0]} {'added to' if created else 'is already in'} your watchlist.",
+                fg=COLORS["muted"],
+            )
 
     def open_discovery_link(self, item: dict[str, object]) -> None:
         url = item.get("site_url")

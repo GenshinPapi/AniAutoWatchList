@@ -46,6 +46,26 @@ def test_trending_query_returns_media_payloads(app_env) -> None:
     assert FakeAniListProvider().get_trending_anime(limit=2) == [{"id": 1}, {"id": 2}]
 
 
+def test_popular_query_can_filter_currently_airing(app_env) -> None:
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            assert "POPULARITY_DESC" in query
+            assert variables == {"page": 1, "perPage": 2, "status": "RELEASING"}
+            return {"Page": {"media": [{"id": 21}, {"id": 22}, {"id": 23}]}}
+
+    assert FakeAniListProvider().get_top_airing_anime(limit=2) == [{"id": 21}, {"id": 22}]
+
+
+def test_popular_query_all_time_has_no_status_filter(app_env) -> None:
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            assert "POPULARITY_DESC" in query
+            assert variables == {"page": 1, "perPage": 1, "status": None}
+            return {"Page": {"media": [{"id": 21}, {"id": 22}]}}
+
+    assert FakeAniListProvider().get_popular_anime(limit=1) == [{"id": 21}]
+
+
 def test_airing_schedule_pages_until_limit(app_env) -> None:
     calls = []
 

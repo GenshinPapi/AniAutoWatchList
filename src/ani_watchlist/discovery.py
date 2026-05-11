@@ -11,8 +11,11 @@ from .store import now_iso
 
 
 TRENDING_CACHE_KEY = "anilist_trending_v1"
+TOP_AIRING_CACHE_KEY = "anilist_top_airing_v1"
+POPULAR_CACHE_KEY = "anilist_popular_v1"
 SCHEDULE_CACHE_KEY = "anilist_schedule_week_v1"
-DISCOVERY_CACHE_KEYS = (TRENDING_CACHE_KEY, SCHEDULE_CACHE_KEY)
+DISCOVERY_CACHE_KEYS = (TRENDING_CACHE_KEY, TOP_AIRING_CACHE_KEY, POPULAR_CACHE_KEY, SCHEDULE_CACHE_KEY)
+EMPTY_MEDIA_LIST = {"items": [], "error": None, "fetched_at": None}
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -143,14 +146,48 @@ def set_cache(conn: sqlite3.Connection, cache_key: str, payload: dict[str, Any])
 
 
 def load_discovery(conn: sqlite3.Connection) -> dict[str, Any]:
-    trending = load_cache(conn, TRENDING_CACHE_KEY) or {"items": [], "error": None, "fetched_at": None}
-    schedule = load_cache(conn, SCHEDULE_CACHE_KEY) or {"items": [], "error": None, "fetched_at": None}
+    trending = load_cache(conn, TRENDING_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
+    top_airing = load_cache(conn, TOP_AIRING_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
+    popular = load_cache(conn, POPULAR_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
+    schedule = load_cache(conn, SCHEDULE_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
     return {
         "trending": trending,
+        "top_airing": top_airing,
+        "popular": popular,
         "schedule": schedule,
         "trending_fresh": cache_fetched_today(conn, TRENDING_CACHE_KEY),
+        "top_airing_fresh": cache_fetched_today(conn, TOP_AIRING_CACHE_KEY),
+        "popular_fresh": cache_fetched_today(conn, POPULAR_CACHE_KEY),
         "schedule_fresh": cache_fetched_today(conn, SCHEDULE_CACHE_KEY),
     }
+
+
+def refresh_media_list(
+    conn: sqlite3.Connection,
+    cache_key: str,
+    fetch_items,
+    config: AppConfig | None = None,
+    *,
+    force: bool = False,
+    provider: AniListProvider | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    config = config or load_config()
+    if not config.anilist.enabled:
+        payload = {"items": [], "error": "AniList metadata is disabled.", "fetched_at": now_iso()}
+        set_cache(conn, cache_key, payload)
+        return payload
+    if not force and cache_fetched_today(conn, cache_key):
+        return load_cache(conn, cache_key) or dict(EMPTY_MEDIA_LIST)
+    provider = provider or AniListProvider(config.anilist)
+    try:
+        items = [_normalize_media(item, provider) for item in fetch_items(provider, limit)]
+        payload = {"items": items, "error": None, "fetched_at": now_iso()}
+    except Exception as exc:
+        existing = load_cache(conn, cache_key) or {"items": [], "fetched_at": None}
+        payload = {**existing, "error": str(exc)}
+    set_cache(conn, cache_key, payload)
+    return payload
 
 
 def refresh_trending(
@@ -161,22 +198,53 @@ def refresh_trending(
     provider: AniListProvider | None = None,
     limit: int = 20,
 ) -> dict[str, Any]:
-    config = config or load_config()
-    if not config.anilist.enabled:
-        payload = {"items": [], "error": "AniList metadata is disabled.", "fetched_at": now_iso()}
-        set_cache(conn, TRENDING_CACHE_KEY, payload)
-        return payload
-    if not force and cache_fetched_today(conn, TRENDING_CACHE_KEY):
-        return load_cache(conn, TRENDING_CACHE_KEY) or {"items": [], "error": None, "fetched_at": None}
-    provider = provider or AniListProvider(config.anilist)
-    try:
-        items = [_normalize_media(item, provider) for item in provider.get_trending_anime(limit=limit)]
-        payload = {"items": items, "error": None, "fetched_at": now_iso()}
-    except Exception as exc:
-        existing = load_cache(conn, TRENDING_CACHE_KEY) or {"items": [], "fetched_at": None}
-        payload = {**existing, "error": str(exc)}
-    set_cache(conn, TRENDING_CACHE_KEY, payload)
-    return payload
+    return refresh_media_list(
+        conn,
+        TRENDING_CACHE_KEY,
+        lambda client, page_limit: client.get_trending_anime(limit=page_limit),
+        config,
+        force=force,
+        provider=provider,
+        limit=limit,
+    )
+
+
+def refresh_top_airing(
+    conn: sqlite3.Connection,
+    config: AppConfig | None = None,
+    *,
+    force: bool = False,
+    provider: AniListProvider | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    return refresh_media_list(
+        conn,
+        TOP_AIRING_CACHE_KEY,
+        lambda client, page_limit: client.get_top_airing_anime(limit=page_limit),
+        config,
+        force=force,
+        provider=provider,
+        limit=limit,
+    )
+
+
+def refresh_popular(
+    conn: sqlite3.Connection,
+    config: AppConfig | None = None,
+    *,
+    force: bool = False,
+    provider: AniListProvider | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    return refresh_media_list(
+        conn,
+        POPULAR_CACHE_KEY,
+        lambda client, page_limit: client.get_popular_anime(limit=page_limit),
+        config,
+        force=force,
+        provider=provider,
+        limit=limit,
+    )
 
 
 def refresh_schedule(
@@ -225,9 +293,12 @@ def refresh_discovery(
     config: AppConfig | None = None,
     *,
     force: bool = False,
+    provider: AniListProvider | None = None,
 ) -> dict[str, Any]:
     config = config or load_config()
-    provider = AniListProvider(config.anilist) if config.anilist.enabled else None
+    provider = provider or (AniListProvider(config.anilist) if config.anilist.enabled else None)
     trending = refresh_trending(conn, config, force=force, provider=provider)
+    top_airing = refresh_top_airing(conn, config, force=force, provider=provider)
+    popular = refresh_popular(conn, config, force=force, provider=provider)
     schedule = refresh_schedule(conn, config, force=force, provider=provider)
-    return {"trending": trending, "schedule": schedule}
+    return {"trending": trending, "top_airing": top_airing, "popular": popular, "schedule": schedule}

@@ -76,6 +76,32 @@ query ($page: Int, $perPage: Int) {
 """
 
 
+POPULAR_MEDIA_QUERY = """
+query ($page: Int, $perPage: Int, $status: MediaStatus) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: POPULARITY_DESC, status: $status, isAdult: false) {
+      id
+      title { romaji english native userPreferred }
+      synonyms
+      episodes
+      status
+      format
+      isAdult
+      season
+      seasonYear
+      averageScore
+      popularity
+      trending
+      coverImage { extraLarge large medium color }
+      bannerImage
+      siteUrl
+      nextAiringEpisode { airingAt timeUntilAiring episode }
+    }
+  }
+}
+"""
+
+
 AIRING_SCHEDULE_QUERY = """
 query ($page: Int, $perPage: Int, $start: Int, $end: Int) {
   Page(page: $page, perPage: $perPage) {
@@ -256,6 +282,14 @@ class AniListProvider:
         per_page = max(1, min(int(limit), 50))
         data = self._request(TRENDING_QUERY, {"page": 1, "perPage": per_page})
         return list(((data.get("Page") or {}).get("media")) or [])[:limit]
+
+    def get_popular_anime(self, limit: int = 20, *, status: str | None = None) -> list[dict[str, Any]]:
+        per_page = max(1, min(int(limit), 50))
+        data = self._request(POPULAR_MEDIA_QUERY, {"page": 1, "perPage": per_page, "status": status})
+        return list(((data.get("Page") or {}).get("media")) or [])[:limit]
+
+    def get_top_airing_anime(self, limit: int = 20) -> list[dict[str, Any]]:
+        return self.get_popular_anime(limit=limit, status="RELEASING")
 
     def get_airing_schedule(
         self,

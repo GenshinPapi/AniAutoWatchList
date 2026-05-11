@@ -12,7 +12,7 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 
 - Local SQLite watchlist
 - Dark Tkinter desktop GUI
-- Trending and release schedule tabs powered by AniList metadata
+- Trending, top airing, most popular, and release schedule tabs powered by AniList metadata
 - Status tabs: Watching, Completed, Dropped, On Hold, Plan to Watch
 - Episode watched/unwatched tracking
 - Continue button in the GUI for launching a selected episode through ani-cli
@@ -182,6 +182,8 @@ ani-watch install-desktop-entry
 The GUI includes:
 
 - Trending tab
+- Top Airing tab
+- Most Popular tab
 - 7-day release schedule tab
 - Status tabs
 - Cover grid
@@ -194,7 +196,7 @@ The GUI includes:
 - AniList match selection
 - Recent activity panel
 
-Trending and schedule data refresh from AniList at most once per local day on GUI startup, unless you press Refresh or use the CLI `--refresh` option.
+Discovery and schedule data refresh from AniList at most once per local day on GUI startup, unless you press Refresh or use the CLI `--refresh` option.
 
 ## How ani-cli Is Patched
 
