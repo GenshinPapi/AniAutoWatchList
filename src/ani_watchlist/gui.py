@@ -744,7 +744,7 @@ class WatchlistApp:
         card = tk.Frame(
             self.grid_frame,
             width=CARD_W - 16,
-            height=326,
+            height=348,
             bg=COLORS["panel"],
             highlightthickness=1,
             highlightbackground=COLORS["border"],
@@ -787,7 +787,7 @@ class WatchlistApp:
             anchor="w",
             cursor="hand2",
         )
-        last.grid(row=3, column=0, sticky="ew", padx=12)
+        last.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
         for widget in (card, cover, title, progress, last):
             widget.bind("<Button-1>", lambda _event, anime_id=row["id"]: self.open_detail(anime_id))
         self.card_widgets[int(row["id"])] = card

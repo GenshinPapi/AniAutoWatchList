@@ -43,13 +43,13 @@ class FakeDiscoveryProvider(AniListProvider):
             }
         ][:limit]
 
-    def get_popular_anime(self, limit: int = 20, *, status: str | None = None):  # noqa: ANN201
+    def get_popular_anime(self, limit: int = 20):  # noqa: ANN201
         return [
             {
                 **self.get_trending_anime(1)[0],
                 "id": 23,
                 "title": {"english": "Fullmetal Alchemist: Brotherhood", "romaji": "Hagane no Renkinjutsushi", "userPreferred": "Hagane no Renkinjutsushi"},
-                "status": status or "FINISHED",
+                "status": "FINISHED",
                 "popularity": 9999,
             }
         ][:limit]

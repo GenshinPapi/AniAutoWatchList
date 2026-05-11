@@ -12,7 +12,7 @@ from .store import now_iso
 
 TRENDING_CACHE_KEY = "anilist_trending_v1"
 TOP_AIRING_CACHE_KEY = "anilist_top_airing_v1"
-POPULAR_CACHE_KEY = "anilist_popular_v1"
+POPULAR_CACHE_KEY = "anilist_popular_v2"
 SCHEDULE_CACHE_KEY = "anilist_schedule_week_v1"
 DISCOVERY_CACHE_KEYS = (TRENDING_CACHE_KEY, TOP_AIRING_CACHE_KEY, POPULAR_CACHE_KEY, SCHEDULE_CACHE_KEY)
 EMPTY_MEDIA_LIST = {"items": [], "error": None, "fetched_at": None}

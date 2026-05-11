@@ -77,9 +77,35 @@ query ($page: Int, $perPage: Int) {
 
 
 POPULAR_MEDIA_QUERY = """
-query ($page: Int, $perPage: Int, $status: MediaStatus) {
+query ($page: Int, $perPage: Int) {
   Page(page: $page, perPage: $perPage) {
-    media(type: ANIME, sort: POPULARITY_DESC, status: $status, isAdult: false) {
+    media(type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
+      id
+      title { romaji english native userPreferred }
+      synonyms
+      episodes
+      status
+      format
+      isAdult
+      season
+      seasonYear
+      averageScore
+      popularity
+      trending
+      coverImage { extraLarge large medium color }
+      bannerImage
+      siteUrl
+      nextAiringEpisode { airingAt timeUntilAiring episode }
+    }
+  }
+}
+"""
+
+
+TOP_AIRING_QUERY = """
+query ($page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    media(type: ANIME, sort: POPULARITY_DESC, status: RELEASING, isAdult: false) {
       id
       title { romaji english native userPreferred }
       synonyms
@@ -283,13 +309,15 @@ class AniListProvider:
         data = self._request(TRENDING_QUERY, {"page": 1, "perPage": per_page})
         return list(((data.get("Page") or {}).get("media")) or [])[:limit]
 
-    def get_popular_anime(self, limit: int = 20, *, status: str | None = None) -> list[dict[str, Any]]:
+    def get_popular_anime(self, limit: int = 20) -> list[dict[str, Any]]:
         per_page = max(1, min(int(limit), 50))
-        data = self._request(POPULAR_MEDIA_QUERY, {"page": 1, "perPage": per_page, "status": status})
+        data = self._request(POPULAR_MEDIA_QUERY, {"page": 1, "perPage": per_page})
         return list(((data.get("Page") or {}).get("media")) or [])[:limit]
 
     def get_top_airing_anime(self, limit: int = 20) -> list[dict[str, Any]]:
-        return self.get_popular_anime(limit=limit, status="RELEASING")
+        per_page = max(1, min(int(limit), 50))
+        data = self._request(TOP_AIRING_QUERY, {"page": 1, "perPage": per_page})
+        return list(((data.get("Page") or {}).get("media")) or [])[:limit]
 
     def get_airing_schedule(
         self,
