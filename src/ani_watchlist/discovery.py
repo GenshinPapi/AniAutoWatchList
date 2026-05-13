@@ -10,10 +10,10 @@ from .providers.anilist import AniListProvider, display_title_from_media
 from .store import now_iso
 
 
-TRENDING_CACHE_KEY = "anilist_trending_v1"
-TOP_AIRING_CACHE_KEY = "anilist_top_airing_v1"
-POPULAR_CACHE_KEY = "anilist_popular_v3"
-SCHEDULE_CACHE_KEY = "anilist_schedule_week_v1"
+TRENDING_CACHE_KEY = "anilist_trending_v2"
+TOP_AIRING_CACHE_KEY = "anilist_top_airing_v2"
+POPULAR_CACHE_KEY = "anilist_popular_v4"
+SCHEDULE_CACHE_KEY = "anilist_schedule_week_v2"
 DISCOVERY_CACHE_KEYS = (TRENDING_CACHE_KEY, TOP_AIRING_CACHE_KEY, POPULAR_CACHE_KEY, SCHEDULE_CACHE_KEY)
 EMPTY_MEDIA_LIST = {"items": [], "error": None, "fetched_at": None}
 POPULAR_MEDIA_LIMIT = 100
@@ -278,7 +278,6 @@ def refresh_schedule(
         items = [
             _normalize_schedule_item(item, provider)
             for item in provider.get_airing_schedule(start, end, limit=limit)
-            if not ((item.get("media") or {}).get("isAdult"))
         ]
         items.sort(key=lambda item: (item.get("airing_at") or 0, str((item.get("media") or {}).get("display_title") or "")))
         payload = {"items": items, "error": None, "fetched_at": now_iso(), "start": start, "end": end, "days": days}

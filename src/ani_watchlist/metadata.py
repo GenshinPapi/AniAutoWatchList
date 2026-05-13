@@ -6,7 +6,7 @@ from typing import Any
 
 from .config import AppConfig
 from .paths import get_paths
-from .providers.anilist import AniListProvider, search_title_variants
+from .providers.anilist import AniListProvider, search_title_variants, title_with_content_labels
 from .providers.base import MetadataSearchResult
 from .store import canonicalize_title, get_anime_by_id, now_iso, update_anime_fields
 
@@ -23,12 +23,14 @@ def _display_title(payload: dict[str, Any], current_title: str | None = None) ->
     preferred = (title.get("userPreferred") or "").strip()
     native = (title.get("native") or "").strip()
     if english and romaji and english.casefold() != romaji.casefold():
-        return f"{english} ({romaji})"
+        return title_with_content_labels(f"{english} ({romaji})", payload)
     if english:
-        return english
+        return title_with_content_labels(english, payload)
     if current_title and current_title != "Unknown title":
-        return None
-    return preferred or romaji or native or None
+        labeled_current = title_with_content_labels(current_title, payload)
+        return labeled_current if labeled_current != current_title else None
+    fallback = preferred or romaji or native or None
+    return title_with_content_labels(fallback, payload) if fallback else None
 
 
 def _display_title_exact_match(match: MetadataSearchResult, title: str) -> bool:
