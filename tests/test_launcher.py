@@ -17,30 +17,6 @@ def test_build_ani_cli_command_uses_episode_option() -> None:
     ]
 
 
-def test_build_ani_cli_command_adds_dub_option() -> None:
-    command = launcher.build_ani_cli_command("Frieren", "12", ani_cli="/home/me/.local/bin/ani-cli", mode="dub")
-
-    assert command == [
-        "/home/me/.local/bin/ani-cli",
-        "--no-detach",
-        "--select-nth",
-        "1",
-        "--episode",
-        "12",
-        "--dub",
-        "Frieren",
-    ]
-
-
-def test_build_ani_cli_command_rejects_unknown_mode() -> None:
-    try:
-        launcher.build_ani_cli_command("Frieren", "12", ani_cli="/home/me/.local/bin/ani-cli", mode="raw")
-    except launcher.LaunchError as exc:
-        assert "unsupported playback mode" in str(exc)
-    else:
-        raise AssertionError("expected LaunchError")
-
-
 def test_clean_ani_cli_search_title_removes_episode_count_and_source_id() -> None:
     assert launcher.clean_ani_cli_search_title("One Piece (1P) (1161 episodes)") == "One Piece"
 
@@ -53,45 +29,6 @@ def test_choose_search_title_prefers_cleaned_source_title() -> None:
     title = launcher.choose_ani_cli_search_title("ONE PIECE", "One Piece (1P) (1161 episodes)")
 
     assert title == "One Piece"
-
-
-def test_allanime_episode_available_checks_first_matching_mode_result(monkeypatch) -> None:
-    calls: list[tuple[dict[str, object], str]] = []
-
-    def fake_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
-        calls.append((variables, query))
-        if query == launcher.ALLANIME_SEARCH_GQL:
-            return {
-                "data": {
-                    "shows": {
-                        "edges": [
-                            {"_id": "skip", "availableEpisodes": {"dub": 0}},
-                            {"_id": "show-id", "availableEpisodes": {"dub": 2}},
-                        ]
-                    }
-                }
-            }
-        return {"data": {"show": {"availableEpisodesDetail": {"dub": ["1", 2.0]}}}}
-
-    monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
-
-    assert launcher.allanime_episode_available("Love Flops", "2", mode="dub") is True
-    assert calls[0][0]["translationType"] == "dub"
-    assert calls[0][0]["search"] == {
-        "allowAdult": True,
-        "allowUnknown": True,
-        "query": "Love+Flops",
-    }
-    assert calls[1][0] == {"showId": "show-id"}
-
-
-def test_allanime_episode_available_returns_false_when_mode_missing(monkeypatch) -> None:
-    def fake_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
-        return {"data": {"shows": {"edges": [{"_id": "show-id", "availableEpisodes": {"dub": 0}}]}}}
-
-    monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
-
-    assert launcher.allanime_episode_available("Overflow", "1", mode="dub") is False
 
 
 def test_terminal_args_use_x_terminal_compatible_e_flag() -> None:

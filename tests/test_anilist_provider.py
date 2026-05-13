@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ani_watchlist.providers.anilist import AniListProvider, display_title_from_media, search_title_variants
+from ani_watchlist.providers.anilist import AniListProvider, search_title_variants
 
 
 def test_search_title_variants_split_parenthetical_titles() -> None:
@@ -23,9 +23,6 @@ def test_search_uses_title_variants_and_deduplicates(app_env) -> None:
 
     class FakeAniListProvider(AniListProvider):
         def _request(self, query, variables):  # noqa: ANN001
-            assert "isAdult" in query
-            assert "format" in query
-            assert "isAdult:" not in query
             calls.append(variables["search"])
             if variables["search"] == "One Piece":
                 return {"Page": {"media": [payload]}}
@@ -54,7 +51,6 @@ def test_popular_query_can_filter_currently_airing(app_env) -> None:
         def _request(self, query, variables):  # noqa: ANN001
             assert "POPULARITY_DESC" in query
             assert "status: RELEASING" in query
-            assert "isAdult:" not in query
             assert variables == {"page": 1, "perPage": 2}
             return {"Page": {"media": [{"id": 21}, {"id": 22}, {"id": 23}]}}
 
@@ -66,7 +62,6 @@ def test_popular_query_all_time_omits_status_filter(app_env) -> None:
         def _request(self, query, variables):  # noqa: ANN001
             assert "POPULARITY_DESC" in query
             assert "status:" not in query
-            assert "isAdult:" not in query
             assert variables == {"page": 1, "perPage": 1}
             return {"Page": {"media": [{"id": 21}, {"id": 22}]}}
 
@@ -92,22 +87,6 @@ def test_popular_query_pages_until_requested_limit(app_env) -> None:
     assert calls == [{"page": 1, "perPage": 50}, {"page": 2, "perPage": 50}]
     assert len(rows) == 51
     assert rows[-1]["id"] == 200
-
-
-def test_display_title_labels_adult_and_explicit_uncensored_variants() -> None:
-    adult = {
-        "title": {"english": "Bible Black", "romaji": "Bible Black"},
-        "isAdult": True,
-        "synonyms": [],
-    }
-    uncensored = {
-        "title": {"english": "Example Show", "romaji": "Example Show"},
-        "isAdult": False,
-        "synonyms": ["Example Show Uncensored"],
-    }
-
-    assert display_title_from_media(adult) == "Bible Black [18+]"
-    assert display_title_from_media(uncensored) == "Example Show [Uncensored]"
 
 
 def test_airing_schedule_pages_until_limit(app_env) -> None:

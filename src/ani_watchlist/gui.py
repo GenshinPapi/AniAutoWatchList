@@ -19,7 +19,7 @@ except Exception:  # pragma: no cover - optional GUI enhancement
 from .config import load_config
 from .db import initialize
 from .discovery import load_discovery, refresh_discovery
-from .launcher import LaunchError, allanime_episode_available, choose_ani_cli_search_title, launch_episode
+from .launcher import LaunchError, choose_ani_cli_search_title, launch_episode
 from .metadata import refresh_metadata_for_anime, select_match
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
@@ -220,8 +220,6 @@ class WatchlistApp:
         style.map("Compact.Dark.TButton", background=[("active", COLORS["border"])])
         style.configure("Accent.TButton", background=COLORS["accent"], foreground="#111111", padding=(10, 6))
         style.map("Accent.TButton", background=[("active", COLORS["accent_hover"])])
-        style.configure("Accent.TMenubutton", background=COLORS["accent"], foreground="#111111", padding=(10, 6))
-        style.map("Accent.TMenubutton", background=[("active", COLORS["accent_hover"])])
         style.configure(
             "Dark.TCombobox",
             fieldbackground=COLORS["entry"],
@@ -545,22 +543,9 @@ class WatchlistApp:
 
         actions = tk.Frame(summary, bg=COLORS["bg"])
         actions.grid(row=1, column=1, sticky="ew", pady=(10, 0))
-        continue_button = ttk.Menubutton(actions, text="Continue", style="Accent.TMenubutton")
-        continue_menu = tk.Menu(
-            continue_button,
-            tearoff=False,
-            bg=COLORS["panel_alt"],
-            fg=COLORS["text"],
-            activebackground=COLORS["accent"],
-            activeforeground="#111111",
-            relief="flat",
-        )
-        continue_menu.add_command(label="Sub", command=lambda: self.continue_selected_episode("sub"))
-        continue_menu.add_command(label="Dub", command=lambda: self.continue_selected_episode("dub"))
-        continue_button.configure(menu=continue_menu)
-        continue_button.grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
         for idx, (text, command, style) in enumerate(
             [
+                ("Continue", self.continue_selected_episode, "Accent.TButton"),
                 ("Mark Watched", lambda: self.mark_selected_episode(True), "Accent.TButton"),
                 ("Mark Unwatched", lambda: self.mark_selected_episode(False), "Dark.TButton"),
                 ("Add Episode", self.add_episode, "Dark.TButton"),
@@ -568,8 +553,7 @@ class WatchlistApp:
                 ("Choose Match", self.choose_match, "Dark.TButton"),
                 ("Edit Title", self.edit_title, "Dark.TButton"),
                 ("Delete", self.delete_selected, "Dark.TButton"),
-            ],
-            start=1,
+            ]
         ):
             ttk.Button(actions, text=text, style=style, command=command).grid(
                 row=idx // 4,
@@ -1320,7 +1304,7 @@ class WatchlistApp:
         mark_episode(self.conn, self.selected_anime_id, episode, not bool(current["watched"]))
         self.load_detail()
 
-    def continue_selected_episode(self, mode: str = "sub") -> None:
+    def continue_selected_episode(self) -> None:
         if self.selected_anime_id is None:
             return
         anime = get_anime_by_id(self.conn, self.selected_anime_id)
@@ -1331,44 +1315,16 @@ class WatchlistApp:
             messagebox.showinfo("Episode required", "Select an episode first.")
             return
         title = choose_ani_cli_search_title(anime["display_title"], anime["source_title"])
-        launch_mode = mode.strip().casefold()
-        if launch_mode not in {"sub", "dub"}:
-            launch_mode = "sub"
-        title_for_message, _alt_title = split_display_title(anime["display_title"])
-        if launch_mode == "dub":
-            self.launch_label.configure(text=f"Checking dub availability for episode {episode}...", fg=COLORS["muted"])
-            self.root.update_idletasks()
-            try:
-                has_dub = allanime_episode_available(title, episode, mode="dub")
-            except LaunchError as exc:
-                if not messagebox.askyesno(
-                    "Dub check failed",
-                    f"Could not check dub availability: {exc}\n\nTry the dub search anyway?",
-                ):
-                    self.launch_label.configure(text="Dub launch canceled.", fg=COLORS["muted"])
-                    return
-            else:
-                if not has_dub:
-                    if not messagebox.askyesno(
-                        "Dub unavailable",
-                        f"No dub was found for {title_for_message} episode {episode}.\n\nSearch sub instead?",
-                    ):
-                        self.launch_label.configure(
-                            text=f"No dub found for {title_for_message} episode {episode}.",
-                            fg=COLORS["muted"],
-                        )
-                        return
-                    launch_mode = "sub"
         try:
-            result = launch_episode(title, episode, mode=launch_mode)
+            result = launch_episode(title, episode)
         except LaunchError as exc:
             self.launch_label.configure(text=f"Launch failed: {exc}", fg=COLORS["danger"])
             messagebox.showwarning("ani-cli launch failed", str(exc))
             return
+        title_for_message, _alt_title = split_display_title(anime["display_title"])
         target = "terminal" if result.used_terminal else "background process"
-        mode_label = "dub" if launch_mode == "dub" else "sub"
         self.launch_label.configure(
-            text=f"Opened {title_for_message} episode {episode} ({mode_label}) in {target}.",
+            text=f"Opened {title_for_message} episode {episode} in {target}.",
             fg=COLORS["muted"],
         )
 

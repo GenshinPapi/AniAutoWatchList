@@ -23,8 +23,6 @@ query ($search: String) {
       synonyms
       episodes
       status
-      format
-      isAdult
       coverImage { extraLarge large medium color }
       siteUrl
       externalLinks { id site url type language }
@@ -42,8 +40,6 @@ query ($id: Int) {
     synonyms
     episodes
     status
-    format
-    isAdult
     description(asHtml: false)
     coverImage { extraLarge large medium color }
     siteUrl
@@ -58,7 +54,7 @@ TRENDING_QUERY = """
 query ($page: Int, $perPage: Int) {
   Page(page: $page, perPage: $perPage) {
     pageInfo { hasNextPage currentPage }
-    media(type: ANIME, sort: TRENDING_DESC) {
+    media(type: ANIME, sort: TRENDING_DESC, isAdult: false) {
       id
       title { romaji english native userPreferred }
       synonyms
@@ -85,7 +81,7 @@ POPULAR_MEDIA_QUERY = """
 query ($page: Int, $perPage: Int) {
   Page(page: $page, perPage: $perPage) {
     pageInfo { hasNextPage currentPage }
-    media(type: ANIME, sort: POPULARITY_DESC) {
+    media(type: ANIME, sort: POPULARITY_DESC, isAdult: false) {
       id
       title { romaji english native userPreferred }
       synonyms
@@ -112,7 +108,7 @@ TOP_AIRING_QUERY = """
 query ($page: Int, $perPage: Int) {
   Page(page: $page, perPage: $perPage) {
     pageInfo { hasNextPage currentPage }
-    media(type: ANIME, sort: POPULARITY_DESC, status: RELEASING) {
+    media(type: ANIME, sort: POPULARITY_DESC, status: RELEASING, isAdult: false) {
       id
       title { romaji english native userPreferred }
       synonyms
@@ -204,41 +200,12 @@ def _best_title(payload: dict[str, Any]) -> str:
     preferred = (title.get("userPreferred") or "").strip()
     native = (title.get("native") or "").strip()
     if english and romaji and english.casefold() != romaji.casefold():
-        return title_with_content_labels(f"{english} ({romaji})", payload)
-    return title_with_content_labels(english or preferred or romaji or native or "Unknown title", payload)
+        return f"{english} ({romaji})"
+    return english or preferred or romaji or native or "Unknown title"
 
 
 def display_title_from_media(payload: dict[str, Any]) -> str:
     return _best_title(payload)
-
-
-def title_with_content_labels(title: str, payload: dict[str, Any]) -> str:
-    labels = content_labels_from_media(payload)
-    if not labels:
-        return title
-    existing = title.casefold()
-    missing = [label for label in labels if label.casefold() not in existing]
-    if not missing:
-        return title
-    return f"{title} {' '.join(f'[{label}]' for label in missing)}"
-
-
-def content_labels_from_media(payload: dict[str, Any]) -> list[str]:
-    texts: list[str] = []
-    title = payload.get("title") or {}
-    for value in (title.get("english"), title.get("romaji"), title.get("userPreferred"), title.get("native")):
-        if value:
-            texts.append(str(value))
-    texts.extend(str(value) for value in payload.get("synonyms") or [] if value)
-    joined = " ".join(texts)
-    labels: list[str] = []
-    if re.search(r"\buncensored\b", joined, flags=re.I):
-        labels.append("Uncensored")
-    elif re.search(r"(?<!un)\bcensored\b", joined, flags=re.I):
-        labels.append("Censored")
-    if payload.get("isAdult") is True and not re.search(r"(\b18\+\b|\badult\b)", joined, flags=re.I):
-        labels.append("18+")
-    return labels
 
 
 def _candidate_titles(payload: dict[str, Any]) -> list[str]:

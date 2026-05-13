@@ -121,22 +121,3 @@ def test_metadata_without_english_title_preserves_current_display_title(app_env)
     stored = conn.execute("SELECT * FROM anime WHERE id = ?", (anime["id"],)).fetchone()
     assert stored["display_title"] == "Spare Me, Great Lord! (Da Wang Rao Ming)"
     assert stored["anilist_id"] == 120220
-
-
-def test_metadata_appends_adult_label_to_preserved_current_title(app_env):
-    conn = initialize()
-    anime, _ = get_or_create_anime(conn, "Existing Adult Title")
-    result = MetadataSearchResult(
-        "anilist",
-        "368",
-        "Bible Black [18+]",
-        1.0,
-        payload(368, "Bible Black", 6)
-        | {"title": {"romaji": "Bible Black", "userPreferred": "Bible Black"}, "isAdult": True},
-    )
-    config = AppConfig(metadata=MetadataConfig(search_on_new_title=True), anilist=AniListConfig(enabled=True))
-
-    search_and_store_matches(conn, anime["id"], "Existing Adult Title", config, FakeProvider([result]))
-
-    stored = conn.execute("SELECT * FROM anime WHERE id = ?", (anime["id"],)).fetchone()
-    assert stored["display_title"] == "Existing Adult Title [18+]"
