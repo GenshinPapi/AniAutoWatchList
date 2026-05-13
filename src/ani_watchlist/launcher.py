@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import re
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -37,6 +40,11 @@ exit "$code"
 
 EPISODE_COUNT_SUFFIX_RE = re.compile(r"\s*\(\s*\d+(?:\.\d+)?\s+episodes?\s*\)\s*$", re.IGNORECASE)
 SHORT_SOURCE_SUFFIX_RE = re.compile(r"\s*\((?=[A-Za-z0-9_-]{1,8}\))(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\)\s*$")
+ALLANIME_API = "https://api.allanime.day/api"
+ALLANIME_REFERER = "https://allmanga.to"
+ALLANIME_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
+ALLANIME_SEARCH_GQL = "query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name englishName nativeName availableEpisodes __typename } }}"
+ALLANIME_EPISODES_GQL = "query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}"
 
 
 @dataclass(frozen=True)
@@ -79,22 +87,122 @@ def choose_ani_cli_search_title(display_title: str, source_title: str | None = N
     return display
 
 
-def build_ani_cli_command(title: str, episode: str, ani_cli: str | None = None) -> list[str]:
+def _validate_mode(mode: str) -> str:
+    normalized = mode.strip().casefold()
+    if normalized not in {"sub", "dub"}:
+        raise LaunchError(f"unsupported playback mode: {mode}")
+    return normalized
+
+
+def build_ani_cli_command(title: str, episode: str, ani_cli: str | None = None, *, mode: str = "sub") -> list[str]:
     cleaned_title = title.strip()
     cleaned_episode = str(episode).strip()
+    cleaned_mode = _validate_mode(mode)
     if not cleaned_title:
         raise LaunchError("anime title is empty")
     if not cleaned_episode:
         raise LaunchError("episode is empty")
-    return [
+    command = [
         ani_cli or resolve_ani_cli(),
         "--no-detach",
         "--select-nth",
         "1",
         "--episode",
         cleaned_episode,
-        cleaned_title,
     ]
+    if cleaned_mode == "dub":
+        command.append("--dub")
+    command.append(cleaned_title)
+    return command
+
+
+def _allanime_api_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
+    data = json.dumps({"variables": variables, "query": query}).encode("utf-8")
+    request = urllib.request.Request(
+        ALLANIME_API,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "Referer": ALLANIME_REFERER,
+            "User-Agent": ALLANIME_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise LaunchError(f"failed to check AllAnime availability: {exc}") from exc
+    if isinstance(payload, dict):
+        return payload
+    raise LaunchError("failed to check AllAnime availability: unexpected response")
+
+
+def _episode_sort_value(episode: str) -> float | None:
+    try:
+        return float(str(episode).strip())
+    except ValueError:
+        return None
+
+
+def _episode_values_match(requested: str, available: object) -> bool:
+    available_key = str(available).strip()
+    if requested == available_key:
+        return True
+    requested_number = _episode_sort_value(requested)
+    available_number = _episode_sort_value(available_key)
+    return requested_number is not None and available_number is not None and requested_number == available_number
+
+
+def allanime_episode_available(title: str, episode: str, *, mode: str = "sub", timeout: int = 12) -> bool:
+    cleaned_title = title.strip()
+    cleaned_episode = str(episode).strip()
+    cleaned_mode = _validate_mode(mode)
+    if not cleaned_title or not cleaned_episode:
+        return False
+    search_payload = _allanime_api_request(
+        {
+            "search": {
+                "allowAdult": True,
+                "allowUnknown": True,
+                "query": cleaned_title.replace(" ", "+"),
+            },
+            "limit": 40,
+            "page": 1,
+            "translationType": cleaned_mode,
+            "countryOrigin": "ALL",
+        },
+        ALLANIME_SEARCH_GQL,
+        timeout=timeout,
+    )
+    edges = (((search_payload.get("data") or {}).get("shows") or {}).get("edges") or []) if isinstance(search_payload, dict) else []
+    selected: dict[str, object] | None = None
+    episode_count: int | None = None
+    for item in edges:
+        if not isinstance(item, dict):
+            continue
+        episodes = ((item.get("availableEpisodes") or {}).get(cleaned_mode)) if isinstance(item.get("availableEpisodes"), dict) else None
+        try:
+            count = int(episodes)
+        except (TypeError, ValueError):
+            continue
+        if count <= 0:
+            continue
+        selected = item
+        episode_count = count
+        break
+    if selected is None:
+        return False
+    show_id = selected.get("_id")
+    if not show_id:
+        return False
+    episodes_payload = _allanime_api_request({"showId": str(show_id)}, ALLANIME_EPISODES_GQL, timeout=timeout)
+    detail = (((episodes_payload.get("data") or {}).get("show") or {}).get("availableEpisodesDetail") or {}) if isinstance(episodes_payload, dict) else {}
+    episode_list = detail.get(cleaned_mode) if isinstance(detail, dict) else None
+    if isinstance(episode_list, list):
+        return any(_episode_values_match(cleaned_episode, item) for item in episode_list)
+    requested_number = _episode_sort_value(cleaned_episode)
+    return requested_number is not None and episode_count is not None and 0 < requested_number <= episode_count
 
 
 def terminal_args_for(terminal_name: str, terminal_path: str) -> tuple[str, ...]:
@@ -131,8 +239,8 @@ def build_terminal_command(command: list[str]) -> tuple[list[str], bool]:
     return shell_command, False
 
 
-def launch_episode(title: str, episode: str, *, prefer_terminal: bool = True) -> LaunchResult:
-    command = build_ani_cli_command(title, episode)
+def launch_episode(title: str, episode: str, *, mode: str = "sub", prefer_terminal: bool = True) -> LaunchResult:
+    command = build_ani_cli_command(title, episode, mode=mode)
     used_terminal = False
     if prefer_terminal:
         command, used_terminal = build_terminal_command(command)
