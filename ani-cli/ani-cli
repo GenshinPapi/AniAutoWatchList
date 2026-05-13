@@ -212,7 +212,7 @@ where_mpv() {
 get_links() {
     response="$(curl -e "$allanime_refr" -s "https://${allanime_base}$*" -A "$agent")"
     episode_link="$(printf '%s' "$response" | sed 's|},{|\
-|g' | sed -nE 's|.*link":"([^"]*)".*"resolutionStr":"([^"]*)".*|\2 >\1|p;s|.*hls","url":"([^"]*)".*"hardsub_lang":"en-US".*|\1|p')"
+|g' | sed -nE 's|.*link":"([^"]*)".*"resolutionStr":"([^"]*)".*|\2 >\1|p;s|.*"resolutionStr":"([^"]*)".*"link":"([^"]*)".*|\1 >\2|p;s|.*hls","url":"([^"]*)".*"hardsub_lang":"en-US".*|\1|p' | sed '/^Dash[[:space:]]/d')"
 
     case "$episode_link" in
         *repackager.wixmp.com*)
@@ -248,13 +248,16 @@ provider_init() {
 # generates links based on given provider
 generate_link() {
     case $1 in
-        1) provider_init "wixmp" "/Default :/p" ;;    # wixmp(default)(m3u8)(multi) -> (mp4)(multi)
-        2) provider_init "youtube" "/Yt-mp4 :/p" ;;   # youtube(mp4)(single)
-        3) provider_init "sharepoint" "/S-mp4 :/p" ;; # sharepoint(mp4)(single)
-        5) provider_init "filemoon" "/Fm-mp4 :/p" ;;  # filemoon(m3u8)(single)
-        *) provider_init "hianime" "/Luf-Mp4 :/p" ;;  # hianime(m3u8)(multi)
+        1 | Default) provider_init "wixmp" "/Default :/p" ;;       # wixmp(default)(m3u8)(multi) -> (mp4)(multi)
+        2 | Yt-mp4) provider_init "youtube" "/Yt-mp4 :/p" ;;       # youtube(mp4)(single)
+        3 | S-mp4) provider_init "sharepoint" "/S-mp4 :/p" ;;      # sharepoint(mp4)(single)
+        4 | Luf-Mp4 | Luf-mp4) provider_init "hianime" "/Luf-[Mm]p4 :/p" ;; # hianime(m3u8)(multi)
+        5 | Fm-mp4) provider_init "filemoon" "/Fm-mp4 :/p" ;;      # filemoon(m3u8)(single)
+        Ak) provider_init "ak" "/Ak :/p" ;;
+        Uv-mp4) provider_init "usercloud" "/Uv-mp4 :/p" ;;
+        *) provider_init "$1" "/$1 :/p" ;;
     esac
-    if [ "$1" = "5" ] && [ -n "$provider_id" ]; then
+    if { [ "$1" = "5" ] || [ "$1" = "Fm-mp4" ]; } && [ -n "$provider_id" ]; then
         get_filemoon_links "$provider_id"
     else
         [ -n "$provider_id" ] && get_links "$provider_id"
@@ -363,9 +366,11 @@ get_episode_url() {
     fi
     # generate links into sequential files
     cache_dir="$(mktemp -d)"
-    providers="1 2 3 4 5"
+    providers="$(printf "%s\n" "$resp" | sed -nE 's|^([^[:space:]][^:]*) :.*|\1|p')"
+    [ -z "$providers" ] && providers="Default Yt-mp4 S-mp4 Luf-Mp4 Fm-mp4 Ak Uv-mp4"
     for provider in $providers; do
-        generate_link "$provider" >"$cache_dir"/"$provider" &
+        cache_file="$(printf "%s" "$provider" | tr -c '[:alnum:]_-' '_')"
+        generate_link "$provider" >"$cache_dir"/"$cache_file" &
     done
     wait
     # select the link with matching quality
@@ -373,7 +378,7 @@ get_episode_url() {
     rm -r "$cache_dir"
     select_quality "$quality"
     if printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
-        [ -z "$episode" ] && die "Episode is released, but no valid sources!"
+        [ -z "$episode" ] && die "Episode is released, but AllAnime returned no valid playable sources for this episode."
     else
         [ -z "$episode" ] && die "Episode not released!"
     fi
@@ -384,7 +389,7 @@ search_anime() {
     #shellcheck disable=SC2016
     search_gql='query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name englishName nativeName availableEpisodes __typename } }}'
 
-    search_resp=$(curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"search\":{\"allowAdult\":false,\"allowUnknown\":false,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"},\"query\":\"$search_gql\"}" -A "$agent")
+    search_resp=$(curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"search\":{\"allowAdult\":true,\"allowUnknown\":true,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"},\"query\":\"$search_gql\"}" -A "$agent")
     if command -v python3 >/dev/null 2>&1; then
         printf '%s' "$search_resp" | python3 -c '
 import json
