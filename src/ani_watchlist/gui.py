@@ -18,7 +18,7 @@ except Exception:  # pragma: no cover - optional GUI enhancement
 
 from .config import load_config
 from .db import initialize
-from .discovery import load_discovery, refresh_discovery
+from .discovery import append_discovery_media_page, load_discovery, refresh_discovery
 from .launcher import (
     LaunchError,
     allanime_episode_available,
@@ -191,6 +191,7 @@ class WatchlistApp:
         self.current_rows = []
         self.discovery_data = load_discovery(self.conn)
         self.discovery_refreshing = False
+        self.discovery_loading_more: set[str] = set()
         self.discovery_error: str | None = None
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
@@ -746,15 +747,60 @@ class WatchlistApp:
 
     def change_discovery_page(self, page_name: str, direction: int) -> None:
         items = list(((self.discovery_data.get(page_name) or {}).get("items")) or [])
+        data = self.discovery_data.get(page_name) or {}
         page_count = discovery_page_count(len(items))
         current = max(0, min(self.discovery_page_indexes.get(page_name, 0), page_count - 1))
-        next_page = max(0, min(current + direction, page_count - 1))
+        requested_page = current + direction
+        if requested_page >= page_count and direction > 0 and data.get("has_more"):
+            self.load_more_discovery_page(page_name, requested_page)
+            return
+        next_page = max(0, min(requested_page, page_count - 1))
         if next_page == current:
             self.update_discovery_page_controls(page_name, len(items))
             return
         self.discovery_page_indexes[page_name] = next_page
         self.render_discovery_list(page_name)
         self.discovery_canvases[page_name].yview_moveto(0)
+
+    def load_more_discovery_page(self, page_name: str, target_page_index: int) -> None:
+        if self.discovery_refreshing or page_name in self.discovery_loading_more:
+            return
+        self.discovery_loading_more.add(page_name)
+        self.update_discovery_page_controls(
+            page_name,
+            len(list(((self.discovery_data.get(page_name) or {}).get("items")) or [])),
+        )
+        label = self.discovery_status_labels.get(page_name)
+        if label is not None:
+            label.configure(text="Loading more AniList results...", fg=COLORS["muted"])
+
+        def worker() -> None:
+            error = None
+            try:
+                with initialize() as conn:
+                    append_discovery_media_page(conn, page_name, load_config())
+            except Exception as exc:  # pragma: no cover - defensive UI boundary
+                error = str(exc)
+            self.root.after(0, lambda: self.finish_discovery_load_more(page_name, target_page_index, error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_discovery_load_more(
+        self,
+        page_name: str,
+        target_page_index: int,
+        error: str | None = None,
+    ) -> None:
+        self.discovery_loading_more.discard(page_name)
+        self.discovery_error = error
+        self.discovery_data = load_discovery(self.conn)
+        items = list(((self.discovery_data.get(page_name) or {}).get("items")) or [])
+        page_count = discovery_page_count(len(items))
+        self.discovery_page_indexes[page_name] = max(0, min(target_page_index, page_count - 1))
+        self.update_discovery_status()
+        if self.current_page == page_name:
+            self.render_discovery_list(page_name)
+            self.discovery_canvases[page_name].yview_moveto(0)
 
     def show_schedule(self) -> None:
         self.current_page = "schedule"
@@ -1008,12 +1054,17 @@ class WatchlistApp:
         self.render_discovery_list("trending")
 
     def update_discovery_page_controls(self, page_name: str, item_count: int) -> None:
+        data = self.discovery_data.get(page_name) or {}
         page_count = discovery_page_count(item_count)
         page_index = max(0, min(self.discovery_page_indexes.get(page_name, 0), page_count - 1))
         self.discovery_page_indexes[page_name] = page_index
-        self.discovery_page_labels[page_name].configure(text=f"{page_index + 1}/{page_count}")
+        has_more = bool(data.get("has_more"))
+        loading_more = page_name in self.discovery_loading_more
+        page_suffix = "+" if has_more else ""
+        self.discovery_page_labels[page_name].configure(text=f"{page_index + 1}/{page_count}{page_suffix}")
         self.discovery_prev_buttons[page_name].configure(state="normal" if page_index > 0 else "disabled")
-        self.discovery_next_buttons[page_name].configure(state="normal" if page_index < page_count - 1 else "disabled")
+        can_next = page_index < page_count - 1 or has_more
+        self.discovery_next_buttons[page_name].configure(state="normal" if can_next and not loading_more else "disabled")
 
     def render_discovery_list(self, page_name: str) -> None:
         self.update_discovery_status(refreshing=self.discovery_refreshing)

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from ani_watchlist.discovery import (
+    MEDIA_LIST_BATCH_LIMIT,
     POPULAR_CACHE_KEY,
     SCHEDULE_CACHE_KEY,
     TOP_AIRING_CACHE_KEY,
     TRENDING_CACHE_KEY,
+    append_discovery_media_page,
     cache_fetched_today,
     load_discovery,
     refresh_discovery,
@@ -19,40 +21,54 @@ from ani_watchlist.providers.anilist import AniListProvider
 
 
 class FakeDiscoveryProvider(AniListProvider):
+    def _media_items(self, kind: str, start: int, count: int) -> list[dict[str, object]]:
+        base = {
+            "trending": (21, "ONE PIECE", "ONE PIECE", "RELEASING", 100),
+            "top_airing": (22, "Frieren", "Sousou no Frieren", "RELEASING", 999),
+            "popular": (23, "Fullmetal Alchemist: Brotherhood", "Hagane no Renkinjutsushi", "FINISHED", 9999),
+        }[kind]
+        media_id, english, romaji, status, metric = base
+        items: list[dict[str, object]] = []
+        for offset in range(count):
+            current_id = media_id + start + offset
+            items.append(
+                {
+                    "id": current_id,
+                    "title": {"english": english, "romaji": romaji, "userPreferred": romaji},
+                    "episodes": None,
+                    "status": status,
+                    "trending": metric if kind == "trending" else None,
+                    "popularity": metric if kind != "trending" else None,
+                    "averageScore": 88,
+                    "coverImage": {"large": f"https://example.invalid/{current_id}.jpg"},
+                    "siteUrl": f"https://anilist.co/anime/{current_id}",
+                }
+            )
+        return items
+
     def get_trending_anime(self, limit: int = 20):  # noqa: ANN201
-        return [
-            {
-                "id": 21,
-                "title": {"english": "ONE PIECE", "romaji": "ONE PIECE", "userPreferred": "ONE PIECE"},
-                "episodes": None,
-                "status": "RELEASING",
-                "trending": 100,
-                "averageScore": 88,
-                "coverImage": {"large": "https://example.invalid/one-piece.jpg"},
-                "siteUrl": "https://anilist.co/anime/21",
-            }
-        ][:limit]
+        return self._media_items("trending", 0, limit)
 
     def get_top_airing_anime(self, limit: int = 20):  # noqa: ANN201
-        return [
-            {
-                **self.get_trending_anime(1)[0],
-                "id": 22,
-                "title": {"english": "Frieren", "romaji": "Sousou no Frieren", "userPreferred": "Sousou no Frieren"},
-                "popularity": 999,
-            }
-        ][:limit]
+        return self._media_items("top_airing", 0, limit)
 
     def get_popular_anime(self, limit: int = 20):  # noqa: ANN201
-        return [
-            {
-                **self.get_trending_anime(1)[0],
-                "id": 23,
-                "title": {"english": "Fullmetal Alchemist: Brotherhood", "romaji": "Hagane no Renkinjutsushi", "userPreferred": "Hagane no Renkinjutsushi"},
-                "status": "FINISHED",
-                "popularity": 9999,
-            }
-        ][:limit]
+        return self._media_items("popular", 0, limit)
+
+    def get_trending_anime_batch(self, *, start_page: int = 1, page_count: int = 2, per_page: int = 50):  # noqa: ANN201
+        start = (start_page - 1) * per_page
+        count = page_count * per_page
+        return {"items": self._media_items("trending", start, count), "next_page": start_page + page_count}
+
+    def get_top_airing_anime_batch(self, *, start_page: int = 1, page_count: int = 2, per_page: int = 50):  # noqa: ANN201
+        start = (start_page - 1) * per_page
+        count = page_count * per_page
+        return {"items": self._media_items("top_airing", start, count), "next_page": start_page + page_count}
+
+    def get_popular_anime_batch(self, *, start_page: int = 1, page_count: int = 2, per_page: int = 50):  # noqa: ANN201
+        start = (start_page - 1) * per_page
+        count = page_count * per_page
+        return {"items": self._media_items("popular", start, count), "next_page": start_page + page_count}
 
     def get_airing_schedule(self, start_timestamp: int, end_timestamp: int, *, limit: int = 140):  # noqa: ANN201
         return [
@@ -78,6 +94,9 @@ def test_refresh_trending_caches_once_per_day(app_env) -> None:
 
     assert payload["items"][0]["display_title"] == "ONE PIECE"
     assert payload["items"][0]["cover_path"] == "/tmp/anilist-21.jpg"
+    assert len(payload["items"]) == 10
+    assert payload["has_more"] is True
+    assert payload["next_page"] == 2
     assert cache_fetched_today(conn, TRENDING_CACHE_KEY) is True
 
     discovery = load_discovery(conn)
@@ -122,3 +141,29 @@ def test_refresh_discovery_populates_all_discovery_tabs(app_env) -> None:
     assert discovery["top_airing_fresh"] is True
     assert discovery["popular_fresh"] is True
     assert discovery["schedule_fresh"] is True
+
+
+def test_refresh_discovery_uses_hundred_item_media_batches(app_env) -> None:
+    conn = initialize()
+
+    payload = refresh_discovery(conn, TEST_CONFIG, force=True, provider=FakeDiscoveryProvider())
+
+    assert len(payload["trending"]["items"]) == MEDIA_LIST_BATCH_LIMIT
+    assert len(payload["top_airing"]["items"]) == MEDIA_LIST_BATCH_LIMIT
+    assert len(payload["popular"]["items"]) == MEDIA_LIST_BATCH_LIMIT
+    assert payload["trending"]["next_page"] == 3
+    assert payload["top_airing"]["next_page"] == 3
+    assert payload["popular"]["next_page"] == 3
+
+
+def test_append_discovery_media_page_extends_existing_cache(app_env) -> None:
+    conn = initialize()
+    provider = FakeDiscoveryProvider()
+    first = refresh_trending(conn, TEST_CONFIG, force=True, provider=provider)
+
+    second = append_discovery_media_page(conn, "trending", TEST_CONFIG, provider=provider)
+
+    assert len(first["items"]) == MEDIA_LIST_BATCH_LIMIT
+    assert len(second["items"]) == MEDIA_LIST_BATCH_LIMIT * 2
+    assert second["items"][MEDIA_LIST_BATCH_LIMIT]["id"] == 121
+    assert second["next_page"] == 5

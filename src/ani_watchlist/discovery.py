@@ -10,13 +10,21 @@ from .providers.anilist import AniListProvider, display_title_from_media
 from .store import now_iso
 
 
-TRENDING_CACHE_KEY = "anilist_trending_v2"
-TOP_AIRING_CACHE_KEY = "anilist_top_airing_v2"
-POPULAR_CACHE_KEY = "anilist_popular_v4"
+TRENDING_CACHE_KEY = "anilist_trending_v3"
+TOP_AIRING_CACHE_KEY = "anilist_top_airing_v3"
+POPULAR_CACHE_KEY = "anilist_popular_v5"
 SCHEDULE_CACHE_KEY = "anilist_schedule_week_v2"
 DISCOVERY_CACHE_KEYS = (TRENDING_CACHE_KEY, TOP_AIRING_CACHE_KEY, POPULAR_CACHE_KEY, SCHEDULE_CACHE_KEY)
-EMPTY_MEDIA_LIST = {"items": [], "error": None, "fetched_at": None}
-POPULAR_MEDIA_LIMIT = 100
+MEDIA_LIST_BATCH_PAGES = 2
+MEDIA_LIST_PAGE_SIZE = 50
+MEDIA_LIST_BATCH_LIMIT = MEDIA_LIST_BATCH_PAGES * MEDIA_LIST_PAGE_SIZE
+EMPTY_MEDIA_LIST = {
+    "items": [],
+    "error": None,
+    "fetched_at": None,
+    "next_page": None,
+    "has_more": False,
+}
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -166,29 +174,107 @@ def load_discovery(conn: sqlite3.Connection) -> dict[str, Any]:
 def refresh_media_list(
     conn: sqlite3.Connection,
     cache_key: str,
-    fetch_items,
+    fetch_batch,
     config: AppConfig | None = None,
     *,
     force: bool = False,
     provider: AniListProvider | None = None,
-    limit: int = 20,
+    start_page: int = 1,
+    batch_pages: int = MEDIA_LIST_BATCH_PAGES,
+    per_page: int = MEDIA_LIST_PAGE_SIZE,
 ) -> dict[str, Any]:
     config = config or load_config()
     if not config.anilist.enabled:
-        payload = {"items": [], "error": "AniList metadata is disabled.", "fetched_at": now_iso()}
+        payload = {
+            "items": [],
+            "error": "AniList metadata is disabled.",
+            "fetched_at": now_iso(),
+            "next_page": None,
+            "has_more": False,
+        }
         set_cache(conn, cache_key, payload)
         return payload
     if not force and cache_fetched_today(conn, cache_key):
         return load_cache(conn, cache_key) or dict(EMPTY_MEDIA_LIST)
     provider = provider or AniListProvider(config.anilist)
     try:
-        items = [_normalize_media(item, provider) for item in fetch_items(provider, limit)]
-        payload = {"items": items, "error": None, "fetched_at": now_iso()}
+        batch = fetch_batch(provider, start_page, batch_pages, per_page)
+        next_page = batch.get("next_page")
+        items = [_normalize_media(item, provider) for item in batch.get("items") or []]
+        payload = {
+            "items": items,
+            "error": None,
+            "fetched_at": now_iso(),
+            "next_page": next_page,
+            "has_more": next_page is not None,
+        }
     except Exception as exc:
         existing = load_cache(conn, cache_key) or {"items": [], "fetched_at": None}
         payload = {**existing, "error": str(exc)}
     set_cache(conn, cache_key, payload)
     return payload
+
+
+def append_media_list(
+    conn: sqlite3.Connection,
+    cache_key: str,
+    fetch_batch,
+    config: AppConfig | None = None,
+    *,
+    provider: AniListProvider | None = None,
+    batch_pages: int = MEDIA_LIST_BATCH_PAGES,
+    per_page: int = MEDIA_LIST_PAGE_SIZE,
+) -> dict[str, Any]:
+    config = config or load_config()
+    existing = load_cache(conn, cache_key) or dict(EMPTY_MEDIA_LIST)
+    if not config.anilist.enabled:
+        payload = {**existing, "error": "AniList metadata is disabled.", "has_more": False, "next_page": None}
+        set_cache(conn, cache_key, payload)
+        return payload
+    next_page = existing.get("next_page")
+    if next_page is None:
+        return {**existing, "has_more": False, "next_page": None}
+    provider = provider or AniListProvider(config.anilist)
+    try:
+        batch = fetch_batch(provider, int(next_page), batch_pages, per_page)
+        current_items = list(existing.get("items") or [])
+        seen_ids = {str(item.get("id")) for item in current_items if isinstance(item, dict) and item.get("id") is not None}
+        for item in batch.get("items") or []:
+            normalized = _normalize_media(item, provider)
+            media_id = str(normalized.get("id"))
+            if media_id in seen_ids:
+                continue
+            current_items.append(normalized)
+            seen_ids.add(media_id)
+        next_page = batch.get("next_page")
+        payload = {
+            **existing,
+            "items": current_items,
+            "error": None,
+            "fetched_at": now_iso(),
+            "next_page": next_page,
+            "has_more": next_page is not None,
+        }
+    except Exception as exc:
+        payload = {**existing, "error": str(exc)}
+    set_cache(conn, cache_key, payload)
+    return payload
+
+
+def _media_batch(method_name: str):
+    def fetch(provider: AniListProvider, start_page: int, batch_pages: int, per_page: int) -> dict[str, Any]:
+        method = getattr(provider, method_name)
+        return method(start_page=start_page, page_count=batch_pages, per_page=per_page)
+
+    return fetch
+
+
+def _batch_params_for_limit(limit: int | None) -> tuple[int, int]:
+    target = max(1, int(limit or MEDIA_LIST_BATCH_LIMIT))
+    for per_page in range(min(MEDIA_LIST_PAGE_SIZE, target), 0, -1):
+        if target % per_page == 0:
+            return target // per_page, per_page
+    return target, 1
 
 
 def refresh_trending(
@@ -197,16 +283,18 @@ def refresh_trending(
     *,
     force: bool = False,
     provider: AniListProvider | None = None,
-    limit: int = 20,
+    limit: int | None = None,
 ) -> dict[str, Any]:
+    batch_pages, per_page = _batch_params_for_limit(limit)
     return refresh_media_list(
         conn,
         TRENDING_CACHE_KEY,
-        lambda client, page_limit: client.get_trending_anime(limit=page_limit),
+        _media_batch("get_trending_anime_batch"),
         config,
         force=force,
         provider=provider,
-        limit=limit,
+        batch_pages=batch_pages,
+        per_page=per_page,
     )
 
 
@@ -216,16 +304,18 @@ def refresh_top_airing(
     *,
     force: bool = False,
     provider: AniListProvider | None = None,
-    limit: int = 20,
+    limit: int | None = None,
 ) -> dict[str, Any]:
+    batch_pages, per_page = _batch_params_for_limit(limit)
     return refresh_media_list(
         conn,
         TOP_AIRING_CACHE_KEY,
-        lambda client, page_limit: client.get_top_airing_anime(limit=page_limit),
+        _media_batch("get_top_airing_anime_batch"),
         config,
         force=force,
         provider=provider,
-        limit=limit,
+        batch_pages=batch_pages,
+        per_page=per_page,
     )
 
 
@@ -235,17 +325,40 @@ def refresh_popular(
     *,
     force: bool = False,
     provider: AniListProvider | None = None,
-    limit: int = POPULAR_MEDIA_LIMIT,
+    limit: int | None = None,
 ) -> dict[str, Any]:
+    batch_pages, per_page = _batch_params_for_limit(limit)
     return refresh_media_list(
         conn,
         POPULAR_CACHE_KEY,
-        lambda client, page_limit: client.get_popular_anime(limit=page_limit),
+        _media_batch("get_popular_anime_batch"),
         config,
         force=force,
         provider=provider,
-        limit=limit,
+        batch_pages=batch_pages,
+        per_page=per_page,
     )
+
+
+MEDIA_PAGE_CONFIG = {
+    "trending": (TRENDING_CACHE_KEY, _media_batch("get_trending_anime_batch")),
+    "top_airing": (TOP_AIRING_CACHE_KEY, _media_batch("get_top_airing_anime_batch")),
+    "popular": (POPULAR_CACHE_KEY, _media_batch("get_popular_anime_batch")),
+}
+
+
+def append_discovery_media_page(
+    conn: sqlite3.Connection,
+    page_name: str,
+    config: AppConfig | None = None,
+    *,
+    provider: AniListProvider | None = None,
+) -> dict[str, Any]:
+    try:
+        cache_key, fetch_batch = MEDIA_PAGE_CONFIG[page_name]
+    except KeyError as exc:
+        raise ValueError(f"unknown discovery page: {page_name}") from exc
+    return append_media_list(conn, cache_key, fetch_batch, config, provider=provider)
 
 
 def refresh_schedule(

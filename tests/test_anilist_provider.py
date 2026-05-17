@@ -94,6 +94,28 @@ def test_popular_query_pages_until_requested_limit(app_env) -> None:
     assert rows[-1]["id"] == 200
 
 
+def test_media_batch_returns_next_page_for_incremental_loading(app_env) -> None:
+    calls = []
+
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            assert "TRENDING_DESC" in query
+            calls.append(variables)
+            page = variables["page"]
+            return {
+                "Page": {
+                    "pageInfo": {"hasNextPage": page < 4, "currentPage": page},
+                    "media": [{"id": page * 100 + idx} for idx in range(variables["perPage"])],
+                }
+            }
+
+    batch = FakeAniListProvider().get_trending_anime_batch(start_page=3, page_count=2, per_page=50)
+
+    assert calls == [{"page": 3, "perPage": 50}, {"page": 4, "perPage": 50}]
+    assert len(batch["items"]) == 100
+    assert batch["next_page"] is None
+
+
 def test_display_title_labels_adult_and_explicit_uncensored_variants() -> None:
     adult = {
         "title": {"english": "Bible Black", "romaji": "Bible Black"},

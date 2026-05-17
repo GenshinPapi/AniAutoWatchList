@@ -355,6 +355,31 @@ class AniListProvider:
             page += 1
         return items[:limit]
 
+    def _get_media_batch(
+        self,
+        query: str,
+        *,
+        start_page: int = 1,
+        page_count: int = 2,
+        per_page: int = 50,
+    ) -> dict[str, Any]:
+        page = max(1, int(start_page))
+        remaining_pages = max(1, int(page_count))
+        per_page = max(1, min(int(per_page), 50))
+        items: list[dict[str, Any]] = []
+        next_page: int | None = page
+        while remaining_pages > 0 and next_page is not None:
+            data = self._request(query, {"page": page, "perPage": per_page})
+            page_data = data.get("Page") or {}
+            items.extend(list(page_data.get("media") or []))
+            page_info = page_data.get("pageInfo") or {}
+            has_next = bool(page_info.get("hasNextPage"))
+            current_page = int(page_info.get("currentPage") or page)
+            next_page = current_page + 1 if has_next else None
+            page = next_page or current_page
+            remaining_pages -= 1
+        return {"items": items, "next_page": next_page}
+
     def get_trending_anime(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._get_media_list(TRENDING_QUERY, limit)
 
@@ -363,6 +388,48 @@ class AniListProvider:
 
     def get_top_airing_anime(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._get_media_list(TOP_AIRING_QUERY, limit)
+
+    def get_trending_anime_batch(
+        self,
+        *,
+        start_page: int = 1,
+        page_count: int = 2,
+        per_page: int = 50,
+    ) -> dict[str, Any]:
+        return self._get_media_batch(
+            TRENDING_QUERY,
+            start_page=start_page,
+            page_count=page_count,
+            per_page=per_page,
+        )
+
+    def get_popular_anime_batch(
+        self,
+        *,
+        start_page: int = 1,
+        page_count: int = 2,
+        per_page: int = 50,
+    ) -> dict[str, Any]:
+        return self._get_media_batch(
+            POPULAR_MEDIA_QUERY,
+            start_page=start_page,
+            page_count=page_count,
+            per_page=per_page,
+        )
+
+    def get_top_airing_anime_batch(
+        self,
+        *,
+        start_page: int = 1,
+        page_count: int = 2,
+        per_page: int = 50,
+    ) -> dict[str, Any]:
+        return self._get_media_batch(
+            TOP_AIRING_QUERY,
+            start_page=start_page,
+            page_count=page_count,
+            per_page=per_page,
+        )
 
     def get_airing_schedule(
         self,
