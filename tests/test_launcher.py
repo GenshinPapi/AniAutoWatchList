@@ -32,6 +32,25 @@ def test_build_ani_cli_command_adds_dub_option() -> None:
     ]
 
 
+def test_build_ani_cli_command_can_target_allanime_id() -> None:
+    command = launcher.build_ani_cli_command(
+        "Berserk (25 episodes)",
+        "3",
+        ani_cli="/home/me/.local/bin/ani-cli",
+        allanime_id="berserk-id",
+    )
+
+    assert command == [
+        "/home/me/.local/bin/ani-cli",
+        "--no-detach",
+        "--allanime-id",
+        "berserk-id",
+        "--episode",
+        "3",
+        "Berserk (25 episodes)",
+    ]
+
+
 def test_build_ani_cli_command_rejects_unknown_mode() -> None:
     try:
         launcher.build_ani_cli_command("Frieren", "12", ani_cli="/home/me/.local/bin/ani-cli", mode="raw")
@@ -53,6 +72,92 @@ def test_choose_search_title_prefers_cleaned_source_title() -> None:
     title = launcher.choose_ani_cli_search_title("ONE PIECE", "One Piece (1P) (1161 episodes)")
 
     assert title == "One Piece"
+
+
+def test_choose_search_title_ignores_unrelated_stale_source_title() -> None:
+    title = launcher.choose_ani_cli_search_title("Berserk", "Berserk of Gluttony")
+
+    assert title == "Berserk"
+
+
+def test_resolve_allanime_launch_target_prefers_specific_metadata_variant(monkeypatch) -> None:
+    calls: list[str] = []
+
+    def fake_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
+        assert query == launcher.ALLANIME_SEARCH_GQL
+        search = variables["search"]
+        assert isinstance(search, dict)
+        query_text = str(search["query"])
+        calls.append(query_text)
+        if query_text == "Baki":
+            return {
+                "data": {
+                    "shows": {
+                        "edges": [
+                            {
+                                "_id": "new-baki",
+                                "name": "Baki",
+                                "englishName": "Baki",
+                                "nativeName": "",
+                                "availableEpisodes": {"sub": 39},
+                            }
+                        ]
+                    }
+                }
+            }
+        return {
+            "data": {
+                "shows": {
+                    "edges": [
+                        {
+                            "_id": "original-baki",
+                            "name": "Baki the Grappler",
+                            "englishName": "Grappler Baki",
+                            "nativeName": "",
+                            "availableEpisodes": {"sub": 48},
+                        }
+                    ]
+                }
+            }
+        }
+
+    monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
+    payload = {
+        "title": {"english": "Baki", "romaji": "Grappler Baki", "userPreferred": "Grappler Baki"},
+        "synonyms": ["Baki the Grappler"],
+    }
+
+    target = launcher.resolve_allanime_launch_target("Baki", "Baki", payload, total_episodes=48)
+
+    assert target is not None
+    assert target.show_id == "original-baki"
+    assert target.title == "Grappler Baki (Baki the Grappler) (48 episodes)"
+    assert "Grappler+Baki" in calls
+
+
+def test_resolve_allanime_launch_target_rejects_broad_spinoff_match(monkeypatch) -> None:
+    def fake_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
+        return {
+            "data": {
+                "shows": {
+                    "edges": [
+                        {
+                            "_id": "gluttony",
+                            "name": "Berserk of Gluttony",
+                            "englishName": "Berserk of Gluttony",
+                            "nativeName": "",
+                            "availableEpisodes": {"sub": 12},
+                        }
+                    ]
+                }
+            }
+        }
+
+    monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
+
+    target = launcher.resolve_allanime_launch_target("Berserk", "Berserk of Gluttony", None, total_episodes=25)
+
+    assert target is None
 
 
 def test_allanime_episode_available_checks_first_matching_mode_result(monkeypatch) -> None:
@@ -92,6 +197,25 @@ def test_allanime_episode_available_returns_false_when_mode_missing(monkeypatch)
     monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
 
     assert launcher.allanime_episode_available("Overflow", "1", mode="dub") is False
+
+
+def test_allanime_episode_available_can_check_direct_show_id(monkeypatch) -> None:
+    calls: list[tuple[dict[str, object], str]] = []
+
+    def fake_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
+        calls.append((variables, query))
+        return {"data": {"show": {"availableEpisodesDetail": {"dub": ["1", "2"]}}}}
+
+    monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
+
+    assert launcher.allanime_episode_available(
+        "Berserk",
+        "2",
+        mode="dub",
+        show_id="target-id",
+        episode_count=25,
+    )
+    assert calls == [({"showId": "target-id"}, launcher.ALLANIME_EPISODES_GQL)]
 
 
 def test_terminal_args_use_x_terminal_compatible_e_flag() -> None:

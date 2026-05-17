@@ -19,7 +19,13 @@ except Exception:  # pragma: no cover - optional GUI enhancement
 from .config import load_config
 from .db import initialize
 from .discovery import load_discovery, refresh_discovery
-from .launcher import LaunchError, allanime_episode_available, choose_ani_cli_search_title, launch_episode
+from .launcher import (
+    LaunchError,
+    allanime_episode_available,
+    choose_ani_cli_search_title,
+    launch_episode,
+    resolve_allanime_launch_target,
+)
 from .metadata import refresh_metadata_for_anime, select_match
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
@@ -104,6 +110,25 @@ def split_display_title(title: str) -> tuple[str, str | None]:
         if primary and secondary and primary.casefold() != secondary.casefold():
             return primary, secondary
     return title, None
+
+
+def selected_metadata_payload(conn, anime_id: int) -> dict[str, object] | None:
+    row = conn.execute(
+        """
+        SELECT payload_json FROM metadata_matches
+        WHERE anime_id = ? AND provider = 'anilist' AND selected = 1
+        ORDER BY confidence_score DESC, id
+        LIMIT 1
+        """,
+        (anime_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def scroll_units_from_mousewheel(event) -> int:
@@ -1335,11 +1360,35 @@ class WatchlistApp:
         if launch_mode not in {"sub", "dub"}:
             launch_mode = "sub"
         title_for_message, _alt_title = split_display_title(anime["display_title"])
+        metadata_payload = selected_metadata_payload(self.conn, self.selected_anime_id)
+        total_episodes = int(anime["total_episodes"]) if anime["total_episodes"] is not None else None
+
+        def resolve_target(target_mode: str):
+            try:
+                return resolve_allanime_launch_target(
+                    anime["display_title"],
+                    anime["source_title"],
+                    metadata_payload,
+                    total_episodes=total_episodes,
+                    mode=target_mode,
+                )
+            except LaunchError:
+                return None
+
+        target = resolve_target(launch_mode)
         if launch_mode == "dub":
+            if target is None:
+                target = resolve_target("sub")
             self.launch_label.configure(text=f"Checking dub availability for episode {episode}...", fg=COLORS["muted"])
             self.root.update_idletasks()
             try:
-                has_dub = allanime_episode_available(title, episode, mode="dub")
+                has_dub = allanime_episode_available(
+                    target.title if target is not None else title,
+                    episode,
+                    mode="dub",
+                    show_id=target.show_id if target is not None else None,
+                    episode_count=target.episode_count if target is not None else None,
+                )
             except LaunchError as exc:
                 if not messagebox.askyesno(
                     "Dub check failed",
@@ -1359,8 +1408,15 @@ class WatchlistApp:
                         )
                         return
                     launch_mode = "sub"
+                    target = resolve_target(launch_mode)
         try:
-            result = launch_episode(title, episode, mode=launch_mode)
+            launch_title = target.title if target is not None else title
+            result = launch_episode(
+                launch_title,
+                episode,
+                mode=launch_mode,
+                allanime_id=target.show_id if target is not None else None,
+            )
         except LaunchError as exc:
             self.launch_label.configure(text=f"Launch failed: {exc}", fg=COLORS["danger"])
             messagebox.showwarning("ani-cli launch failed", str(exc))

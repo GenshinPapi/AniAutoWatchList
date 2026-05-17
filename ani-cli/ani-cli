@@ -154,6 +154,8 @@ help_info() {
         Exit the player, and return the player exit code (useful for non interactive scenarios, mpv only)
       --skip-title <title>
         Use given title as ani-skip query
+      --allanime-id <id>
+        Open a specific AllAnime show id
       -N, --nextep-countdown
         Display a countdown to the next episode
       -U, --update
@@ -421,20 +423,68 @@ search_anime() {
     if command -v python3 >/dev/null 2>&1; then
         printf '%s' "$search_resp" | python3 -c '
 import json
+import re
 import sys
+import urllib.parse
 
 mode = sys.argv[1]
+query = urllib.parse.unquote_plus(sys.argv[2]) if len(sys.argv) > 2 else ""
+
+def normalized(value):
+    value = (value or "").casefold()
+    value = re.sub(r"[^a-z0-9]+", " ", value)
+    return " ".join(value.split())
+
+query_norm = normalized(query)
+query_terms = set(query_norm.split())
+
+def episode_count(item):
+    episodes = (item.get("availableEpisodes") or {}).get(mode)
+    try:
+        return int(episodes)
+    except (TypeError, ValueError):
+        return 0
+
+def title_score(item, original_index):
+    titles = [
+        (item.get("name") or "").strip(),
+        (item.get("englishName") or "").strip(),
+        (item.get("nativeName") or "").strip(),
+    ]
+    title_norms = [normalized(title) for title in titles if title]
+    if not query_norm or not title_norms:
+        return (9, 9, -episode_count(item), original_index)
+
+    if any(title == query_norm for title in title_norms):
+        return (0, 0, -episode_count(item), original_index)
+
+    penalties = []
+    ranks = []
+    for title in title_norms:
+        if title.startswith(f"{query_norm} "):
+            ranks.append(1)
+        elif query_norm in title:
+            ranks.append(2)
+        elif query_terms and query_terms.issubset(set(title.split())):
+            ranks.append(3)
+        else:
+            continue
+
+        special = bool(re.search(r"\b(season|part|movie|special|ova|ona|mini|recap|pv)\b", title))
+        penalties.append(1 if special else 0)
+
+    if not ranks:
+        return (8, 8, -episode_count(item), original_index)
+    return (min(ranks), min(penalties or [0]), -episode_count(item), original_index)
+
 try:
     edges = (((json.load(sys.stdin).get("data") or {}).get("shows") or {}).get("edges") or [])
 except Exception:
     edges = []
-for item in edges:
-    episodes = (item.get("availableEpisodes") or {}).get(mode)
-    try:
-        episode_count = int(episodes)
-    except (TypeError, ValueError):
-        continue
-    if episode_count <= 0:
+ranked_edges = sorted(enumerate(edges), key=lambda pair: title_score(pair[1], pair[0]))
+for _index, item in ranked_edges:
+    episodes = episode_count(item)
+    if episodes <= 0:
         continue
     name = (item.get("name") or "").strip()
     english = (item.get("englishName") or "").strip()
@@ -444,8 +494,8 @@ for item in edges:
         title = english or name
     show_id = item.get("_id")
     if show_id and title:
-        print(f"{show_id}\t{title} ({episode_count} episodes)")
-' "$mode"
+        print(f"{show_id}\t{title} ({episodes} episodes)")
+' "$mode" "$1"
     else
         printf '%s' "$search_resp" | sed 's|Show|\
 | g' | sed -nE "s|.*_id\":\"([^\"]*)\",\"name\":\"(.+)\",.*${mode}\":([1-9][^,]*).*|\1	\2 (\3 episodes)|p" | sed 's/\\"//g'
@@ -700,12 +750,18 @@ while [ $# -gt 0 ]; do
             skip_title="$2"
             shift
             ;;
+        --allanime-id)
+            [ $# -lt 2 ] && die "missing argument!"
+            allanime_id="$2"
+            shift
+            ;;
         -N | --nextep-countdown) search=nextep ;;
         -U | --update) update_script ;;
         *) query="$(printf "%s" "$query $1" | sed "s|^ ||;s| |+|g")" ;;
     esac
     shift
 done
+[ -n "$allanime_id" ] && search=allanime-id
 [ "$use_external_menu" = "0" ] && multi_selection_flag="${ANI_CLI_MULTI_SELECTION:-"-m"}"
 [ "$use_external_menu" = "1" ] && multi_selection_flag="${ANI_CLI_MULTI_SELECTION:-"-multi-select"}"
 [ "$external_menu_normal_window" = "1" ] && external_menu_args="-normal-window"
@@ -728,6 +784,18 @@ esac
 
 # searching
 case "$search" in
+    allanime-id)
+        id="$allanime_id"
+        title="$(printf "%s" "$query" | sed 's|+| |g')"
+        [ -z "$title" ] && title="$id"
+        ep_list=$(episodes_list "$id")
+        [ -z "$ep_list" ] && die "No episodes found for AllAnime ID $id"
+        allanime_title="$(printf "%s" "$title" | cut -d'(' -f1 | tr -d '[:punct:]')"
+        ani_watch_hook title-selected --title "$title" --source-title "$title"
+        ani_watch_hook episodes-listed --title "$title" --source-title "$title" --episodes-json "$(ani_watch_ep_list_json "$ep_list")" --source-label "$mode"
+        [ -z "$ep_no" ] && ep_no=$(printf "%s" "$ep_list" | nth "Select episode: " "$multi_selection_flag")
+        [ -z "$ep_no" ] && exit 1
+        ;;
     history)
         anime_list=$(while read -r ep_no id title; do process_hist_entry & done <"$histfile")
         wait
