@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from datetime import datetime, time, timedelta, timezone
 from typing import Any
@@ -12,12 +13,33 @@ from .store import now_iso
 
 TRENDING_CACHE_KEY = "anilist_trending_v3"
 TOP_AIRING_CACHE_KEY = "anilist_top_airing_v3"
-POPULAR_CACHE_KEY = "anilist_popular_v5"
+POPULAR_CACHE_KEY = "anilist_popular_v6"
 SCHEDULE_CACHE_KEY = "anilist_schedule_week_v2"
 DISCOVERY_CACHE_KEYS = (TRENDING_CACHE_KEY, TOP_AIRING_CACHE_KEY, POPULAR_CACHE_KEY, SCHEDULE_CACHE_KEY)
 MEDIA_LIST_BATCH_PAGES = 2
 MEDIA_LIST_PAGE_SIZE = 50
 MEDIA_LIST_BATCH_LIMIT = MEDIA_LIST_BATCH_PAGES * MEDIA_LIST_PAGE_SIZE
+POPULAR_GENRE_ALL_LABEL = "All genres"
+POPULAR_GENRES = (
+    "Action",
+    "Adventure",
+    "Comedy",
+    "Drama",
+    "Ecchi",
+    "Fantasy",
+    "Horror",
+    "Mahou Shoujo",
+    "Mecha",
+    "Music",
+    "Mystery",
+    "Psychological",
+    "Romance",
+    "Sci-Fi",
+    "Slice of Life",
+    "Sports",
+    "Supernatural",
+    "Thriller",
+)
 EMPTY_MEDIA_LIST = {
     "items": [],
     "error": None,
@@ -25,6 +47,24 @@ EMPTY_MEDIA_LIST = {
     "next_page": None,
     "has_more": False,
 }
+
+
+def normalize_popular_genre(genre: str | None) -> str | None:
+    cleaned = str(genre or "").strip()
+    if not cleaned or cleaned.casefold() == POPULAR_GENRE_ALL_LABEL.casefold():
+        return None
+    for value in POPULAR_GENRES:
+        if cleaned.casefold() == value.casefold():
+            return value
+    return cleaned
+
+
+def popular_cache_key(genre: str | None = None) -> str:
+    normalized = normalize_popular_genre(genre)
+    if normalized is None:
+        return POPULAR_CACHE_KEY
+    slug = re.sub(r"[^0-9a-z]+", "_", normalized.casefold()).strip("_")
+    return f"{POPULAR_CACHE_KEY}_{slug or 'genre'}"
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -154,10 +194,11 @@ def set_cache(conn: sqlite3.Connection, cache_key: str, payload: dict[str, Any])
         )
 
 
-def load_discovery(conn: sqlite3.Connection) -> dict[str, Any]:
+def load_discovery(conn: sqlite3.Connection, *, popular_genre: str | None = None) -> dict[str, Any]:
     trending = load_cache(conn, TRENDING_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
     top_airing = load_cache(conn, TOP_AIRING_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
-    popular = load_cache(conn, POPULAR_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
+    popular_key = popular_cache_key(popular_genre)
+    popular = load_cache(conn, popular_key) or (dict(EMPTY_MEDIA_LIST) | {"genre": normalize_popular_genre(popular_genre)})
     schedule = load_cache(conn, SCHEDULE_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
     return {
         "trending": trending,
@@ -166,7 +207,7 @@ def load_discovery(conn: sqlite3.Connection) -> dict[str, Any]:
         "schedule": schedule,
         "trending_fresh": cache_fetched_today(conn, TRENDING_CACHE_KEY),
         "top_airing_fresh": cache_fetched_today(conn, TOP_AIRING_CACHE_KEY),
-        "popular_fresh": cache_fetched_today(conn, POPULAR_CACHE_KEY),
+        "popular_fresh": cache_fetched_today(conn, popular_key),
         "schedule_fresh": cache_fetched_today(conn, SCHEDULE_CACHE_KEY),
     }
 
@@ -182,6 +223,7 @@ def refresh_media_list(
     start_page: int = 1,
     batch_pages: int = MEDIA_LIST_BATCH_PAGES,
     per_page: int = MEDIA_LIST_PAGE_SIZE,
+    extra_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = config or load_config()
     if not config.anilist.enabled:
@@ -192,6 +234,7 @@ def refresh_media_list(
             "next_page": None,
             "has_more": False,
         }
+        payload.update(extra_payload or {})
         set_cache(conn, cache_key, payload)
         return payload
     if not force and cache_fetched_today(conn, cache_key):
@@ -208,6 +251,7 @@ def refresh_media_list(
             "next_page": next_page,
             "has_more": next_page is not None,
         }
+        payload.update(extra_payload or {})
     except Exception as exc:
         existing = load_cache(conn, cache_key) or {"items": [], "fetched_at": None}
         payload = {**existing, "error": str(exc)}
@@ -269,6 +313,20 @@ def _media_batch(method_name: str):
     return fetch
 
 
+def _popular_media_batch(genre: str | None = None):
+    normalized = normalize_popular_genre(genre)
+
+    def fetch(provider: AniListProvider, start_page: int, batch_pages: int, per_page: int) -> dict[str, Any]:
+        return provider.get_popular_anime_batch(
+            start_page=start_page,
+            page_count=batch_pages,
+            per_page=per_page,
+            genre=normalized,
+        )
+
+    return fetch
+
+
 def _batch_params_for_limit(limit: int | None) -> tuple[int, int]:
     target = max(1, int(limit or MEDIA_LIST_BATCH_LIMIT))
     for per_page in range(min(MEDIA_LIST_PAGE_SIZE, target), 0, -1):
@@ -326,24 +384,26 @@ def refresh_popular(
     force: bool = False,
     provider: AniListProvider | None = None,
     limit: int | None = None,
+    genre: str | None = None,
 ) -> dict[str, Any]:
+    normalized_genre = normalize_popular_genre(genre)
     batch_pages, per_page = _batch_params_for_limit(limit)
     return refresh_media_list(
         conn,
-        POPULAR_CACHE_KEY,
-        _media_batch("get_popular_anime_batch"),
+        popular_cache_key(normalized_genre),
+        _popular_media_batch(normalized_genre),
         config,
         force=force,
         provider=provider,
         batch_pages=batch_pages,
         per_page=per_page,
+        extra_payload={"genre": normalized_genre},
     )
 
 
 MEDIA_PAGE_CONFIG = {
     "trending": (TRENDING_CACHE_KEY, _media_batch("get_trending_anime_batch")),
     "top_airing": (TOP_AIRING_CACHE_KEY, _media_batch("get_top_airing_anime_batch")),
-    "popular": (POPULAR_CACHE_KEY, _media_batch("get_popular_anime_batch")),
 }
 
 
@@ -353,7 +413,17 @@ def append_discovery_media_page(
     config: AppConfig | None = None,
     *,
     provider: AniListProvider | None = None,
+    genre: str | None = None,
 ) -> dict[str, Any]:
+    if page_name == "popular":
+        normalized_genre = normalize_popular_genre(genre)
+        return append_media_list(
+            conn,
+            popular_cache_key(normalized_genre),
+            _popular_media_batch(normalized_genre),
+            config,
+            provider=provider,
+        )
     try:
         cache_key, fetch_batch = MEDIA_PAGE_CONFIG[page_name]
     except KeyError as exc:
@@ -407,11 +477,12 @@ def refresh_discovery(
     *,
     force: bool = False,
     provider: AniListProvider | None = None,
+    popular_genre: str | None = None,
 ) -> dict[str, Any]:
     config = config or load_config()
     provider = provider or (AniListProvider(config.anilist) if config.anilist.enabled else None)
     trending = refresh_trending(conn, config, force=force, provider=provider)
     top_airing = refresh_top_airing(conn, config, force=force, provider=provider)
-    popular = refresh_popular(conn, config, force=force, provider=provider)
+    popular = refresh_popular(conn, config, force=force, provider=provider, genre=popular_genre)
     schedule = refresh_schedule(conn, config, force=force, provider=provider)
     return {"trending": trending, "top_airing": top_airing, "popular": popular, "schedule": schedule}

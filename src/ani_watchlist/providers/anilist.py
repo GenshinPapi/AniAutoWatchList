@@ -82,10 +82,10 @@ query ($page: Int, $perPage: Int) {
 
 
 POPULAR_MEDIA_QUERY = """
-query ($page: Int, $perPage: Int) {
+query ($page: Int, $perPage: Int, $genreIn: [String]) {
   Page(page: $page, perPage: $perPage) {
     pageInfo { hasNextPage currentPage }
-    media(type: ANIME, sort: POPULARITY_DESC) {
+    media(type: ANIME, sort: POPULARITY_DESC, genre_in: $genreIn) {
       id
       title { romaji english native userPreferred }
       synonyms
@@ -266,6 +266,11 @@ def confidence(query: str, payload: dict[str, Any]) -> float:
     return max(scores) if scores else 0.0
 
 
+def _genre_variables(genre: str | None) -> dict[str, Any]:
+    cleaned = str(genre or "").strip()
+    return {"genreIn": [cleaned]} if cleaned else {}
+
+
 class AniListProvider:
     name = "anilist"
 
@@ -340,13 +345,21 @@ class AniListProvider:
         links = self.get_external_links(media_id)
         return [link for link in links if str(link.get("type", "")).upper() == "STREAMING"]
 
-    def _get_media_list(self, query: str, limit: int) -> list[dict[str, Any]]:
+    def _get_media_list(
+        self,
+        query: str,
+        limit: int,
+        *,
+        variables: dict[str, Any] | None = None,
+    ) -> list[dict[str, Any]]:
         per_page = max(1, min(int(limit), 50))
         page = 1
         items: list[dict[str, Any]] = []
         max_pages = max(1, (int(limit) + per_page - 1) // per_page)
         while page <= max_pages and len(items) < limit:
-            data = self._request(query, {"page": page, "perPage": per_page})
+            request_variables = {"page": page, "perPage": per_page}
+            request_variables.update(variables or {})
+            data = self._request(query, request_variables)
             page_data = data.get("Page") or {}
             items.extend(list(page_data.get("media") or []))
             page_info = page_data.get("pageInfo") or {}
@@ -362,6 +375,7 @@ class AniListProvider:
         start_page: int = 1,
         page_count: int = 2,
         per_page: int = 50,
+        variables: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         page = max(1, int(start_page))
         remaining_pages = max(1, int(page_count))
@@ -369,7 +383,9 @@ class AniListProvider:
         items: list[dict[str, Any]] = []
         next_page: int | None = page
         while remaining_pages > 0 and next_page is not None:
-            data = self._request(query, {"page": page, "perPage": per_page})
+            request_variables = {"page": page, "perPage": per_page}
+            request_variables.update(variables or {})
+            data = self._request(query, request_variables)
             page_data = data.get("Page") or {}
             items.extend(list(page_data.get("media") or []))
             page_info = page_data.get("pageInfo") or {}
@@ -383,8 +399,8 @@ class AniListProvider:
     def get_trending_anime(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._get_media_list(TRENDING_QUERY, limit)
 
-    def get_popular_anime(self, limit: int = 20) -> list[dict[str, Any]]:
-        return self._get_media_list(POPULAR_MEDIA_QUERY, limit)
+    def get_popular_anime(self, limit: int = 20, *, genre: str | None = None) -> list[dict[str, Any]]:
+        return self._get_media_list(POPULAR_MEDIA_QUERY, limit, variables=_genre_variables(genre))
 
     def get_top_airing_anime(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._get_media_list(TOP_AIRING_QUERY, limit)
@@ -409,12 +425,14 @@ class AniListProvider:
         start_page: int = 1,
         page_count: int = 2,
         per_page: int = 50,
+        genre: str | None = None,
     ) -> dict[str, Any]:
         return self._get_media_batch(
             POPULAR_MEDIA_QUERY,
             start_page=start_page,
             page_count=page_count,
             per_page=per_page,
+            variables=_genre_variables(genre),
         )
 
     def get_top_airing_anime_batch(

@@ -18,7 +18,15 @@ except Exception:  # pragma: no cover - optional GUI enhancement
 
 from .config import load_config
 from .db import initialize
-from .discovery import append_discovery_media_page, load_discovery, refresh_discovery
+from .discovery import (
+    POPULAR_GENRES,
+    POPULAR_GENRE_ALL_LABEL,
+    append_discovery_media_page,
+    load_discovery,
+    normalize_popular_genre,
+    refresh_discovery,
+    refresh_popular,
+)
 from .launcher import (
     LaunchError,
     allanime_episode_available,
@@ -182,6 +190,7 @@ class WatchlistApp:
         self.selected_status = tk.StringVar(value="watching")
         self.search_text = tk.StringVar()
         self.detail_status = tk.StringVar(value=STATUS_LABELS["watching"])
+        self.popular_genre = tk.StringVar(value=POPULAR_GENRE_ALL_LABEL)
         self.show_alt_title = tk.BooleanVar(value=False)
         self.selected_anime_id: int | None = None
         self.detail_primary_title = ""
@@ -189,7 +198,7 @@ class WatchlistApp:
         self.current_page = "library"
         self.images: dict[str, object] = {}
         self.current_rows = []
-        self.discovery_data = load_discovery(self.conn)
+        self.discovery_data = load_discovery(self.conn, popular_genre=self.current_popular_genre())
         self.discovery_refreshing = False
         self.discovery_loading_more: set[str] = set()
         self.discovery_error: str | None = None
@@ -203,6 +212,7 @@ class WatchlistApp:
         self.discovery_canvases: dict[str, tk.Canvas] = {}
         self.discovery_frames: dict[str, tk.Frame] = {}
         self.discovery_windows: dict[str, int] = {}
+        self.popular_genre_box: ttk.Combobox | None = None
         self.discovery_columns = {name: 1 for name in DISCOVERY_MEDIA_PAGES}
         self.discovery_page_indexes = {name: 0 for name in DISCOVERY_MEDIA_PAGES}
         self._configure_style()
@@ -287,6 +297,12 @@ class WatchlistApp:
             bordercolor=COLORS["border"],
         )
         style.map("Dark.Treeview", background=[("selected", COLORS["accent"])], foreground=[("selected", "#111111")])
+
+    def current_popular_genre(self) -> str | None:
+        return normalize_popular_genre(self.popular_genre.get())
+
+    def reload_discovery_data(self) -> None:
+        self.discovery_data = load_discovery(self.conn, popular_genre=self.current_popular_genre())
 
     def _build(self) -> None:
         self.root.columnconfigure(0, weight=1)
@@ -431,6 +447,20 @@ class WatchlistApp:
         ttk.Label(header, text=page_config["title"], style="Title.TLabel").grid(row=0, column=0, sticky="w")
         controls = tk.Frame(header, bg=COLORS["bg"])
         controls.grid(row=0, column=1, sticky="e")
+        control_column = 0
+        if page_name == "popular":
+            genre_box = ttk.Combobox(
+                controls,
+                textvariable=self.popular_genre,
+                values=(POPULAR_GENRE_ALL_LABEL, *POPULAR_GENRES),
+                state="readonly",
+                width=18,
+                style="Dark.TCombobox",
+            )
+            genre_box.grid(row=0, column=control_column, padx=(8, 0))
+            genre_box.bind("<<ComboboxSelected>>", lambda _event: self.on_popular_genre_changed())
+            self.popular_genre_box = genre_box
+            control_column += 1
         prev_button = ttk.Button(
             controls,
             text="Prev",
@@ -438,9 +468,11 @@ class WatchlistApp:
             style="Dark.TButton",
             command=lambda value=page_name: self.change_discovery_page(value, -1),
         )
-        prev_button.grid(row=0, column=0, padx=(8, 0))
+        prev_button.grid(row=0, column=control_column, padx=(8, 0))
+        control_column += 1
         page_label = tk.Label(controls, text="", bg=COLORS["bg"], fg=COLORS["muted"], width=10, anchor="center")
-        page_label.grid(row=0, column=1, padx=(8, 0))
+        page_label.grid(row=0, column=control_column, padx=(8, 0))
+        control_column += 1
         next_button = ttk.Button(
             controls,
             text="Next",
@@ -448,8 +480,8 @@ class WatchlistApp:
             style="Dark.TButton",
             command=lambda value=page_name: self.change_discovery_page(value, 1),
         )
-        next_button.grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(header, text="Refresh", style="Dark.TButton", command=lambda: self.start_discovery_refresh(force=True)).grid(
+        next_button.grid(row=0, column=control_column, padx=(8, 0))
+        ttk.Button(header, text="Refresh", style="Dark.TButton", command=lambda value=page_name: self.start_discovery_refresh(force=True, page_name=value)).grid(
             row=0, column=2, padx=(8, 0), sticky="e"
         )
         self.discovery_prev_buttons[page_name] = prev_button
@@ -745,6 +777,15 @@ class WatchlistApp:
     def show_popular(self) -> None:
         self.show_discovery_list("popular")
 
+    def on_popular_genre_changed(self) -> None:
+        self.discovery_page_indexes["popular"] = 0
+        self.reload_discovery_data()
+        if self.current_page == "popular":
+            self.render_discovery_list("popular")
+        popular = self.discovery_data.get("popular") or {}
+        if not popular.get("items"):
+            self.start_discovery_refresh(force=True, page_name="popular")
+
     def change_discovery_page(self, page_name: str, direction: int) -> None:
         items = list(((self.discovery_data.get(page_name) or {}).get("items")) or [])
         data = self.discovery_data.get(page_name) or {}
@@ -773,12 +814,13 @@ class WatchlistApp:
         label = self.discovery_status_labels.get(page_name)
         if label is not None:
             label.configure(text="Loading more AniList results...", fg=COLORS["muted"])
+        popular_genre = self.current_popular_genre() if page_name == "popular" else None
 
         def worker() -> None:
             error = None
             try:
                 with initialize() as conn:
-                    append_discovery_media_page(conn, page_name, load_config())
+                    append_discovery_media_page(conn, page_name, load_config(), genre=popular_genre)
             except Exception as exc:  # pragma: no cover - defensive UI boundary
                 error = str(exc)
             self.root.after(0, lambda: self.finish_discovery_load_more(page_name, target_page_index, error))
@@ -793,7 +835,7 @@ class WatchlistApp:
     ) -> None:
         self.discovery_loading_more.discard(page_name)
         self.discovery_error = error
-        self.discovery_data = load_discovery(self.conn)
+        self.reload_discovery_data()
         items = list(((self.discovery_data.get(page_name) or {}).get("items")) or [])
         page_count = discovery_page_count(len(items))
         self.discovery_page_indexes[page_name] = max(0, min(target_page_index, page_count - 1))
@@ -986,16 +1028,22 @@ class WatchlistApp:
             title, _alt_title = split_display_title(event["anime_title"] or "-")
             self.activity_list.insert(tk.END, f"{local_time(event['created_at'])}  {event['event_type']}  {title}")
 
-    def start_discovery_refresh(self, *, force: bool = False) -> None:
+    def start_discovery_refresh(self, *, force: bool = False, page_name: str | None = None) -> None:
         if self.discovery_refreshing:
             return
-        discovery_fresh = all(
-            self.discovery_data.get(f"{page_name}_fresh")
-            for page_name in (*DISCOVERY_MEDIA_PAGES.keys(), "schedule")
-        )
-        if not force and discovery_fresh:
-            self.update_discovery_status()
-            return
+        popular_genre = self.current_popular_genre()
+        if page_name == "popular":
+            if not force and self.discovery_data.get("popular_fresh"):
+                self.update_discovery_status()
+                return
+        else:
+            discovery_fresh = all(
+                self.discovery_data.get(f"{value}_fresh")
+                for value in (*DISCOVERY_MEDIA_PAGES.keys(), "schedule")
+            )
+            if not force and discovery_fresh:
+                self.update_discovery_status()
+                return
         self.discovery_refreshing = True
         self.discovery_error = None
         self.update_discovery_status(refreshing=True)
@@ -1004,7 +1052,10 @@ class WatchlistApp:
             error = None
             try:
                 with initialize() as conn:
-                    refresh_discovery(conn, load_config(), force=force)
+                    if page_name == "popular":
+                        refresh_popular(conn, load_config(), force=force, genre=popular_genre)
+                    else:
+                        refresh_discovery(conn, load_config(), force=force, popular_genre=popular_genre)
             except Exception as exc:  # pragma: no cover - defensive UI boundary
                 error = str(exc)
             self.root.after(0, lambda: self.finish_discovery_refresh(error))
@@ -1014,7 +1065,7 @@ class WatchlistApp:
     def finish_discovery_refresh(self, error: str | None = None) -> None:
         self.discovery_refreshing = False
         self.discovery_error = error
-        self.discovery_data = load_discovery(self.conn)
+        self.reload_discovery_data()
         self.update_discovery_status()
         if self.current_page in DISCOVERY_MEDIA_PAGES:
             self.render_discovery_list(self.current_page)

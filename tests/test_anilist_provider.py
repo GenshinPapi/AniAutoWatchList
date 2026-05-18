@@ -73,6 +73,16 @@ def test_popular_query_all_time_omits_status_filter(app_env) -> None:
     assert FakeAniListProvider().get_popular_anime(limit=1) == [{"id": 21}]
 
 
+def test_popular_query_can_filter_by_genre(app_env) -> None:
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            assert "genre_in: $genreIn" in query
+            assert variables == {"page": 1, "perPage": 2, "genreIn": ["Action"]}
+            return {"Page": {"media": [{"id": 31}, {"id": 32}, {"id": 33}]}}
+
+    assert FakeAniListProvider().get_popular_anime(limit=2, genre="Action") == [{"id": 31}, {"id": 32}]
+
+
 def test_popular_query_pages_until_requested_limit(app_env) -> None:
     calls = []
 
@@ -114,6 +124,28 @@ def test_media_batch_returns_next_page_for_incremental_loading(app_env) -> None:
     assert calls == [{"page": 3, "perPage": 50}, {"page": 4, "perPage": 50}]
     assert len(batch["items"]) == 100
     assert batch["next_page"] is None
+
+
+def test_popular_media_batch_passes_genre_filter(app_env) -> None:
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            assert "genre_in: $genreIn" in query
+            assert variables == {"page": 2, "perPage": 25, "genreIn": ["Romance"]}
+            return {
+                "Page": {
+                    "pageInfo": {"hasNextPage": True, "currentPage": 2},
+                    "media": [{"id": 41}],
+                }
+            }
+
+    batch = FakeAniListProvider().get_popular_anime_batch(
+        start_page=2,
+        page_count=1,
+        per_page=25,
+        genre="Romance",
+    )
+
+    assert batch == {"items": [{"id": 41}], "next_page": 3}
 
 
 def test_display_title_labels_adult_and_explicit_uncensored_variants() -> None:

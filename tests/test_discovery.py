@@ -9,6 +9,8 @@ from ani_watchlist.discovery import (
     append_discovery_media_page,
     cache_fetched_today,
     load_discovery,
+    normalize_popular_genre,
+    popular_cache_key,
     refresh_discovery,
     refresh_popular,
     refresh_schedule,
@@ -21,7 +23,7 @@ from ani_watchlist.providers.anilist import AniListProvider
 
 
 class FakeDiscoveryProvider(AniListProvider):
-    def _media_items(self, kind: str, start: int, count: int) -> list[dict[str, object]]:
+    def _media_items(self, kind: str, start: int, count: int, genre: str | None = None) -> list[dict[str, object]]:
         base = {
             "trending": (21, "ONE PIECE", "ONE PIECE", "RELEASING", 100),
             "top_airing": (22, "Frieren", "Sousou no Frieren", "RELEASING", 999),
@@ -30,7 +32,8 @@ class FakeDiscoveryProvider(AniListProvider):
         media_id, english, romaji, status, metric = base
         items: list[dict[str, object]] = []
         for offset in range(count):
-            current_id = media_id + start + offset
+            genre_offset = 5000 if genre else 0
+            current_id = media_id + genre_offset + start + offset
             items.append(
                 {
                     "id": current_id,
@@ -65,10 +68,10 @@ class FakeDiscoveryProvider(AniListProvider):
         count = page_count * per_page
         return {"items": self._media_items("top_airing", start, count), "next_page": start_page + page_count}
 
-    def get_popular_anime_batch(self, *, start_page: int = 1, page_count: int = 2, per_page: int = 50):  # noqa: ANN201
+    def get_popular_anime_batch(self, *, start_page: int = 1, page_count: int = 2, per_page: int = 50, genre: str | None = None):  # noqa: ANN201
         start = (start_page - 1) * per_page
         count = page_count * per_page
-        return {"items": self._media_items("popular", start, count), "next_page": start_page + page_count}
+        return {"items": self._media_items("popular", start, count, genre), "next_page": start_page + page_count}
 
     def get_airing_schedule(self, start_timestamp: int, end_timestamp: int, *, limit: int = 140):  # noqa: ANN201
         return [
@@ -128,6 +131,24 @@ def test_refresh_top_airing_and_popular_cache_once_per_day(app_env) -> None:
     discovery = load_discovery(conn)
     assert discovery["top_airing"]["items"][0]["id"] == 22
     assert discovery["popular"]["items"][0]["id"] == 23
+
+
+def test_refresh_popular_uses_separate_cache_for_genre(app_env) -> None:
+    conn = initialize()
+    provider = FakeDiscoveryProvider()
+
+    default = refresh_popular(conn, TEST_CONFIG, force=True, provider=provider, limit=10)
+    action = refresh_popular(conn, TEST_CONFIG, force=True, provider=provider, limit=10, genre="action")
+
+    assert normalize_popular_genre("action") == "Action"
+    assert popular_cache_key(None) == POPULAR_CACHE_KEY
+    assert popular_cache_key("Action") != POPULAR_CACHE_KEY
+    assert default["genre"] is None
+    assert action["genre"] == "Action"
+    assert default["items"][0]["id"] == 23
+    assert action["items"][0]["id"] == 5023
+    assert load_discovery(conn)["popular"]["items"][0]["id"] == 23
+    assert load_discovery(conn, popular_genre="Action")["popular"]["items"][0]["id"] == 5023
 
 
 def test_refresh_discovery_populates_all_discovery_tabs(app_env) -> None:

@@ -184,6 +184,7 @@ The GUI includes:
 - Trending tab
 - Top Airing tab
 - Most Popular tab
+- Genre filter for Most Popular
 - Discovery tabs load 100 titles at a time and fetch the next batch as you page forward
 - 7-day release schedule tab
 - Status tabs
