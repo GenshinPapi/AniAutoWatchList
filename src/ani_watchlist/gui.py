@@ -19,11 +19,11 @@ except Exception:  # pragma: no cover - optional GUI enhancement
 from .config import load_config
 from .db import initialize
 from .discovery import (
-    POPULAR_GENRES,
+    POPULAR_FILTERS,
     POPULAR_GENRE_ALL_LABEL,
     append_discovery_media_page,
     load_discovery,
-    normalize_popular_genre,
+    popular_filter_label,
     refresh_discovery,
     refresh_popular,
 )
@@ -299,7 +299,7 @@ class WatchlistApp:
         style.map("Dark.Treeview", background=[("selected", COLORS["accent"])], foreground=[("selected", "#111111")])
 
     def current_popular_genre(self) -> str | None:
-        return normalize_popular_genre(self.popular_genre.get())
+        return popular_filter_label(self.popular_genre.get())
 
     def reload_discovery_data(self) -> None:
         self.discovery_data = load_discovery(self.conn, popular_genre=self.current_popular_genre())
@@ -452,7 +452,7 @@ class WatchlistApp:
             genre_box = ttk.Combobox(
                 controls,
                 textvariable=self.popular_genre,
-                values=(POPULAR_GENRE_ALL_LABEL, *POPULAR_GENRES),
+                values=(POPULAR_GENRE_ALL_LABEL, *POPULAR_FILTERS),
                 state="readonly",
                 width=18,
                 style="Dark.TCombobox",

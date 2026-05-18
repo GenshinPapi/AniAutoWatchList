@@ -9,7 +9,9 @@ from ani_watchlist.discovery import (
     append_discovery_media_page,
     cache_fetched_today,
     load_discovery,
+    normalize_popular_filter,
     normalize_popular_genre,
+    popular_filter_label,
     popular_cache_key,
     refresh_discovery,
     refresh_popular,
@@ -23,7 +25,14 @@ from ani_watchlist.providers.anilist import AniListProvider
 
 
 class FakeDiscoveryProvider(AniListProvider):
-    def _media_items(self, kind: str, start: int, count: int, genre: str | None = None) -> list[dict[str, object]]:
+    def _media_items(
+        self,
+        kind: str,
+        start: int,
+        count: int,
+        genre: str | None = None,
+        tag: str | None = None,
+    ) -> list[dict[str, object]]:
         base = {
             "trending": (21, "ONE PIECE", "ONE PIECE", "RELEASING", 100),
             "top_airing": (22, "Frieren", "Sousou no Frieren", "RELEASING", 999),
@@ -32,8 +41,8 @@ class FakeDiscoveryProvider(AniListProvider):
         media_id, english, romaji, status, metric = base
         items: list[dict[str, object]] = []
         for offset in range(count):
-            genre_offset = 5000 if genre else 0
-            current_id = media_id + genre_offset + start + offset
+            filter_offset = 5000 if genre else 8000 if tag else 0
+            current_id = media_id + filter_offset + start + offset
             items.append(
                 {
                     "id": current_id,
@@ -68,10 +77,18 @@ class FakeDiscoveryProvider(AniListProvider):
         count = page_count * per_page
         return {"items": self._media_items("top_airing", start, count), "next_page": start_page + page_count}
 
-    def get_popular_anime_batch(self, *, start_page: int = 1, page_count: int = 2, per_page: int = 50, genre: str | None = None):  # noqa: ANN201
+    def get_popular_anime_batch(
+        self,
+        *,
+        start_page: int = 1,
+        page_count: int = 2,
+        per_page: int = 50,
+        genre: str | None = None,
+        tag: str | None = None,
+    ):  # noqa: ANN201
         start = (start_page - 1) * per_page
         count = page_count * per_page
-        return {"items": self._media_items("popular", start, count, genre), "next_page": start_page + page_count}
+        return {"items": self._media_items("popular", start, count, genre, tag), "next_page": start_page + page_count}
 
     def get_airing_schedule(self, start_timestamp: int, end_timestamp: int, *, limit: int = 140):  # noqa: ANN201
         return [
@@ -149,6 +166,24 @@ def test_refresh_popular_uses_separate_cache_for_genre(app_env) -> None:
     assert action["items"][0]["id"] == 5023
     assert load_discovery(conn)["popular"]["items"][0]["id"] == 23
     assert load_discovery(conn, popular_genre="Action")["popular"]["items"][0]["id"] == 5023
+
+
+def test_refresh_popular_can_filter_by_genre_like_tag(app_env) -> None:
+    conn = initialize()
+    provider = FakeDiscoveryProvider()
+
+    payload = refresh_popular(conn, TEST_CONFIG, force=True, provider=provider, limit=10, genre="isekai")
+
+    assert normalize_popular_genre("Isekai") is None
+    assert normalize_popular_filter("isekai") == ("tag", "Isekai")
+    assert popular_filter_label("isekai") == "Isekai"
+    assert popular_cache_key("Isekai") != POPULAR_CACHE_KEY
+    assert payload["genre"] is None
+    assert payload["tag"] == "Isekai"
+    assert payload["filter_type"] == "tag"
+    assert payload["filter"] == "Isekai"
+    assert payload["items"][0]["id"] == 8023
+    assert load_discovery(conn, popular_genre="Isekai")["popular"]["items"][0]["id"] == 8023
 
 
 def test_refresh_discovery_populates_all_discovery_tabs(app_env) -> None:

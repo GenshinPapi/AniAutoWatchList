@@ -13,7 +13,7 @@ from .store import now_iso
 
 TRENDING_CACHE_KEY = "anilist_trending_v3"
 TOP_AIRING_CACHE_KEY = "anilist_top_airing_v3"
-POPULAR_CACHE_KEY = "anilist_popular_v6"
+POPULAR_CACHE_KEY = "anilist_popular_v7"
 SCHEDULE_CACHE_KEY = "anilist_schedule_week_v2"
 DISCOVERY_CACHE_KEYS = (TRENDING_CACHE_KEY, TOP_AIRING_CACHE_KEY, POPULAR_CACHE_KEY, SCHEDULE_CACHE_KEY)
 MEDIA_LIST_BATCH_PAGES = 2
@@ -27,6 +27,7 @@ POPULAR_GENRES = (
     "Drama",
     "Ecchi",
     "Fantasy",
+    "Hentai",
     "Horror",
     "Mahou Shoujo",
     "Mecha",
@@ -40,6 +41,55 @@ POPULAR_GENRES = (
     "Supernatural",
     "Thriller",
 )
+POPULAR_TAGS = (
+    "Isekai",
+    "Harem",
+    "Shounen",
+    "Seinen",
+    "Shoujo",
+    "Josei",
+    "Iyashikei",
+    "Cute Girls Doing Cute Things",
+    "Boys' Love",
+    "Girls' Love",
+    "Aliens",
+    "Animals",
+    "Assassins",
+    "Battle Royale",
+    "Body Horror",
+    "Crime",
+    "Cyberpunk",
+    "Demons",
+    "Dragons",
+    "Dungeon",
+    "Ghost",
+    "Gods",
+    "Guns",
+    "Historical",
+    "Idol",
+    "Kaiju",
+    "Martial Arts",
+    "Military",
+    "Monster Girl",
+    "Ninja",
+    "Pirates",
+    "Post-Apocalyptic",
+    "Robots",
+    "Samurai",
+    "School",
+    "Space",
+    "Super Power",
+    "Survival",
+    "Time Manipulation",
+    "Vampire",
+    "Video Games",
+    "Virtual World",
+    "War",
+    "Witch",
+    "Yandere",
+    "Zombie",
+)
+POPULAR_FILTERS = (*POPULAR_GENRES, *POPULAR_TAGS)
 EMPTY_MEDIA_LIST = {
     "items": [],
     "error": None,
@@ -49,22 +99,34 @@ EMPTY_MEDIA_LIST = {
 }
 
 
-def normalize_popular_genre(genre: str | None) -> str | None:
-    cleaned = str(genre or "").strip()
+def normalize_popular_filter(value: str | None) -> tuple[str | None, str | None]:
+    cleaned = str(value or "").strip()
     if not cleaned or cleaned.casefold() == POPULAR_GENRE_ALL_LABEL.casefold():
-        return None
-    for value in POPULAR_GENRES:
-        if cleaned.casefold() == value.casefold():
-            return value
-    return cleaned
+        return None, None
+    for genre in POPULAR_GENRES:
+        if cleaned.casefold() == genre.casefold():
+            return "genre", genre
+    for tag in POPULAR_TAGS:
+        if cleaned.casefold() == tag.casefold():
+            return "tag", tag
+    return "tag", cleaned
 
 
-def popular_cache_key(genre: str | None = None) -> str:
-    normalized = normalize_popular_genre(genre)
-    if normalized is None:
+def normalize_popular_genre(genre: str | None) -> str | None:
+    filter_type, filter_value = normalize_popular_filter(genre)
+    return filter_value if filter_type == "genre" else None
+
+
+def popular_filter_label(value: str | None) -> str | None:
+    return normalize_popular_filter(value)[1]
+
+
+def popular_cache_key(filter_value: str | None = None) -> str:
+    filter_type, normalized = normalize_popular_filter(filter_value)
+    if filter_type is None or normalized is None:
         return POPULAR_CACHE_KEY
     slug = re.sub(r"[^0-9a-z]+", "_", normalized.casefold()).strip("_")
-    return f"{POPULAR_CACHE_KEY}_{slug or 'genre'}"
+    return f"{POPULAR_CACHE_KEY}_{filter_type}_{slug or 'filter'}"
 
 
 def _parse_iso(value: str | None) -> datetime | None:
@@ -198,7 +260,16 @@ def load_discovery(conn: sqlite3.Connection, *, popular_genre: str | None = None
     trending = load_cache(conn, TRENDING_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
     top_airing = load_cache(conn, TOP_AIRING_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
     popular_key = popular_cache_key(popular_genre)
-    popular = load_cache(conn, popular_key) or (dict(EMPTY_MEDIA_LIST) | {"genre": normalize_popular_genre(popular_genre)})
+    filter_type, filter_value = normalize_popular_filter(popular_genre)
+    popular = load_cache(conn, popular_key) or (
+        dict(EMPTY_MEDIA_LIST)
+        | {
+            "filter_type": filter_type,
+            "filter": filter_value,
+            "genre": filter_value if filter_type == "genre" else None,
+            "tag": filter_value if filter_type == "tag" else None,
+        }
+    )
     schedule = load_cache(conn, SCHEDULE_CACHE_KEY) or dict(EMPTY_MEDIA_LIST)
     return {
         "trending": trending,
@@ -313,15 +384,16 @@ def _media_batch(method_name: str):
     return fetch
 
 
-def _popular_media_batch(genre: str | None = None):
-    normalized = normalize_popular_genre(genre)
+def _popular_media_batch(filter_value: str | None = None):
+    filter_type, normalized = normalize_popular_filter(filter_value)
 
     def fetch(provider: AniListProvider, start_page: int, batch_pages: int, per_page: int) -> dict[str, Any]:
         return provider.get_popular_anime_batch(
             start_page=start_page,
             page_count=batch_pages,
             per_page=per_page,
-            genre=normalized,
+            genre=normalized if filter_type == "genre" else None,
+            tag=normalized if filter_type == "tag" else None,
         )
 
     return fetch
@@ -386,18 +458,23 @@ def refresh_popular(
     limit: int | None = None,
     genre: str | None = None,
 ) -> dict[str, Any]:
-    normalized_genre = normalize_popular_genre(genre)
+    filter_type, filter_value = normalize_popular_filter(genre)
     batch_pages, per_page = _batch_params_for_limit(limit)
     return refresh_media_list(
         conn,
-        popular_cache_key(normalized_genre),
-        _popular_media_batch(normalized_genre),
+        popular_cache_key(filter_value),
+        _popular_media_batch(filter_value),
         config,
         force=force,
         provider=provider,
         batch_pages=batch_pages,
         per_page=per_page,
-        extra_payload={"genre": normalized_genre},
+        extra_payload={
+            "filter_type": filter_type,
+            "filter": filter_value,
+            "genre": filter_value if filter_type == "genre" else None,
+            "tag": filter_value if filter_type == "tag" else None,
+        },
     )
 
 
@@ -416,11 +493,11 @@ def append_discovery_media_page(
     genre: str | None = None,
 ) -> dict[str, Any]:
     if page_name == "popular":
-        normalized_genre = normalize_popular_genre(genre)
+        filter_type, filter_value = normalize_popular_filter(genre)
         return append_media_list(
             conn,
-            popular_cache_key(normalized_genre),
-            _popular_media_batch(normalized_genre),
+            popular_cache_key(filter_value if filter_type is not None else None),
+            _popular_media_batch(filter_value if filter_type is not None else None),
             config,
             provider=provider,
         )

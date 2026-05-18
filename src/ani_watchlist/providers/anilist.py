@@ -82,10 +82,10 @@ query ($page: Int, $perPage: Int) {
 
 
 POPULAR_MEDIA_QUERY = """
-query ($page: Int, $perPage: Int, $genreIn: [String]) {
+query ($page: Int, $perPage: Int, $genreIn: [String], $tagIn: [String]) {
   Page(page: $page, perPage: $perPage) {
     pageInfo { hasNextPage currentPage }
-    media(type: ANIME, sort: POPULARITY_DESC, genre_in: $genreIn) {
+    media(type: ANIME, sort: POPULARITY_DESC, genre_in: $genreIn, tag_in: $tagIn) {
       id
       title { romaji english native userPreferred }
       synonyms
@@ -266,9 +266,15 @@ def confidence(query: str, payload: dict[str, Any]) -> float:
     return max(scores) if scores else 0.0
 
 
-def _genre_variables(genre: str | None) -> dict[str, Any]:
+def _popular_filter_variables(genre: str | None = None, tag: str | None = None) -> dict[str, Any]:
+    variables: dict[str, Any] = {}
     cleaned = str(genre or "").strip()
-    return {"genreIn": [cleaned]} if cleaned else {}
+    if cleaned:
+        variables["genreIn"] = [cleaned]
+    cleaned_tag = str(tag or "").strip()
+    if cleaned_tag:
+        variables["tagIn"] = [cleaned_tag]
+    return variables
 
 
 class AniListProvider:
@@ -399,8 +405,14 @@ class AniListProvider:
     def get_trending_anime(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._get_media_list(TRENDING_QUERY, limit)
 
-    def get_popular_anime(self, limit: int = 20, *, genre: str | None = None) -> list[dict[str, Any]]:
-        return self._get_media_list(POPULAR_MEDIA_QUERY, limit, variables=_genre_variables(genre))
+    def get_popular_anime(
+        self,
+        limit: int = 20,
+        *,
+        genre: str | None = None,
+        tag: str | None = None,
+    ) -> list[dict[str, Any]]:
+        return self._get_media_list(POPULAR_MEDIA_QUERY, limit, variables=_popular_filter_variables(genre, tag))
 
     def get_top_airing_anime(self, limit: int = 20) -> list[dict[str, Any]]:
         return self._get_media_list(TOP_AIRING_QUERY, limit)
@@ -426,13 +438,14 @@ class AniListProvider:
         page_count: int = 2,
         per_page: int = 50,
         genre: str | None = None,
+        tag: str | None = None,
     ) -> dict[str, Any]:
         return self._get_media_batch(
             POPULAR_MEDIA_QUERY,
             start_page=start_page,
             page_count=page_count,
             per_page=per_page,
-            variables=_genre_variables(genre),
+            variables=_popular_filter_variables(genre, tag),
         )
 
     def get_top_airing_anime_batch(
