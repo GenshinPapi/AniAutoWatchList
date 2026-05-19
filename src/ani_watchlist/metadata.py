@@ -142,6 +142,37 @@ def apply_selected_metadata(
     update_anime_fields(conn, anime_id, **fields)
 
 
+def store_selected_metadata_payload(
+    conn: sqlite3.Connection,
+    anime_id: int,
+    provider_media_id: str | int | None,
+    payload: dict[str, Any],
+    cover_path: str | None = None,
+) -> None:
+    media_id = str(provider_media_id or payload.get("id") or "").strip()
+    if not media_id:
+        return
+    ts = now_iso()
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO metadata_matches(
+                anime_id, provider, provider_media_id, confidence_score, selected, payload_json, created_at
+            ) VALUES (?, 'anilist', ?, 1.0, 1, ?, ?)
+            ON CONFLICT(anime_id, provider, provider_media_id) DO UPDATE SET
+                confidence_score = 1.0,
+                selected = 1,
+                payload_json = excluded.payload_json
+            """,
+            (anime_id, media_id, json.dumps(payload, sort_keys=True), ts),
+        )
+        conn.execute(
+            "UPDATE metadata_matches SET selected = 0 WHERE anime_id = ? AND provider = 'anilist' AND provider_media_id != ?",
+            (anime_id, media_id),
+        )
+    apply_selected_metadata(conn, anime_id, media_id, payload, cover_path)
+
+
 def search_and_store_matches(
     conn: sqlite3.Connection,
     anime_id: int,

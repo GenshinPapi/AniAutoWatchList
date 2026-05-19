@@ -40,6 +40,7 @@ exit "$code"
 
 EPISODE_COUNT_SUFFIX_RE = re.compile(r"\s*\(\s*\d+(?:\.\d+)?\s+episodes?\s*\)\s*$", re.IGNORECASE)
 SHORT_SOURCE_SUFFIX_RE = re.compile(r"\s*\((?=[A-Za-z0-9_-]{1,8}\))(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\)\s*$")
+CONTENT_LABEL_SUFFIX_RE = re.compile(r"\s*\[[^\]]+\]\s*$")
 ALLANIME_API = "https://api.allanime.day/api"
 ALLANIME_REFERER = "https://allmanga.to"
 ALLANIME_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
@@ -89,7 +90,13 @@ def clean_ani_cli_search_title(title: str) -> str:
 
 
 def _without_content_labels(title: str) -> str:
-    return re.sub(r"\s*\[[^\]]+\]\s*$", "", title.strip()).strip()
+    cleaned = title.strip()
+    while cleaned:
+        without_label = CONTENT_LABEL_SUFFIX_RE.sub("", cleaned).strip()
+        if without_label == cleaned:
+            return cleaned
+        cleaned = without_label
+    return cleaned
 
 
 def _title_norm(title: str) -> str:

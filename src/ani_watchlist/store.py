@@ -17,7 +17,7 @@ def now_iso() -> str:
 
 
 def clean_display_title(title: str) -> str:
-    title = title.replace("+", " ").strip()
+    title = re.sub(r"(?<!\d)\+(?!\])", " ", title).strip()
     title = re.sub(r"\s+", " ", title)
     title = re.sub(r"\s*\(\s*\d+(?:\.\d+)?\s+episodes?\s*\)\s*$", "", title, flags=re.I)
     return title.strip() or "Unknown title"

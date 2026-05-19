@@ -113,6 +113,7 @@ def test_refresh_trending_caches_once_per_day(app_env) -> None:
     payload = refresh_trending(conn, TEST_CONFIG, force=True, provider=FakeDiscoveryProvider(), limit=10)
 
     assert payload["items"][0]["display_title"] == "ONE PIECE"
+    assert payload["items"][0]["metadata_payload"]["title"]["romaji"] == "ONE PIECE"
     assert payload["items"][0]["cover_path"] == "/tmp/anilist-21.jpg"
     assert len(payload["items"]) == 10
     assert payload["has_more"] is True

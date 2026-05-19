@@ -68,6 +68,10 @@ def test_clean_ani_cli_search_title_preserves_meaningful_year_suffix() -> None:
     assert launcher.clean_ani_cli_search_title("Fruits Basket (2019) (25 episodes)") == "Fruits Basket (2019)"
 
 
+def test_title_variants_strip_stacked_content_labels_from_existing_rows() -> None:
+    assert launcher.ani_cli_title_variants("Overflow [18 ] [18+]", None, None) == ["Overflow"]
+
+
 def test_choose_search_title_prefers_cleaned_source_title() -> None:
     title = launcher.choose_ani_cli_search_title("ONE PIECE", "One Piece (1P) (1161 episodes)")
 

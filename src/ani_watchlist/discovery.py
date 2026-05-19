@@ -161,6 +161,27 @@ def _cover_url(media: dict[str, Any]) -> str | None:
     return cover.get("extraLarge") or cover.get("large") or cover.get("medium")
 
 
+def _metadata_payload(media: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: media.get(key)
+        for key in (
+            "id",
+            "title",
+            "synonyms",
+            "episodes",
+            "status",
+            "format",
+            "isAdult",
+            "season",
+            "seasonYear",
+            "coverImage",
+            "siteUrl",
+            "nextAiringEpisode",
+        )
+        if key in media
+    }
+
+
 def _normalize_media(media: dict[str, Any], provider: AniListProvider | None = None) -> dict[str, Any]:
     media_id = str(media.get("id") or media.get("mediaId") or "")
     cover_url = _cover_url(media)
@@ -191,6 +212,7 @@ def _normalize_media(media: dict[str, Any], provider: AniListProvider | None = N
         "banner_image": media.get("bannerImage"),
         "site_url": media.get("siteUrl"),
         "next_airing_episode": media.get("nextAiringEpisode"),
+        "metadata_payload": _metadata_payload(media),
     }
 
 

@@ -9,8 +9,10 @@ from ani_watchlist.gui import (
     discovery_page_count,
     discovery_page_items,
     discovery_title_preview,
+    metadata_payload_is_adult,
     scroll_units_from_mousewheel,
     split_display_title,
+    title_has_adult_label,
 )
 
 
@@ -54,6 +56,18 @@ def test_discovery_title_preview_preserves_start_of_long_titles() -> None:
 
 def test_watchlist_auto_refresh_is_thirty_seconds() -> None:
     assert WATCHLIST_AUTO_REFRESH_MS == 30_000
+
+
+def test_metadata_payload_is_adult_only_for_explicit_anilist_adult_flag() -> None:
+    assert metadata_payload_is_adult({"isAdult": True}) is True
+    assert metadata_payload_is_adult({"isAdult": False}) is False
+    assert metadata_payload_is_adult(None) is False
+
+
+def test_title_has_adult_label_handles_clean_and_legacy_labels() -> None:
+    assert title_has_adult_label("Bible Black [18+]") is True
+    assert title_has_adult_label("Bible Black [18 ]") is True
+    assert title_has_adult_label("Cowboy Bebop") is False
 
 
 def test_discovery_paging_splits_items_into_twenty_item_pages() -> None:

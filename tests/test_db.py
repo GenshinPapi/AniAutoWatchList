@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from ani_watchlist.db import current_version, initialize
 from ani_watchlist.store import (
+    clean_display_title,
     episodes_for_anime,
     get_anime,
     get_or_create_anime,
@@ -35,6 +36,11 @@ def test_add_anime_update_episode_list_and_mark_watched(app_env):
     assert [row["episode_key"] for row in episodes] == ["1", "2", "3"]
     assert [row["watched"] for row in episodes] == [0, 1, 0]
     assert get_anime(conn, "frieren beyond journeys end") is not None
+
+
+def test_clean_display_title_preserves_adult_content_label_plus() -> None:
+    assert clean_display_title("Bible+Black") == "Bible Black"
+    assert clean_display_title("Bible Black [18+]") == "Bible Black [18+]"
 
 
 def test_status_changes(app_env):

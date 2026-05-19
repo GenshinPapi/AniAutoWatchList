@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import json
+
 from ani_watchlist.config import AppConfig, AniListConfig, MetadataConfig
 from ani_watchlist.db import initialize
-from ani_watchlist.metadata import search_and_store_matches
+from ani_watchlist.metadata import search_and_store_matches, store_selected_metadata_payload
 from ani_watchlist.providers.base import MetadataSearchResult
 from ani_watchlist.store import get_or_create_anime
 
@@ -140,3 +142,23 @@ def test_metadata_appends_adult_label_to_preserved_current_title(app_env):
 
     stored = conn.execute("SELECT * FROM anime WHERE id = ?", (anime["id"],)).fetchone()
     assert stored["display_title"] == "Existing Adult Title [18+]"
+
+
+def test_store_selected_metadata_payload_preserves_discovery_match(app_env):
+    conn = initialize()
+    anime, _ = get_or_create_anime(conn, "Bible Black [18+]", status="plan_to_watch")
+    media = payload(368, "Bible Black", 6) | {
+        "title": {"romaji": "Bible Black", "userPreferred": "Bible Black"},
+        "synonyms": ["Bible Black: Night of the Walpulgiss"],
+        "isAdult": True,
+    }
+
+    store_selected_metadata_payload(conn, anime["id"], 368, media, "/tmp/anilist-368.jpg")
+
+    stored = conn.execute("SELECT * FROM anime WHERE id = ?", (anime["id"],)).fetchone()
+    assert stored["anilist_id"] == 368
+    assert stored["display_title"] == "Bible Black [18+]"
+    assert stored["cover_path"] == "/tmp/anilist-368.jpg"
+    selected = conn.execute("SELECT * FROM metadata_matches WHERE anime_id = ?", (anime["id"],)).fetchone()
+    assert selected["selected"] == 1
+    assert json.loads(selected["payload_json"])["synonyms"] == ["Bible Black: Night of the Walpulgiss"]

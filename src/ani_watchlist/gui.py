@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import threading
 import webbrowser
 from datetime import datetime, timedelta
@@ -34,7 +35,7 @@ from .launcher import (
     launch_episode,
     resolve_allanime_launch_target,
 )
-from .metadata import refresh_metadata_for_anime, select_match
+from .metadata import refresh_metadata_for_anime, select_match, store_selected_metadata_payload
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
 from .store import (
@@ -89,6 +90,7 @@ DETAIL_COVER_H = 244
 WATCHLIST_AUTO_REFRESH_MS = 30_000
 WATCHED_ICON = "✅"
 UNWATCHED_ICON = "❌"
+ADULT_TITLE_LABEL_RE = re.compile(r"\[\s*(?:18\s*\+?|adult)\s*\]", re.IGNORECASE)
 
 DISCOVERY_MEDIA_PAGES = {
     "trending": {
@@ -137,6 +139,14 @@ def selected_metadata_payload(conn, anime_id: int) -> dict[str, object] | None:
     except json.JSONDecodeError:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def metadata_payload_is_adult(payload: dict[str, object] | None) -> bool:
+    return isinstance(payload, dict) and payload.get("isAdult") is True
+
+
+def title_has_adult_label(title: object) -> bool:
+    return bool(ADULT_TITLE_LABEL_RE.search(str(title or "")))
 
 
 def scroll_units_from_mousewheel(event) -> int:
@@ -1283,6 +1293,7 @@ class WatchlistApp:
     def add_discovery_to_plan(self, item: dict[str, object]) -> None:
         title = str(item.get("display_title") or "Unknown title")
         anime, created = get_or_create_anime(self.conn, title, status="plan_to_watch")
+        metadata_payload = item.get("metadata_payload") if isinstance(item.get("metadata_payload"), dict) else None
         updates = {
             "anilist_id": item.get("id") or anime["anilist_id"],
             "total_episodes": item.get("episodes") or anime["total_episodes"],
@@ -1292,6 +1303,14 @@ class WatchlistApp:
         if created:
             updates["status"] = "plan_to_watch"
         update_anime_fields(self.conn, anime["id"], **updates)
+        if metadata_payload is not None:
+            store_selected_metadata_payload(
+                self.conn,
+                anime["id"],
+                item.get("id"),
+                metadata_payload,
+                str(item.get("cover_path")) if item.get("cover_path") else None,
+            )
         label = self.discovery_status_labels.get(self.current_page) or self.discovery_status_labels.get("trending")
         if label is not None:
             label.configure(
@@ -1478,9 +1497,17 @@ class WatchlistApp:
                 return None
 
         target = resolve_target(launch_mode)
+        if launch_mode == "dub" and target is None:
+            target = resolve_target("sub")
+        if target is None and (metadata_payload_is_adult(metadata_payload) or title_has_adult_label(anime["display_title"])):
+            message = (
+                f"AllAnime did not return a playable result for {title_for_message}. "
+                "ani-cli can only launch titles available from AllAnime."
+            )
+            self.launch_label.configure(text=message, fg=COLORS["danger"])
+            messagebox.showwarning("AllAnime result not found", message)
+            return
         if launch_mode == "dub":
-            if target is None:
-                target = resolve_target("sub")
             self.launch_label.configure(text=f"Checking dub availability for episode {episode}...", fg=COLORS["muted"])
             self.root.update_idletasks()
             try:
