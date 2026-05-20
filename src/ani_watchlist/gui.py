@@ -28,6 +28,7 @@ from .discovery import (
     popular_filter_label,
     refresh_discovery,
     refresh_popular,
+    related_media,
     search_media,
 )
 from .launcher import (
@@ -228,6 +229,12 @@ class WatchlistApp:
         self.search_suggestion_job: str | None = None
         self.search_suggestion_generation = 0
         self.search_generation = 0
+        self.related_media_items: list[dict[str, object]] = []
+        self.related_loading = False
+        self.related_loaded = False
+        self.related_error: str | None = None
+        self.related_anilist_id: int | None = None
+        self.related_columns = 1
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
         self.discovery_pages: dict[str, tk.Frame] = {}
@@ -636,7 +643,20 @@ class WatchlistApp:
         self.schedule_canvas.bind("<Configure>", self._on_schedule_resize)
 
     def _build_detail_page(self) -> None:
-        page = self.detail_page
+        outer = self.detail_page
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        self.detail_canvas = tk.Canvas(outer, bg=COLORS["bg"], highlightthickness=0)
+        self.detail_canvas.grid(row=0, column=0, sticky="nsew")
+        self.detail_scrollbar = ttk.Scrollbar(outer, orient="vertical", command=self.detail_canvas.yview)
+        self.detail_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.detail_canvas.configure(yscrollcommand=self.detail_scrollbar.set)
+        self.detail_frame = tk.Frame(self.detail_canvas, bg=COLORS["bg"])
+        self.detail_window = self.detail_canvas.create_window((0, 0), window=self.detail_frame, anchor="nw")
+        self.detail_frame.bind("<Configure>", self._update_detail_scroll_region)
+        self.detail_canvas.bind("<Configure>", self._on_detail_resize)
+
+        page = self.detail_frame
         page.columnconfigure(0, weight=1)
         page.rowconfigure(2, weight=1)
 
@@ -805,6 +825,17 @@ class WatchlistApp:
         )
         self.activity_list.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
 
+        related = tk.Frame(page, bg=COLORS["bg"])
+        related.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 18))
+        related.columnconfigure(0, weight=1)
+        self.related_title_label = tk.Label(related, text="Related Seasons", bg=COLORS["bg"], fg=COLORS["text"], font=("", 12, "bold"))
+        self.related_title_label.grid(row=0, column=0, sticky="w")
+        self.related_status_label = tk.Label(related, text="", bg=COLORS["bg"], fg=COLORS["muted"], anchor="w")
+        self.related_status_label.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.related_frame = tk.Frame(related, bg=COLORS["bg"])
+        self.related_frame.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.related_frame.columnconfigure(0, weight=1)
+
     def _placeholder_image(self, size: tuple[int, int], title: str) -> object | None:
         if Image is None or ImageTk is None or ImageDraw is None:
             return None
@@ -952,12 +983,19 @@ class WatchlistApp:
     def open_detail(self, anime_id: int) -> None:
         self.selected_anime_id = anime_id
         self.show_alt_title.set(False)
+        self.related_media_items = []
+        self.related_error = None
+        self.related_anilist_id = None
+        self.related_loading = False
+        self.related_loaded = False
         if hasattr(self, "launch_label"):
             self.launch_label.configure(text="", fg=COLORS["muted"])
         self.current_page = "detail"
         self._set_active_nav("detail")
         self._hide_pages()
         self.detail_page.grid(row=0, column=0, sticky="nsew")
+        if hasattr(self, "detail_canvas"):
+            self.detail_canvas.yview_moveto(0)
         self.load_detail()
 
     def schedule_auto_refresh(self) -> None:
@@ -1107,6 +1145,9 @@ class WatchlistApp:
     def _update_search_scroll_region(self, _event=None) -> None:
         self.search_canvas.configure(scrollregion=self.search_canvas.bbox("all"))
 
+    def _update_detail_scroll_region(self, _event=None) -> None:
+        self.detail_canvas.configure(scrollregion=self.detail_canvas.bbox("all"))
+
     def _update_schedule_scroll_region(self, _event=None) -> None:
         self.schedule_canvas.configure(scrollregion=self.schedule_canvas.bbox("all"))
 
@@ -1128,6 +1169,12 @@ class WatchlistApp:
         if columns != self.search_columns:
             self.render_search_results()
 
+    def _on_detail_resize(self, event) -> None:
+        self.detail_canvas.itemconfigure(self.detail_window, width=event.width)
+        columns = max(1, event.width // DISCOVERY_GRID_W)
+        if columns != self.related_columns:
+            self.render_related_media()
+
     def _on_schedule_resize(self, event) -> None:
         self.schedule_canvas.itemconfigure(self.schedule_window, width=event.width)
 
@@ -1141,6 +1188,8 @@ class WatchlistApp:
             self.discovery_canvases[self.current_page].yview_scroll(scroll_units, "units")
         elif self.current_page == "search":
             self.search_canvas.yview_scroll(scroll_units, "units")
+        elif self.current_page == "detail":
+            self.detail_canvas.yview_scroll(scroll_units, "units")
         elif self.current_page == "schedule":
             self.schedule_canvas.yview_scroll(scroll_units, "units")
         else:
@@ -1457,6 +1506,41 @@ class WatchlistApp:
             empty.grid(row=0, column=0, sticky="w", padx=10, pady=20)
         self._update_search_scroll_region()
 
+    def render_related_media(self) -> None:
+        if not hasattr(self, "related_frame"):
+            return
+        for child in self.related_frame.winfo_children():
+            child.destroy()
+        width = max(self.detail_canvas.winfo_width(), DISCOVERY_GRID_W)
+        columns = max(1, width // DISCOVERY_GRID_W)
+        self.related_columns = columns
+        if self.related_loading:
+            self.related_status_label.configure(text="Loading related seasons from AniList...", fg=COLORS["muted"])
+            empty_text = "Loading..."
+        elif self.related_error:
+            self.related_status_label.configure(text=f"Related seasons failed: {self.related_error}", fg=COLORS["danger"])
+            empty_text = "Related seasons could not be loaded."
+        elif not self.related_anilist_id:
+            self.related_status_label.configure(text="Choose an AniList match to show related seasons.", fg=COLORS["muted"])
+            empty_text = "No AniList match selected."
+        else:
+            count = len(self.related_media_items)
+            self.related_status_label.configure(text=f"{count} related title{'s' if count != 1 else ''}", fg=COLORS["muted"])
+            empty_text = "No related seasons found."
+        for index, item in enumerate(self.related_media_items):
+            card = self.create_discovery_card(self.related_frame, item)
+            card.grid(row=index // columns, column=index % columns, padx=8, pady=8, sticky="nw")
+        if not self.related_media_items:
+            empty = tk.Label(
+                self.related_frame,
+                text=empty_text,
+                bg=COLORS["bg"],
+                fg=COLORS["muted"],
+                font=("", 13),
+            )
+            empty.grid(row=0, column=0, sticky="w", padx=10, pady=12)
+        self._update_detail_scroll_region()
+
     def create_discovery_card(self, parent: tk.Frame, item: dict[str, object]) -> tk.Frame:
         title_text, _alt_title = split_display_title(str(item.get("display_title") or "Unknown title"))
         media_id = int(item.get("id") or 0)
@@ -1477,11 +1561,12 @@ class WatchlistApp:
         cover.grid(row=0, column=0, pady=(10, 8))
         title = self.create_scrollable_card_title(card, title_text)
         title.grid(row=1, column=0, sticky="ew", padx=12)
+        relation_label = item.get("relation_label")
         score = item.get("average_score") or "-"
         trending = item.get("trending") or "-"
         meta = tk.Label(
             card,
-            text=f"Score {score}   Trend {trending}",
+            text=str(relation_label) if relation_label else f"Score {score}   Trend {trending}",
             bg=COLORS["panel"],
             fg=COLORS["muted"],
             anchor="w",
@@ -1604,6 +1689,8 @@ class WatchlistApp:
             )
         if self.current_page == "search" and hasattr(self, "search_status_label"):
             label = self.search_status_label
+        elif self.current_page == "detail" and hasattr(self, "related_status_label"):
+            label = self.related_status_label
         else:
             label = self.discovery_status_labels.get(self.current_page) or self.discovery_status_labels.get("trending")
         if label is not None:
@@ -1611,6 +1698,52 @@ class WatchlistApp:
                 text=f"{split_display_title(title)[0]} {'added to' if created else 'is already in'} your watchlist.",
                 fg=COLORS["muted"],
             )
+
+    def start_related_media_refresh(self, anime) -> None:
+        media_id = anime["anilist_id"] if anime is not None else None
+        if not media_id:
+            self.related_anilist_id = None
+            self.related_media_items = []
+            self.related_error = None
+            self.related_loading = False
+            self.related_loaded = False
+            self.render_related_media()
+            return
+        try:
+            media_id_int = int(media_id)
+        except (TypeError, ValueError):
+            self.related_anilist_id = None
+            self.related_media_items = []
+            self.related_error = f"Invalid AniList ID: {media_id}"
+            self.related_loading = False
+            self.related_loaded = True
+            self.render_related_media()
+            return
+        if self.related_anilist_id == media_id_int and (self.related_loading or self.related_loaded):
+            self.render_related_media()
+            return
+        self.related_anilist_id = media_id_int
+        self.related_media_items = []
+        self.related_error = None
+        self.related_loading = True
+        self.related_loaded = False
+        self.render_related_media()
+
+        def worker() -> None:
+            payload = related_media(media_id_int, load_config(), cache_covers=True)
+            self.root.after(0, lambda: self.finish_related_media_refresh(media_id_int, payload))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_related_media_refresh(self, media_id: int, payload: dict[str, object]) -> None:
+        if self.related_anilist_id != media_id:
+            return
+        self.related_loading = False
+        self.related_loaded = True
+        self.related_error = str(payload.get("error")) if payload.get("error") else None
+        self.related_media_items = [item for item in list(payload.get("items") or []) if isinstance(item, dict)]
+        if self.current_page == "detail":
+            self.render_related_media()
 
     def open_discovery_link(self, item: dict[str, object]) -> None:
         url = item.get("site_url")
@@ -1680,6 +1813,7 @@ class WatchlistApp:
         if selected_episode and self.episode_tree.exists(selected_episode):
             self.episode_tree.selection_set(selected_episode)
         self.refresh_activity()
+        self.start_related_media_refresh(anime)
 
     def add_anime(self) -> None:
         title = simpledialog.askstring("Add anime", "Title:")

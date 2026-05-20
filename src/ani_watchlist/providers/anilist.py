@@ -5,6 +5,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import deque
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,38 @@ query ($page: Int, $perPage: Int, $search: String) {
       bannerImage
       siteUrl
       nextAiringEpisode { airingAt timeUntilAiring episode }
+    }
+  }
+}
+"""
+
+
+RELATED_MEDIA_QUERY = """
+query ($id: Int) {
+  Media(id: $id, type: ANIME) {
+    relations {
+      edges {
+        relationType(version: 2)
+        node {
+          id
+          type
+          title { romaji english native userPreferred }
+          synonyms
+          episodes
+          status
+          format
+          isAdult
+          season
+          seasonYear
+          averageScore
+          popularity
+          trending
+          coverImage { extraLarge large medium color }
+          bannerImage
+          siteUrl
+          nextAiringEpisode { airingAt timeUntilAiring episode }
+        }
+      }
     }
   }
 }
@@ -196,6 +229,20 @@ query ($page: Int, $perPage: Int, $start: Int, $end: Int) {
   }
 }
 """
+
+
+SEASON_RELATION_TYPES = {
+    "PREQUEL",
+    "SEQUEL",
+    "PARENT",
+    "SIDE_STORY",
+    "SPIN_OFF",
+}
+SEASON_CHAIN_RELATION_TYPES = {
+    "PREQUEL",
+    "SEQUEL",
+    "PARENT",
+}
 
 
 def _norm(text: str) -> str:
@@ -360,6 +407,52 @@ class AniListProvider:
         if not cleaned:
             return []
         return self._get_media_list(SEARCH_MEDIA_QUERY, limit, variables={"search": cleaned})
+
+    def _related_edges(self, media_id: str | int) -> list[tuple[str, dict[str, Any]]]:
+        data = self._request(RELATED_MEDIA_QUERY, {"id": int(media_id)})
+        media = data.get("Media") or {}
+        relations = media.get("relations") or {}
+        edges: list[tuple[str, dict[str, Any]]] = []
+        for edge in relations.get("edges") or []:
+            if not isinstance(edge, dict):
+                continue
+            relation_type = str(edge.get("relationType") or "").strip()
+            node = edge.get("node") or {}
+            if relation_type and isinstance(node, dict):
+                edges.append((relation_type, node))
+        return edges
+
+    def get_related_anime(self, media_id: str | int, *, max_depth: int = 6, max_items: int = 24) -> list[dict[str, Any]]:
+        root_id = str(int(media_id))
+        items: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        fetched_ids: set[str] = set()
+        queue: deque[tuple[str, int]] = deque([(root_id, 0)])
+        while queue:
+            current_id, depth = queue.popleft()
+            if current_id in fetched_ids or depth > max_depth:
+                continue
+            fetched_ids.add(current_id)
+            for relation_type, node in self._related_edges(current_id):
+                if relation_type not in SEASON_RELATION_TYPES or node.get("type") != "ANIME":
+                    continue
+                related_id = str(node.get("id") or "").strip()
+                if not related_id or related_id == root_id:
+                    continue
+                if related_id not in seen_ids:
+                    item = dict(node)
+                    item["relationType"] = relation_type
+                    items.append(item)
+                    seen_ids.add(related_id)
+                    if len(items) >= max_items:
+                        return items
+                if (
+                    depth < max_depth
+                    and relation_type in SEASON_CHAIN_RELATION_TYPES
+                    and related_id not in fetched_ids
+                ):
+                    queue.append((related_id, depth + 1))
+        return items
 
     def get_media(self, media_id: str) -> dict[str, Any]:
         data = self._request(MEDIA_QUERY, {"id": int(media_id)})

@@ -90,6 +90,13 @@ POPULAR_TAGS = (
     "Zombie",
 )
 POPULAR_FILTERS = (*POPULAR_GENRES, *POPULAR_TAGS)
+RELATION_LABELS = {
+    "PREQUEL": "Prequel",
+    "SEQUEL": "Sequel",
+    "PARENT": "Parent",
+    "SIDE_STORY": "Side Story",
+    "SPIN_OFF": "Spin-Off",
+}
 EMPTY_MEDIA_LIST = {
     "items": [],
     "error": None,
@@ -213,6 +220,8 @@ def _normalize_media(media: dict[str, Any], provider: AniListProvider | None = N
         "site_url": media.get("siteUrl"),
         "next_airing_episode": media.get("nextAiringEpisode"),
         "metadata_payload": _metadata_payload(media),
+        "relation_type": media.get("relationType"),
+        "relation_label": RELATION_LABELS.get(str(media.get("relationType") or "")),
     }
 
 
@@ -380,6 +389,42 @@ def search_media(
         return {"items": items, "error": None, "fetched_at": now_iso(), "query": cleaned_query}
     except Exception as exc:
         return {"items": [], "error": str(exc), "fetched_at": now_iso(), "query": cleaned_query}
+
+
+def related_media(
+    media_id: str | int | None,
+    config: AppConfig | None = None,
+    *,
+    provider: AniListProvider | None = None,
+    cache_covers: bool = True,
+) -> dict[str, Any]:
+    cleaned_id = str(media_id or "").strip()
+    if not cleaned_id:
+        return {"items": [], "error": None, "fetched_at": now_iso(), "media_id": cleaned_id}
+    config = config or load_config()
+    if not config.anilist.enabled:
+        return {
+            "items": [],
+            "error": "AniList metadata is disabled.",
+            "fetched_at": now_iso(),
+            "media_id": cleaned_id,
+        }
+    provider = provider or AniListProvider(config.anilist)
+    try:
+        items = [
+            _normalize_media(item, provider if cache_covers else None)
+            for item in provider.get_related_anime(cleaned_id)
+        ]
+        items.sort(
+            key=lambda item: (
+                item.get("season_year") is None,
+                item.get("season_year") or 9999,
+                str(item.get("display_title") or ""),
+            )
+        )
+        return {"items": items, "error": None, "fetched_at": now_iso(), "media_id": cleaned_id}
+    except Exception as exc:
+        return {"items": [], "error": str(exc), "fetched_at": now_iso(), "media_id": cleaned_id}
 
 
 def append_media_list(

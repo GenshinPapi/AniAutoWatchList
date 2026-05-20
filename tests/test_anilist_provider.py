@@ -59,6 +59,56 @@ def test_search_anime_media_uses_search_match_query(app_env) -> None:
     assert FakeAniListProvider().search_anime_media("One Piece", limit=3) == [{"id": 21}, {"id": 22}, {"id": 23}]
 
 
+def test_get_related_anime_filters_season_relations(app_env) -> None:
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            assert "relations" in query
+            assert "relationType(version: 2)" in query
+            if variables != {"id": 101280}:
+                return {"Media": {"relations": {"edges": []}}}
+            return {
+                "Media": {
+                    "relations": {
+                        "edges": [
+                            {"relationType": "SEQUEL", "node": {"id": 116742, "type": "ANIME", "title": {"romaji": "Season 2"}}},
+                            {"relationType": "ADAPTATION", "node": {"id": 1, "type": "MANGA", "title": {"romaji": "Manga"}}},
+                            {"relationType": "CHARACTER", "node": {"id": 2, "type": "ANIME", "title": {"romaji": "Character"}}},
+                        ]
+                    }
+                }
+            }
+
+    related = FakeAniListProvider().get_related_anime(101280)
+
+    assert related == [{"id": 116742, "type": "ANIME", "title": {"romaji": "Season 2"}, "relationType": "SEQUEL"}]
+
+
+def test_get_related_anime_follows_sequel_chain(app_env) -> None:
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            assert "relations" in query
+            edges_by_id = {
+                101280: [
+                    {"relationType": "SIDE_STORY", "node": {"id": 106509, "type": "ANIME", "title": {"romaji": "OVA"}}},
+                    {"relationType": "SEQUEL", "node": {"id": 161802, "type": "ANIME", "title": {"romaji": "Visions"}}},
+                ],
+                161802: [
+                    {"relationType": "PREQUEL", "node": {"id": 101280, "type": "ANIME", "title": {"romaji": "Season 1"}}},
+                    {"relationType": "SEQUEL", "node": {"id": 108511, "type": "ANIME", "title": {"romaji": "Season 2"}}},
+                ],
+                108511: [
+                    {"relationType": "SEQUEL", "node": {"id": 116742, "type": "ANIME", "title": {"romaji": "Season 2 Part 2"}}},
+                ],
+                116742: [],
+            }
+            return {"Media": {"relations": {"edges": edges_by_id.get(variables["id"], [])}}}
+
+    related = FakeAniListProvider().get_related_anime(101280)
+
+    assert [item["id"] for item in related] == [106509, 161802, 108511, 116742]
+    assert [item["relationType"] for item in related] == ["SIDE_STORY", "SEQUEL", "SEQUEL", "SEQUEL"]
+
+
 def test_popular_query_can_filter_currently_airing(app_env) -> None:
     class FakeAniListProvider(AniListProvider):
         def _request(self, query, variables):  # noqa: ANN001

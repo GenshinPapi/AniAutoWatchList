@@ -15,6 +15,7 @@ from ani_watchlist.discovery import (
     popular_cache_key,
     refresh_discovery,
     refresh_popular,
+    related_media,
     refresh_schedule,
     search_media,
     refresh_top_airing,
@@ -106,6 +107,12 @@ class FakeDiscoveryProvider(AniListProvider):
         assert search == "One Piece"
         return self._media_items("trending", 0, min(limit, 3))
 
+    def get_related_anime(self, media_id: str | int):  # noqa: ANN201
+        assert str(media_id) == "21"
+        item = self._media_items("popular", 0, 1)[0]
+        item["relationType"] = "SEQUEL"
+        return [item]
+
     def cache_cover(self, media_id: str, url: str) -> str:
         return f"/tmp/anilist-{media_id}.jpg"
 
@@ -154,6 +161,17 @@ def test_search_media_can_skip_cover_cache_for_suggestions(app_env) -> None:
 
     assert len(payload["items"]) == 2
     assert payload["items"][0]["cover_path"] is None
+
+
+def test_related_media_normalizes_relation_labels(app_env) -> None:
+    payload = related_media(21, TEST_CONFIG, provider=FakeDiscoveryProvider())
+
+    assert payload["media_id"] == "21"
+    assert payload["error"] is None
+    assert payload["items"][0]["display_title"] == "Fullmetal Alchemist: Brotherhood (Hagane no Renkinjutsushi)"
+    assert payload["items"][0]["relation_type"] == "SEQUEL"
+    assert payload["items"][0]["relation_label"] == "Sequel"
+    assert payload["items"][0]["cover_path"] == "/tmp/anilist-23.jpg"
 
 
 def test_refresh_top_airing_and_popular_cache_once_per_day(app_env) -> None:
