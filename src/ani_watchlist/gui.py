@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover - optional GUI enhancement
     ImageDraw = None
     ImageTk = None
 
+from .availability import refresh_available_episodes_for_anime
 from .config import load_config
 from .db import initialize
 from .discovery import (
@@ -38,7 +39,7 @@ from .launcher import (
     launch_episode,
     resolve_allanime_launch_target,
 )
-from .metadata import refresh_metadata_for_anime, select_match, store_selected_metadata_payload
+from .metadata import refresh_metadata_for_anime, select_match, selected_metadata_payload, store_selected_metadata_payload
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
 from .updater import UpdateInfo, check_for_update, launch_update
@@ -129,25 +130,6 @@ def split_display_title(title: str) -> tuple[str, str | None]:
     return title, None
 
 
-def selected_metadata_payload(conn, anime_id: int) -> dict[str, object] | None:
-    row = conn.execute(
-        """
-        SELECT payload_json FROM metadata_matches
-        WHERE anime_id = ? AND provider = 'anilist' AND selected = 1
-        ORDER BY confidence_score DESC, id
-        LIMIT 1
-        """,
-        (anime_id,),
-    ).fetchone()
-    if row is None:
-        return None
-    try:
-        payload = json.loads(row["payload_json"])
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
 def metadata_payload_is_adult(payload: dict[str, object] | None) -> bool:
     return isinstance(payload, dict) and payload.get("isAdult") is True
 
@@ -235,6 +217,7 @@ class WatchlistApp:
         self.related_error: str | None = None
         self.related_anilist_id: int | None = None
         self.related_columns = 1
+        self.episode_availability_refreshing: set[int] = set()
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
         self.discovery_pages: dict[str, tk.Frame] = {}
@@ -997,6 +980,7 @@ class WatchlistApp:
         if hasattr(self, "detail_canvas"):
             self.detail_canvas.yview_moveto(0)
         self.load_detail()
+        self.start_episode_availability_refresh(anime_id)
 
     def schedule_auto_refresh(self) -> None:
         self.root.after(self.auto_refresh_ms, self.auto_refresh)
@@ -1222,6 +1206,13 @@ class WatchlistApp:
             return
         self.search_suggestion_job = self.root.after(SEARCH_DEBOUNCE_MS, self.start_search_suggestions)
 
+    def cancel_search_suggestions(self) -> None:
+        if self.search_suggestion_job is not None:
+            self.root.after_cancel(self.search_suggestion_job)
+            self.search_suggestion_job = None
+        self.search_suggestion_generation += 1
+        self.search_suggestions = []
+
     def hide_search_dropdown(self) -> str:
         self.global_search_dropdown.grid_remove()
         return "break"
@@ -1281,6 +1272,7 @@ class WatchlistApp:
         query = self.global_search_text.get().strip()
         if not query:
             return "break"
+        self.cancel_search_suggestions()
         self.hide_search_dropdown()
         self.current_page = "search"
         self._set_active_nav("search")
@@ -1698,6 +1690,46 @@ class WatchlistApp:
                 text=f"{split_display_title(title)[0]} {'added to' if created else 'is already in'} your watchlist.",
                 fg=COLORS["muted"],
             )
+        self.start_episode_availability_refresh(int(anime["id"]))
+
+    def start_episode_availability_refresh(self, anime_id: int) -> None:
+        try:
+            anime_id = int(anime_id)
+        except (TypeError, ValueError):
+            return
+        if anime_id in self.episode_availability_refreshing:
+            return
+        self.episode_availability_refreshing.add(anime_id)
+        if self.current_page == "detail" and self.selected_anime_id == anime_id and hasattr(self, "launch_label"):
+            self.launch_label.configure(text="Updating released episode list from AllAnime...", fg=COLORS["muted"])
+
+        def worker() -> None:
+            payload: dict[str, object] = {"anime_id": anime_id}
+            try:
+                with initialize() as conn:
+                    payload.update(refresh_available_episodes_for_anime(conn, anime_id))
+            except Exception as exc:  # pragma: no cover - defensive UI boundary
+                payload["error"] = str(exc)
+            self.root.after(0, lambda: self.finish_episode_availability_refresh(anime_id, payload))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_episode_availability_refresh(self, anime_id: int, payload: dict[str, object]) -> None:
+        self.episode_availability_refreshing.discard(anime_id)
+        if self.current_page == "library":
+            self.refresh_library(preserve_scroll=True)
+        if self.current_page != "detail" or self.selected_anime_id != anime_id:
+            return
+        self.load_detail()
+        error = payload.get("error")
+        if error:
+            self.launch_label.configure(text=f"Released episode update failed: {error}", fg=COLORS["danger"])
+            return
+        if payload.get("updated"):
+            count = payload.get("episode_count")
+            self.launch_label.configure(text=f"Released episode list updated: {count or '?'} available.", fg=COLORS["muted"])
+        else:
+            self.launch_label.configure(text="Released episode list could not be matched automatically.", fg=COLORS["muted"])
 
     def start_related_media_refresh(self, anime) -> None:
         media_id = anime["anilist_id"] if anime is not None else None

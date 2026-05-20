@@ -222,6 +222,67 @@ def test_allanime_episode_available_can_check_direct_show_id(monkeypatch) -> Non
     assert calls == [({"showId": "target-id"}, launcher.ALLANIME_EPISODES_GQL)]
 
 
+def test_allanime_available_episode_keys_uses_episode_detail(monkeypatch) -> None:
+    calls: list[tuple[dict[str, object], str]] = []
+
+    def fake_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
+        calls.append((variables, query))
+        if query == launcher.ALLANIME_SEARCH_GQL:
+            return {
+                "data": {
+                    "shows": {
+                        "edges": [
+                            {
+                                "_id": "show-id",
+                                "name": "Test Show",
+                                "englishName": "Test Show",
+                                "nativeName": "",
+                                "availableEpisodes": {"sub": 3},
+                            }
+                        ]
+                    }
+                }
+            }
+        return {"data": {"show": {"availableEpisodesDetail": {"sub": ["1", 2.0, {"episode": "3"}]}}}}
+
+    monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
+
+    availability = launcher.allanime_available_episode_keys("Test Show")
+
+    assert availability is not None
+    assert availability.target.show_id == "show-id"
+    assert availability.episode_keys == ("1", "2", "3")
+    assert calls[1] == ({"showId": "show-id"}, launcher.ALLANIME_EPISODES_GQL)
+
+
+def test_allanime_available_episode_keys_falls_back_to_count(monkeypatch) -> None:
+    def fake_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
+        if query == launcher.ALLANIME_SEARCH_GQL:
+            return {
+                "data": {
+                    "shows": {
+                        "edges": [
+                            {
+                                "_id": "show-id",
+                                "name": "Test Show",
+                                "englishName": "Test Show",
+                                "nativeName": "",
+                                "availableEpisodes": {"sub": 2},
+                            }
+                        ]
+                    }
+                }
+            }
+        return {"data": {"show": {"availableEpisodesDetail": {}}}}
+
+    monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
+
+    availability = launcher.allanime_available_episode_keys("Test Show")
+
+    assert availability is not None
+    assert availability.episode_keys == ("1", "2")
+
+
 def test_terminal_args_use_x_terminal_compatible_e_flag() -> None:
     assert launcher.terminal_args_for("x-terminal-emulator", "/usr/bin/gnome-terminal.wrapper") == ("-e",)
 

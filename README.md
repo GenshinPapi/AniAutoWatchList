@@ -19,6 +19,7 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 - Startup update check against the GitHub `main` branch
 - Global AniList title search with suggestions and card results
 - Related seasons on anime detail pages
+- Automatic released episode refresh from AllAnime when titles are added or opened
 - AniList metadata search and cover caching
 - English-first display titles when metadata is available
 - Notes per anime
@@ -198,6 +199,7 @@ The GUI includes:
 - Anime detail page
 - Related seasons and side stories on detail pages
 - Episode checklist
+- Automatic released episode list refresh from AllAnime
 - Continue selected episode through ani-cli
 - Notes editor
 - Metadata refresh
@@ -207,6 +209,8 @@ The GUI includes:
 Type in the top search box to fetch AniList title suggestions. Press Enter to show matching titles as discovery-style cards with the same Plan and AniList actions.
 
 When a watchlist entry has an AniList match, the detail page shows related anime from AniList below the episode and activity panels. Sequels, prequels, parent entries, side stories, and spin-offs appear as discovery-style cards. Prequel, sequel, and parent links are followed across the relation chain so later seasons can appear even when AniList links them through an intermediate entry.
+
+When an anime is added from discovery/search or opened from the watchlist, the GUI checks AllAnime for currently released sub episodes and upserts those episode rows. This keeps the watchlist progress count and detail episode list populated before launching playback.
 
 Discovery and schedule data refresh from AniList at most once per local day on GUI startup, unless you press Refresh or use the CLI `--refresh` option. On startup, the GUI also checks GitHub for a newer `main` branch commit. If an update is available and you accept it, a terminal opens, pulls the latest code, reruns `scripts/install-user.sh`, and prompts you to relaunch the GUI.
 

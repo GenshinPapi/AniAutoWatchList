@@ -72,6 +72,17 @@ def _selected_match(conn: sqlite3.Connection, anime_id: int, provider: str = "an
     ).fetchone()
 
 
+def selected_metadata_payload(conn: sqlite3.Connection, anime_id: int, provider: str = "anilist") -> dict[str, Any] | None:
+    row = _selected_match(conn, anime_id, provider)
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload_json"])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _apply_selected_match(
     conn: sqlite3.Connection,
     anime_id: int,

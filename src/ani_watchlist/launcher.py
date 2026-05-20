@@ -64,6 +64,12 @@ class AllAnimeLaunchTarget:
     query: str
 
 
+@dataclass(frozen=True)
+class AllAnimeEpisodeAvailability:
+    target: AllAnimeLaunchTarget
+    episode_keys: tuple[str, ...]
+
+
 class LaunchError(RuntimeError):
     pass
 
@@ -247,6 +253,46 @@ def _episode_values_match(requested: str, available: object) -> bool:
     return requested_number is not None and available_number is not None and requested_number == available_number
 
 
+def _episode_key_from_available(value: object) -> str:
+    if isinstance(value, dict):
+        for key in ("episode_key", "key", "episode", "episode_number", "number", "id"):
+            if value.get(key) is not None:
+                return _episode_key_from_available(value[key])
+        return ""
+    text = str(value).strip()
+    number = _episode_sort_value(text)
+    if number is not None and number.is_integer() and re.fullmatch(r"\d+(?:\.0+)?", text):
+        return str(int(number))
+    return text
+
+
+def _episode_keys_from_count(count: int | None) -> tuple[str, ...]:
+    if count is None or count <= 0:
+        return ()
+    return tuple(str(index) for index in range(1, count + 1))
+
+
+def _dedupe_episode_keys(values: list[object]) -> tuple[str, ...]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = _episode_key_from_available(value)
+        if not key or key in seen:
+            continue
+        keys.append(key)
+        seen.add(key)
+    return tuple(
+        sorted(
+            keys,
+            key=lambda key: (
+                _episode_sort_value(key) is None,
+                _episode_sort_value(key) if _episode_sort_value(key) is not None else 999999.0,
+                key,
+            ),
+        )
+    )
+
+
 def _allanime_search_edges(title: str, *, mode: str, timeout: int = 12) -> list[dict[str, object]]:
     cleaned_title = title.strip()
     if not cleaned_title:
@@ -406,6 +452,57 @@ def resolve_allanime_launch_target(
     if len(scored) > 1 and scored[0].show_id != scored[1].show_id and scored[0].score - scored[1].score < 1.0:
         return None
     return scored[0]
+
+
+def _allanime_episode_keys_for_show(
+    show_id: str,
+    *,
+    mode: str,
+    episode_count: int | None = None,
+    timeout: int = 12,
+) -> tuple[str, ...]:
+    if not show_id:
+        return ()
+    episodes_payload = _allanime_api_request({"showId": str(show_id)}, ALLANIME_EPISODES_GQL, timeout=timeout)
+    detail = (((episodes_payload.get("data") or {}).get("show") or {}).get("availableEpisodesDetail") or {}) if isinstance(episodes_payload, dict) else {}
+    episode_list = detail.get(mode) if isinstance(detail, dict) else None
+    if isinstance(episode_list, list):
+        keys = _dedupe_episode_keys(episode_list)
+        if keys:
+            return keys
+    return _episode_keys_from_count(episode_count)
+
+
+def allanime_available_episode_keys(
+    display_title: str,
+    source_title: str | None = None,
+    metadata_payload: dict[str, object] | None = None,
+    *,
+    total_episodes: int | None = None,
+    mode: str = "sub",
+    timeout: int = 12,
+) -> AllAnimeEpisodeAvailability | None:
+    cleaned_mode = _validate_mode(mode)
+    target = resolve_allanime_launch_target(
+        display_title,
+        source_title,
+        metadata_payload,
+        total_episodes=total_episodes,
+        mode=cleaned_mode,
+        timeout=timeout,
+    )
+    if target is None:
+        return None
+    try:
+        episode_keys = _allanime_episode_keys_for_show(
+            target.show_id,
+            mode=cleaned_mode,
+            episode_count=target.episode_count,
+            timeout=timeout,
+        )
+    except LaunchError:
+        episode_keys = _episode_keys_from_count(target.episode_count)
+    return AllAnimeEpisodeAvailability(target=target, episode_keys=episode_keys)
 
 
 def _allanime_episode_available_for_show(
