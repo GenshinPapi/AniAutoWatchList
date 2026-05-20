@@ -49,6 +49,16 @@ def test_trending_query_returns_media_payloads(app_env) -> None:
     assert FakeAniListProvider().get_trending_anime(limit=2) == [{"id": 1}, {"id": 2}]
 
 
+def test_search_anime_media_uses_search_match_query(app_env) -> None:
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            assert "SEARCH_MATCH" in query
+            assert variables == {"page": 1, "perPage": 3, "search": "One Piece"}
+            return {"Page": {"media": [{"id": 21}, {"id": 22}, {"id": 23}, {"id": 24}]}}
+
+    assert FakeAniListProvider().search_anime_media("One Piece", limit=3) == [{"id": 21}, {"id": 22}, {"id": 23}]
+
+
 def test_popular_query_can_filter_currently_airing(app_env) -> None:
     class FakeAniListProvider(AniListProvider):
         def _request(self, query, variables):  # noqa: ANN001

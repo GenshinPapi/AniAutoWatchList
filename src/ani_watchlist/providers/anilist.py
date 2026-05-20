@@ -34,6 +34,33 @@ query ($search: String) {
 """
 
 
+SEARCH_MEDIA_QUERY = """
+query ($page: Int, $perPage: Int, $search: String) {
+  Page(page: $page, perPage: $perPage) {
+    pageInfo { hasNextPage currentPage }
+    media(type: ANIME, search: $search, sort: SEARCH_MATCH) {
+      id
+      title { romaji english native userPreferred }
+      synonyms
+      episodes
+      status
+      format
+      isAdult
+      season
+      seasonYear
+      averageScore
+      popularity
+      trending
+      coverImage { extraLarge large medium color }
+      bannerImage
+      siteUrl
+      nextAiringEpisode { airingAt timeUntilAiring episode }
+    }
+  }
+}
+"""
+
+
 MEDIA_QUERY = """
 query ($id: Int) {
   Media(id: $id, type: ANIME) {
@@ -327,6 +354,12 @@ class AniListProvider:
                     results_by_id[media_id] = result
         results = list(results_by_id.values())
         return sorted(results, key=lambda item: item.confidence_score, reverse=True)
+
+    def search_anime_media(self, search: str, limit: int = 50) -> list[dict[str, Any]]:
+        cleaned = str(search or "").strip()
+        if not cleaned:
+            return []
+        return self._get_media_list(SEARCH_MEDIA_QUERY, limit, variables={"search": cleaned})
 
     def get_media(self, media_id: str) -> dict[str, Any]:
         data = self._request(MEDIA_QUERY, {"id": int(media_id)})

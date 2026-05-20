@@ -352,6 +352,36 @@ def refresh_media_list(
     return payload
 
 
+def search_media(
+    query: str,
+    config: AppConfig | None = None,
+    *,
+    provider: AniListProvider | None = None,
+    limit: int = 50,
+    cache_covers: bool = True,
+) -> dict[str, Any]:
+    cleaned_query = str(query or "").strip()
+    if not cleaned_query:
+        return {"items": [], "error": None, "fetched_at": now_iso(), "query": cleaned_query}
+    config = config or load_config()
+    if not config.anilist.enabled:
+        return {
+            "items": [],
+            "error": "AniList metadata is disabled.",
+            "fetched_at": now_iso(),
+            "query": cleaned_query,
+        }
+    provider = provider or AniListProvider(config.anilist)
+    try:
+        items = [
+            _normalize_media(item, provider if cache_covers else None)
+            for item in provider.search_anime_media(cleaned_query, limit=limit)
+        ]
+        return {"items": items, "error": None, "fetched_at": now_iso(), "query": cleaned_query}
+    except Exception as exc:
+        return {"items": [], "error": str(exc), "fetched_at": now_iso(), "query": cleaned_query}
+
+
 def append_media_list(
     conn: sqlite3.Connection,
     cache_key: str,

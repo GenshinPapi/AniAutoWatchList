@@ -16,6 +16,7 @@ from ani_watchlist.discovery import (
     refresh_discovery,
     refresh_popular,
     refresh_schedule,
+    search_media,
     refresh_top_airing,
     refresh_trending,
 )
@@ -101,6 +102,10 @@ class FakeDiscoveryProvider(AniListProvider):
             }
         ]
 
+    def search_anime_media(self, search: str, limit: int = 50):  # noqa: ANN201
+        assert search == "One Piece"
+        return self._media_items("trending", 0, min(limit, 3))
+
     def cache_cover(self, media_id: str, url: str) -> str:
         return f"/tmp/anilist-{media_id}.jpg"
 
@@ -132,6 +137,23 @@ def test_refresh_schedule_caches_local_day(app_env) -> None:
     assert payload["items"][0]["media"]["display_title"] == "ONE PIECE"
     assert payload["items"][0]["local_day"] != "-"
     assert cache_fetched_today(conn, SCHEDULE_CACHE_KEY) is True
+
+
+def test_search_media_normalizes_anilist_search_results(app_env) -> None:
+    payload = search_media("One Piece", TEST_CONFIG, provider=FakeDiscoveryProvider(), limit=2)
+
+    assert payload["query"] == "One Piece"
+    assert payload["error"] is None
+    assert len(payload["items"]) == 2
+    assert payload["items"][0]["display_title"] == "ONE PIECE"
+    assert payload["items"][0]["cover_path"] == "/tmp/anilist-21.jpg"
+
+
+def test_search_media_can_skip_cover_cache_for_suggestions(app_env) -> None:
+    payload = search_media("One Piece", TEST_CONFIG, provider=FakeDiscoveryProvider(), limit=2, cache_covers=False)
+
+    assert len(payload["items"]) == 2
+    assert payload["items"][0]["cover_path"] is None
 
 
 def test_refresh_top_airing_and_popular_cache_once_per_day(app_env) -> None:

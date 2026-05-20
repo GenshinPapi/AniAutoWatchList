@@ -28,6 +28,7 @@ from .discovery import (
     popular_filter_label,
     refresh_discovery,
     refresh_popular,
+    search_media,
 )
 from .launcher import (
     LaunchError,
@@ -85,6 +86,9 @@ DISCOVERY_GRID_W = DISCOVERY_CARD_W + 16
 DISCOVERY_TITLE_LINES = 3
 DISCOVERY_TITLE_CHARS = 24
 DISCOVERY_PAGE_SIZE = 20
+SEARCH_SUGGESTION_LIMIT = 8
+SEARCH_RESULT_LIMIT = 50
+SEARCH_DEBOUNCE_MS = 350
 COVER_W = 142
 COVER_H = 204
 DETAIL_COVER_W = 170
@@ -201,6 +205,7 @@ class WatchlistApp:
         self.auto_discovery_enabled = auto_discovery
         self.selected_status = tk.StringVar(value="watching")
         self.search_text = tk.StringVar()
+        self.global_search_text = tk.StringVar()
         self.detail_status = tk.StringVar(value=STATUS_LABELS["watching"])
         self.popular_genre = tk.StringVar(value=POPULAR_GENRE_ALL_LABEL)
         self.show_alt_title = tk.BooleanVar(value=False)
@@ -215,6 +220,14 @@ class WatchlistApp:
         self.discovery_loading_more: set[str] = set()
         self.discovery_error: str | None = None
         self.update_checking = False
+        self.search_loading = False
+        self.search_results: list[dict[str, object]] = []
+        self.search_result_query = ""
+        self.search_error: str | None = None
+        self.search_suggestions: list[dict[str, object]] = []
+        self.search_suggestion_job: str | None = None
+        self.search_suggestion_generation = 0
+        self.search_generation = 0
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
         self.discovery_pages: dict[str, tk.Frame] = {}
@@ -225,6 +238,7 @@ class WatchlistApp:
         self.discovery_canvases: dict[str, tk.Canvas] = {}
         self.discovery_frames: dict[str, tk.Frame] = {}
         self.discovery_windows: dict[str, int] = {}
+        self.search_columns = 1
         self.popular_genre_box: ttk.Combobox | None = None
         self.discovery_columns = {name: 1 for name in DISCOVERY_MEDIA_PAGES}
         self.discovery_page_indexes = {name: 0 for name in DISCOVERY_MEDIA_PAGES}
@@ -325,6 +339,7 @@ class WatchlistApp:
         self.nav_bar = tk.Frame(self.root, bg=COLORS["bg"])
         self.nav_bar.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 0))
         self.nav_bar.columnconfigure(5, weight=1)
+        self.nav_bar.rowconfigure(1, weight=0)
         self.nav_buttons: dict[str, tk.Button] = {}
         for idx, (page, label, command) in enumerate(
             [
@@ -350,6 +365,7 @@ class WatchlistApp:
             )
             button.grid(row=0, column=idx, padx=(0, 8), sticky="w")
             self.nav_buttons[page] = button
+        self._build_global_search()
         self.container = tk.Frame(self.root, bg=COLORS["bg"])
         self.container.grid(row=1, column=0, sticky="nsew")
         self.container.columnconfigure(0, weight=1)
@@ -360,14 +376,54 @@ class WatchlistApp:
         self.trending_page = self.discovery_pages["trending"]
         self.top_airing_page = self.discovery_pages["top_airing"]
         self.popular_page = self.discovery_pages["popular"]
+        self.search_page = tk.Frame(self.container, bg=COLORS["bg"])
         self.schedule_page = tk.Frame(self.container, bg=COLORS["bg"])
         self.detail_page = tk.Frame(self.container, bg=COLORS["bg"])
         self._build_library_page()
         for page_name in DISCOVERY_MEDIA_PAGES:
             self._build_discovery_page(page_name)
+        self._build_search_page()
         self._build_schedule_page()
         self._build_detail_page()
         self._bind_mousewheel()
+
+    def _build_global_search(self) -> None:
+        self.global_search_box = tk.Frame(self.nav_bar, bg=COLORS["bg"])
+        self.global_search_box.grid(row=0, column=5, sticky="e")
+        self.global_search_entry = tk.Entry(
+            self.global_search_box,
+            textvariable=self.global_search_text,
+            width=34,
+            bg=COLORS["entry"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["text"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            highlightcolor=COLORS["accent"],
+        )
+        self.global_search_entry.grid(row=0, column=0, sticky="ew", ipady=8)
+        self.global_search_entry.bind("<KeyRelease>", self.on_global_search_key)
+        self.global_search_entry.bind("<Return>", lambda _event: self.submit_global_search())
+        self.global_search_entry.bind("<Down>", self.focus_search_dropdown)
+        self.global_search_dropdown = tk.Listbox(
+            self.nav_bar,
+            height=SEARCH_SUGGESTION_LIMIT,
+            width=42,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            selectbackground=COLORS["accent"],
+            selectforeground="#111111",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=COLORS["border"],
+            activestyle="none",
+        )
+        self.global_search_dropdown.grid(row=1, column=5, sticky="e", pady=(2, 0))
+        self.global_search_dropdown.grid_remove()
+        self.global_search_dropdown.bind("<Double-1>", lambda _event: self.choose_search_suggestion())
+        self.global_search_dropdown.bind("<Return>", lambda _event: self.choose_search_suggestion())
+        self.global_search_dropdown.bind("<Escape>", lambda _event: self.hide_search_dropdown())
 
     def _bind_mousewheel(self) -> None:
         for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
@@ -382,7 +438,7 @@ class WatchlistApp:
             )
 
     def _hide_pages(self) -> None:
-        for page in (self.library_page, *self.discovery_pages.values(), self.schedule_page, self.detail_page):
+        for page in (self.library_page, *self.discovery_pages.values(), self.search_page, self.schedule_page, self.detail_page):
             page.grid_forget()
 
     def _build_library_page(self) -> None:
@@ -522,6 +578,33 @@ class WatchlistApp:
         self.discovery_canvases[page_name] = canvas
         self.discovery_frames[page_name] = frame
         self.discovery_windows[page_name] = int(window)
+
+    def _build_search_page(self) -> None:
+        page = self.search_page
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(1, weight=1)
+
+        header = tk.Frame(page, bg=COLORS["bg"])
+        header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
+        header.columnconfigure(0, weight=1)
+        self.search_title_label = ttk.Label(header, text="Search Results", style="Title.TLabel")
+        self.search_title_label.grid(row=0, column=0, sticky="w")
+        self.search_status_label = tk.Label(header, text="", bg=COLORS["bg"], fg=COLORS["muted"], anchor="e")
+        self.search_status_label.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+
+        body = tk.Frame(page, bg=COLORS["bg"])
+        body.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 16))
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+        self.search_canvas = tk.Canvas(body, bg=COLORS["bg"], highlightthickness=0)
+        self.search_canvas.grid(row=0, column=0, sticky="nsew")
+        self.search_scrollbar = ttk.Scrollbar(body, orient="vertical", command=self.search_canvas.yview)
+        self.search_scrollbar.grid(row=0, column=1, sticky="ns")
+        self.search_canvas.configure(yscrollcommand=self.search_scrollbar.set)
+        self.search_frame = tk.Frame(self.search_canvas, bg=COLORS["bg"])
+        self.search_window = self.search_canvas.create_window((0, 0), window=self.search_frame, anchor="nw")
+        self.search_frame.bind("<Configure>", self._update_search_scroll_region)
+        self.search_canvas.bind("<Configure>", self._on_search_resize)
 
     def _build_schedule_page(self) -> None:
         page = self.schedule_page
@@ -1021,6 +1104,9 @@ class WatchlistApp:
         if canvas is not None:
             canvas.configure(scrollregion=canvas.bbox("all"))
 
+    def _update_search_scroll_region(self, _event=None) -> None:
+        self.search_canvas.configure(scrollregion=self.search_canvas.bbox("all"))
+
     def _update_schedule_scroll_region(self, _event=None) -> None:
         self.schedule_canvas.configure(scrollregion=self.schedule_canvas.bbox("all"))
 
@@ -1036,6 +1122,12 @@ class WatchlistApp:
         if columns != self.discovery_columns[page_name]:
             self.render_discovery_list(page_name)
 
+    def _on_search_resize(self, event) -> None:
+        self.search_canvas.itemconfigure(self.search_window, width=event.width)
+        columns = max(1, event.width // DISCOVERY_GRID_W)
+        if columns != self.search_columns:
+            self.render_search_results()
+
     def _on_schedule_resize(self, event) -> None:
         self.schedule_canvas.itemconfigure(self.schedule_window, width=event.width)
 
@@ -1047,6 +1139,8 @@ class WatchlistApp:
             self.grid_canvas.yview_scroll(scroll_units, "units")
         elif self.current_page in self.discovery_canvases:
             self.discovery_canvases[self.current_page].yview_scroll(scroll_units, "units")
+        elif self.current_page == "search":
+            self.search_canvas.yview_scroll(scroll_units, "units")
         elif self.current_page == "schedule":
             self.schedule_canvas.yview_scroll(scroll_units, "units")
         else:
@@ -1066,6 +1160,115 @@ class WatchlistApp:
         for event in watch_events(self.conn, recent=12):
             title, _alt_title = split_display_title(event["anime_title"] or "-")
             self.activity_list.insert(tk.END, f"{local_time(event['created_at'])}  {event['event_type']}  {title}")
+
+    def on_global_search_key(self, event) -> None:
+        if getattr(event, "keysym", "") in {"Return", "Up", "Down", "Escape"}:
+            return
+        query = self.global_search_text.get().strip()
+        if self.search_suggestion_job is not None:
+            self.root.after_cancel(self.search_suggestion_job)
+            self.search_suggestion_job = None
+        if len(query) < 2:
+            self.hide_search_dropdown()
+            return
+        self.search_suggestion_job = self.root.after(SEARCH_DEBOUNCE_MS, self.start_search_suggestions)
+
+    def hide_search_dropdown(self) -> str:
+        self.global_search_dropdown.grid_remove()
+        return "break"
+
+    def focus_search_dropdown(self, _event=None) -> str | None:
+        if not self.global_search_dropdown.winfo_ismapped() or not self.search_suggestions:
+            return None
+        self.global_search_dropdown.focus_set()
+        self.global_search_dropdown.selection_clear(0, tk.END)
+        self.global_search_dropdown.selection_set(0)
+        self.global_search_dropdown.activate(0)
+        return "break"
+
+    def start_search_suggestions(self) -> None:
+        self.search_suggestion_job = None
+        query = self.global_search_text.get().strip()
+        if len(query) < 2:
+            self.hide_search_dropdown()
+            return
+        self.search_suggestion_generation += 1
+        generation = self.search_suggestion_generation
+
+        def worker() -> None:
+            payload = search_media(query, load_config(), limit=SEARCH_SUGGESTION_LIMIT, cache_covers=False)
+            self.root.after(0, lambda: self.finish_search_suggestions(generation, query, payload))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_search_suggestions(self, generation: int, query: str, payload: dict[str, object]) -> None:
+        if generation != self.search_suggestion_generation or query != self.global_search_text.get().strip():
+            return
+        if payload.get("error"):
+            self.hide_search_dropdown()
+            return
+        self.search_suggestions = [item for item in list(payload.get("items") or []) if isinstance(item, dict)]
+        self.global_search_dropdown.delete(0, tk.END)
+        for item in self.search_suggestions:
+            title, alt_title = split_display_title(str(item.get("display_title") or "Unknown title"))
+            self.global_search_dropdown.insert(tk.END, title if alt_title is None else f"{title} ({alt_title})")
+        if self.search_suggestions:
+            self.global_search_dropdown.grid()
+        else:
+            self.hide_search_dropdown()
+
+    def choose_search_suggestion(self) -> str:
+        selection = self.global_search_dropdown.curselection()
+        if not selection:
+            return self.submit_global_search()
+        item = self.search_suggestions[selection[0]]
+        title, _alt_title = split_display_title(str(item.get("display_title") or ""))
+        if title:
+            self.global_search_text.set(title)
+        self.hide_search_dropdown()
+        return self.submit_global_search()
+
+    def submit_global_search(self) -> str:
+        query = self.global_search_text.get().strip()
+        if not query:
+            return "break"
+        self.hide_search_dropdown()
+        self.current_page = "search"
+        self._set_active_nav("search")
+        self._hide_pages()
+        self.search_page.grid(row=0, column=0, sticky="nsew")
+        self.search_result_query = query
+        self.search_results = []
+        self.search_error = None
+        self.search_loading = True
+        self.search_generation += 1
+        generation = self.search_generation
+        self.search_canvas.yview_moveto(0)
+        self.render_search_results()
+
+        def worker() -> None:
+            payload = search_media(query, load_config(), limit=SEARCH_RESULT_LIMIT, cache_covers=True)
+            self.root.after(0, lambda: self.finish_global_search(generation, query, payload))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return "break"
+
+    def finish_global_search(self, generation: int, query: str, payload: dict[str, object]) -> None:
+        if generation != self.search_generation:
+            return
+        self.search_loading = False
+        self.search_result_query = query
+        self.search_results = [item for item in list(payload.get("items") or []) if isinstance(item, dict)]
+        error = payload.get("error")
+        if error:
+            self.search_error = str(error)
+            self.search_status_label.configure(text=f"Search failed: {self.search_error}", fg=COLORS["danger"])
+        else:
+            self.search_error = None
+            count = len(self.search_results)
+            self.search_status_label.configure(text=f"{count} result{'s' if count != 1 else ''} for {query}", fg=COLORS["muted"])
+        if self.current_page == "search":
+            self.render_search_results()
 
     def start_update_check(self) -> None:
         if self.update_checking:
@@ -1222,6 +1425,38 @@ class WatchlistApp:
         self.update_discovery_page_controls(page_name, len(items))
         self._update_discovery_scroll_region(page_name)
 
+    def render_search_results(self) -> None:
+        for child in self.search_frame.winfo_children():
+            child.destroy()
+        title = "Search Results" if not self.search_result_query else f"Search Results: {self.search_result_query}"
+        self.search_title_label.configure(text=title)
+        width = max(self.search_canvas.winfo_width(), DISCOVERY_GRID_W)
+        columns = max(1, width // DISCOVERY_GRID_W)
+        self.search_columns = columns
+        if self.search_loading:
+            self.search_status_label.configure(text=f"Searching AniList for {self.search_result_query}...", fg=COLORS["muted"])
+            empty_text = "Searching..."
+        elif self.search_error:
+            self.search_status_label.configure(text=f"Search failed: {self.search_error}", fg=COLORS["danger"])
+            empty_text = "Search failed."
+        else:
+            empty_text = f"No results for {self.search_result_query}." if self.search_result_query else "Search results will appear here."
+            if self.search_result_query and not self.search_results:
+                self.search_status_label.configure(text=empty_text, fg=COLORS["muted"])
+        for index, item in enumerate(self.search_results):
+            card = self.create_discovery_card(self.search_frame, item)
+            card.grid(row=index // columns, column=index % columns, padx=8, pady=8, sticky="nw")
+        if not self.search_results:
+            empty = tk.Label(
+                self.search_frame,
+                text=empty_text,
+                bg=COLORS["bg"],
+                fg=COLORS["muted"],
+                font=("", 13),
+            )
+            empty.grid(row=0, column=0, sticky="w", padx=10, pady=20)
+        self._update_search_scroll_region()
+
     def create_discovery_card(self, parent: tk.Frame, item: dict[str, object]) -> tk.Frame:
         title_text, _alt_title = split_display_title(str(item.get("display_title") or "Unknown title"))
         media_id = int(item.get("id") or 0)
@@ -1367,7 +1602,10 @@ class WatchlistApp:
                 metadata_payload,
                 str(item.get("cover_path")) if item.get("cover_path") else None,
             )
-        label = self.discovery_status_labels.get(self.current_page) or self.discovery_status_labels.get("trending")
+        if self.current_page == "search" and hasattr(self, "search_status_label"):
+            label = self.search_status_label
+        else:
+            label = self.discovery_status_labels.get(self.current_page) or self.discovery_status_labels.get("trending")
         if label is not None:
             label.configure(
                 text=f"{split_display_title(title)[0]} {'added to' if created else 'is already in'} your watchlist.",
