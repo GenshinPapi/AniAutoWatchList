@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 from ani_watchlist import updater
@@ -8,6 +9,13 @@ from ani_watchlist import updater
 def test_parse_version_from_package_source() -> None:
     assert updater.parse_version('__version__ = "1.2.3"') == "1.2.3"
     assert updater.parse_version("no version here") is None
+
+
+def test_version_from_github_contents_payload() -> None:
+    source = b'"""Package."""\n\n__version__ = "1.2.4"\n'
+    payload = {"encoding": "base64", "content": base64.b64encode(source).decode("ascii")}
+
+    assert updater.version_from_content_payload(payload) == "1.2.4"
 
 
 def test_update_info_detects_remote_commit_change() -> None:

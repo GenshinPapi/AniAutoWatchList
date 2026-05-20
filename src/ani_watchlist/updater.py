@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import shutil
@@ -17,7 +18,7 @@ from .launcher import TERMINAL_CANDIDATES, terminal_args_for
 GITHUB_REPO = "GenshinPapi/AniAutoWatchList"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{GITHUB_BRANCH}"
-GITHUB_RAW_INIT_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/src/ani_watchlist/__init__.py"
+GITHUB_CONTENT_INIT_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/src/ani_watchlist/__init__.py?ref={GITHUB_BRANCH}"
 USER_AGENT = "ani-watchlist-update-check/0.1"
 VERSION_RE = re.compile(r"__version__\s*=\s*['\"]([^'\"]+)['\"]")
 UPDATE_SCRIPT = r"""
@@ -119,14 +120,25 @@ def parse_version(source: str) -> str | None:
     return match.group(1) if match else None
 
 
-def remote_version(*, timeout: int = 8) -> str | None:
-    request = urllib.request.Request(GITHUB_RAW_INIT_URL, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            source = response.read().decode("utf-8")
-    except OSError:
+def version_from_content_payload(payload: dict[str, Any]) -> str | None:
+    content = str(payload.get("content") or "")
+    if not content:
         return None
+    if payload.get("encoding") == "base64":
+        try:
+            source = base64.b64decode(content).decode("utf-8")
+        except (ValueError, UnicodeDecodeError):
+            return None
+    else:
+        source = content
     return parse_version(source)
+
+
+def remote_version(*, timeout: int = 8) -> str | None:
+    try:
+        return version_from_content_payload(_request_json(GITHUB_CONTENT_INIT_URL, timeout=timeout))
+    except UpdateError:
+        return None
 
 
 def version_key(value: str | None) -> tuple[int, ...]:
