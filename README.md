@@ -16,6 +16,7 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 - Status tabs: Watching, Completed, Dropped, On Hold, Plan to Watch
 - Episode watched/unwatched tracking
 - Continue button in the GUI for launching a selected episode through ani-cli
+- Startup update check against the GitHub `main` branch
 - AniList metadata search and cover caching
 - English-first display titles when metadata is available
 - Notes per anime
@@ -186,6 +187,7 @@ The GUI includes:
 - Most Popular tab
 - Genre/tag filter for Most Popular
 - Discovery tabs load 100 titles at a time and fetch the next batch as you page forward
+- Long card titles can be scrolled inside the fixed-size cards
 - 7-day release schedule tab
 - Status tabs
 - Cover grid
@@ -198,7 +200,7 @@ The GUI includes:
 - AniList match selection
 - Recent activity panel
 
-Discovery and schedule data refresh from AniList at most once per local day on GUI startup, unless you press Refresh or use the CLI `--refresh` option.
+Discovery and schedule data refresh from AniList at most once per local day on GUI startup, unless you press Refresh or use the CLI `--refresh` option. On startup, the GUI also checks GitHub for a newer `main` branch commit. If an update is available and you accept it, a terminal opens, pulls the latest code, reruns `scripts/install-user.sh`, and prompts you to relaunch the GUI.
 
 ## How ani-cli Is Patched
 

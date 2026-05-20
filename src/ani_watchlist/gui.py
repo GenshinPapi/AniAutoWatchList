@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import threading
 import webbrowser
@@ -38,6 +39,7 @@ from .launcher import (
 from .metadata import refresh_metadata_for_anime, select_match, store_selected_metadata_payload
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
+from .updater import UpdateInfo, check_for_update, launch_update
 from .store import (
     STATUSES,
     clean_display_title,
@@ -188,7 +190,7 @@ def discovery_page_items(items: list[object], page_index: int, *, page_size: int
 
 
 class WatchlistApp:
-    def __init__(self, root: tk.Tk, *, auto_discovery: bool = True):
+    def __init__(self, root: tk.Tk, *, auto_discovery: bool = True, check_updates: bool = True):
         self.root = root
         self.root.title("ani-watchlist")
         self.root.geometry("1120x760")
@@ -212,6 +214,7 @@ class WatchlistApp:
         self.discovery_refreshing = False
         self.discovery_loading_more: set[str] = set()
         self.discovery_error: str | None = None
+        self.update_checking = False
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
         self.discovery_pages: dict[str, tk.Frame] = {}
@@ -231,6 +234,8 @@ class WatchlistApp:
         if auto_discovery:
             self.start_discovery_refresh(force=False)
         self.schedule_auto_refresh()
+        if check_updates and os.environ.get("ANI_WATCHLIST_SKIP_UPDATE_CHECK") != "1":
+            self.root.after(1200, self.start_update_check)
 
     def _configure_style(self) -> None:
         style = ttk.Style()
@@ -930,6 +935,40 @@ class WatchlistApp:
             empty.grid(row=0, column=0, sticky="w", padx=10, pady=20)
         self._update_grid_scroll_region()
 
+    def create_scrollable_card_title(self, parent: tk.Widget, title: str, *, cursor: str = "arrow") -> tk.Text:
+        text = tk.Text(
+            parent,
+            height=DISCOVERY_TITLE_LINES,
+            width=1,
+            wrap="word",
+            bg=COLORS["panel"],
+            fg=COLORS["text"],
+            font=("", 10, "bold"),
+            relief="flat",
+            highlightthickness=0,
+            borderwidth=0,
+            padx=0,
+            pady=0,
+            insertwidth=0,
+            takefocus=0,
+            cursor=cursor,
+        )
+        text.insert("1.0", " ".join(str(title).split()))
+        text.configure(state="disabled")
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            text.bind(sequence, lambda event, widget=text: self.scroll_card_title(widget, event))
+        return text
+
+    def scroll_card_title(self, widget: tk.Text, event) -> str | None:
+        scroll_units = scroll_units_from_mousewheel(event)
+        if scroll_units == 0:
+            return None
+        first, last = widget.yview()
+        if (scroll_units < 0 and first <= 0.0) or (scroll_units > 0 and last >= 1.0):
+            return None
+        widget.yview_scroll(scroll_units, "units")
+        return "break"
+
     def create_card(self, row) -> tk.Frame:
         primary_title, _alt_title = split_display_title(row["display_title"])
         card = tk.Frame(
@@ -946,18 +985,7 @@ class WatchlistApp:
         image = self._image_for(row["id"], row["cover_path"], (COVER_W, COVER_H), primary_title)
         cover = tk.Label(card, image=image or "", text="" if image else "No Cover", bg=COLORS["panel"], fg=COLORS["muted"], cursor="hand2")
         cover.grid(row=0, column=0, pady=(10, 8))
-        title = tk.Label(
-            card,
-            text=discovery_title_preview(primary_title),
-            bg=COLORS["panel"],
-            fg=COLORS["text"],
-            font=("", 10, "bold"),
-            wraplength=COVER_W + 10,
-            height=DISCOVERY_TITLE_LINES,
-            justify="left",
-            anchor="nw",
-            cursor="hand2",
-        )
+        title = self.create_scrollable_card_title(card, primary_title, cursor="hand2")
         title.grid(row=1, column=0, sticky="ew", padx=12)
         total = row["total_episodes"] if row["total_episodes"] is not None else "?"
         available = row["available_episode_count"] if row["available_episode_count"] is not None else "?"
@@ -979,8 +1007,9 @@ class WatchlistApp:
             cursor="hand2",
         )
         last.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        for widget in (card, cover, title, progress, last):
+        for widget in (card, cover, progress, last):
             widget.bind("<Button-1>", lambda _event, anime_id=row["id"]: self.open_detail(anime_id))
+        title.bind("<Button-1>", lambda _event, anime_id=row["id"]: (self.open_detail(anime_id), "break")[1])
         self.card_widgets[int(row["id"])] = card
         return card
 
@@ -1037,6 +1066,43 @@ class WatchlistApp:
         for event in watch_events(self.conn, recent=12):
             title, _alt_title = split_display_title(event["anime_title"] or "-")
             self.activity_list.insert(tk.END, f"{local_time(event['created_at'])}  {event['event_type']}  {title}")
+
+    def start_update_check(self) -> None:
+        if self.update_checking:
+            return
+        self.update_checking = True
+
+        def worker() -> None:
+            info: UpdateInfo | None = None
+            try:
+                info = check_for_update()
+            except Exception:
+                info = None
+            self.root.after(0, lambda: self.finish_update_check(info))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_update_check(self, info: UpdateInfo | None) -> None:
+        self.update_checking = False
+        if info is None or not info.update_available:
+            return
+        local = info.local_commit[:7] if info.local_commit else info.local_version
+        remote = info.remote_commit[:7] if info.remote_commit else info.remote_version or "latest"
+        details = f"Current: {info.local_version} ({local})\nLatest: {info.remote_version or 'unknown'} ({remote})"
+        if info.remote_message:
+            details += f"\n\nLatest commit: {info.remote_message}"
+        if not messagebox.askyesno("Update available", f"A newer AniAutoWatchList version is available.\n\n{details}\n\nUpdate now?"):
+            return
+        try:
+            result = launch_update()
+        except Exception as exc:
+            messagebox.showwarning("Update failed to start", str(exc))
+            return
+        location = "a terminal window" if result.used_terminal else "a background process"
+        messagebox.showinfo(
+            "Update started",
+            f"The update is running in {location}. When it finishes, close this GUI and relaunch ani-watch-gui.",
+        )
 
     def start_discovery_refresh(self, *, force: bool = False, page_name: str | None = None) -> None:
         if self.discovery_refreshing:
@@ -1174,17 +1240,7 @@ class WatchlistApp:
         image = self._image_for(media_id, cover_path, (COVER_W, COVER_H), title_text)
         cover = tk.Label(card, image=image or "", text="" if image else "No Cover", bg=COLORS["panel"], fg=COLORS["muted"])
         cover.grid(row=0, column=0, pady=(10, 8))
-        title = tk.Label(
-            card,
-            text=discovery_title_preview(title_text),
-            bg=COLORS["panel"],
-            fg=COLORS["text"],
-            font=("", 10, "bold"),
-            wraplength=COVER_W + 10,
-            height=DISCOVERY_TITLE_LINES,
-            justify="left",
-            anchor="nw",
-        )
+        title = self.create_scrollable_card_title(card, title_text)
         title.grid(row=1, column=0, sticky="ew", padx=12)
         score = item.get("average_score") or "-"
         trending = item.get("trending") or "-"
@@ -1671,7 +1727,11 @@ def main(argv: list[str] | None = None) -> int:
         print("database: OK")
         return 0
     root = tk.Tk()
-    app = WatchlistApp(root, auto_discovery=not (args.smoke_test or args.action_smoke_test))
+    app = WatchlistApp(
+        root,
+        auto_discovery=not (args.smoke_test or args.action_smoke_test),
+        check_updates=not (args.smoke_test or args.action_smoke_test),
+    )
     if args.smoke_test or args.action_smoke_test:
         root.update_idletasks()
         app.refresh_library()
