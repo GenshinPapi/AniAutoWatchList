@@ -398,6 +398,18 @@ def _score_allanime_candidate(
     return score
 
 
+def _has_clear_episode_count_lead(top: AllAnimeLaunchTarget, challengers: list[AllAnimeLaunchTarget]) -> bool:
+    if top.score < 98.0 or top.episode_count < 24:
+        return False
+    for challenger in challengers:
+        if challenger.show_id == top.show_id:
+            continue
+        required = max(challenger.episode_count * 3, challenger.episode_count + 24)
+        if top.episode_count < required:
+            return False
+    return True
+
+
 def resolve_allanime_launch_target(
     display_title: str,
     source_title: str | None = None,
@@ -449,7 +461,8 @@ def resolve_allanime_launch_target(
     scored.sort(key=lambda item: (-item.score, -item.episode_count, item.title.casefold(), item.show_id))
     if not scored or scored[0].score < 95.0:
         return None
-    if len(scored) > 1 and scored[0].show_id != scored[1].show_id and scored[0].score - scored[1].score < 1.0:
+    close_challengers = [item for item in scored[1:] if scored[0].show_id != item.show_id and scored[0].score - item.score < 1.0]
+    if close_challengers and not _has_clear_episode_count_lead(scored[0], close_challengers):
         return None
     return scored[0]
 

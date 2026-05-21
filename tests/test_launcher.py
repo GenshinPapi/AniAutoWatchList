@@ -164,6 +164,75 @@ def test_resolve_allanime_launch_target_rejects_broad_spinoff_match(monkeypatch)
     assert target is None
 
 
+def test_resolve_allanime_launch_target_prefers_clear_long_running_match(monkeypatch) -> None:
+    def fake_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
+        if query == launcher.ALLANIME_SEARCH_GQL:
+            return {
+                "data": {
+                    "shows": {
+                        "edges": [
+                            {
+                                "_id": "one-piece-main",
+                                "name": "1P",
+                                "englishName": "One Piece",
+                                "nativeName": "ONE PIECE",
+                                "availableEpisodes": {"sub": 1163},
+                            },
+                            {
+                                "_id": "one-piece-special",
+                                "name": "One Piece Special",
+                                "englishName": "One Piece Special",
+                                "nativeName": "ONE PIECE",
+                                "availableEpisodes": {"sub": 5},
+                            },
+                        ]
+                    }
+                }
+            }
+        return {"data": {"show": {"availableEpisodesDetail": {}}}}
+
+    monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
+
+    target = launcher.resolve_allanime_launch_target("One Piece")
+    availability = launcher.allanime_available_episode_keys("One Piece")
+
+    assert target is not None
+    assert target.show_id == "one-piece-main"
+    assert availability is not None
+    assert availability.target.show_id == "one-piece-main"
+    assert len(availability.episode_keys) == 1163
+
+
+def test_resolve_allanime_launch_target_still_rejects_close_episode_count_ties(monkeypatch) -> None:
+    def fake_request(variables: dict[str, object], query: str, *, timeout: int = 12) -> dict[str, object]:
+        return {
+            "data": {
+                "shows": {
+                    "edges": [
+                        {
+                            "_id": "candidate-a",
+                            "name": "Shared Title A",
+                            "englishName": "Shared Title",
+                            "nativeName": "Shared Title",
+                            "availableEpisodes": {"sub": 26},
+                        },
+                        {
+                            "_id": "candidate-b",
+                            "name": "Shared Title B",
+                            "englishName": "Shared Title",
+                            "nativeName": "Shared Title",
+                            "availableEpisodes": {"sub": 24},
+                        },
+                    ]
+                }
+            }
+        }
+
+    monkeypatch.setattr(launcher, "_allanime_api_request", fake_request)
+
+    assert launcher.resolve_allanime_launch_target("Shared Title") is None
+
+
 def test_allanime_episode_available_checks_first_matching_mode_result(monkeypatch) -> None:
     calls: list[tuple[dict[str, object], str]] = []
 
