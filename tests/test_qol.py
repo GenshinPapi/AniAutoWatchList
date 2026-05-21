@@ -12,6 +12,7 @@ from ani_watchlist.store import (
     get_or_create_anime,
     likely_duplicates,
     merge_anime,
+    merge_safe_duplicates,
     repair_database,
     upsert_episodes,
     update_anime_fields,
@@ -60,6 +61,30 @@ def test_duplicates_and_merge(app_env):
     episodes = episodes_for_anime(conn, merged["id"])
     assert [episode["episode_key"] for episode in episodes] == ["1", "2"]
     assert get_anime(conn, "Merge Show TV") is None
+
+
+def test_safe_duplicate_merge_combines_same_anilist_progress(app_env):
+    conn = initialize()
+    target, _ = get_or_create_anime(conn, "Farming Life in Another World 2 (Isekai Nonbiri Nouka 2)")
+    source, _ = get_or_create_anime(conn, "Temporary Duplicate")
+    update_anime_fields(conn, target["id"], anilist_id=197824)
+    update_anime_fields(
+        conn,
+        source["id"],
+        display_title="Farming Life in Another World Season 2 (Isekai Nonbiri Nouka 2)",
+        source_title="Farming Life in Another World Season 2 (Isekai Nonbiri Nouka 2) (7 episodes)",
+        anilist_id=197824,
+    )
+    upsert_episodes(conn, target["id"], ["1"])
+    upsert_episodes(conn, source["id"], ["2"])
+
+    report = merge_safe_duplicates(conn)
+
+    merged = get_anime(conn, "Farming Life in Another World 2 (Isekai Nonbiri Nouka 2)")
+    assert report["merged"] == 1
+    assert merged["id"] == target["id"]
+    assert get_anime(conn, "Temporary Duplicate") is None
+    assert [episode["episode_key"] for episode in episodes_for_anime(conn, merged["id"])] == ["1", "2"]
 
 
 def test_import_json_preserves_progress(app_env, tmp_path):

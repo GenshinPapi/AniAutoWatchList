@@ -16,6 +16,7 @@ from .store import (
     get_or_create_episode,
     mark_episode,
     mark_started,
+    merge_safe_duplicates,
     record_event,
     upsert_episodes,
 )
@@ -47,6 +48,7 @@ def _maybe_metadata(conn, anime, created: bool) -> None:
         return
     try:
         search_and_store_matches(conn, anime["id"], anime["display_title"], config)
+        merge_safe_duplicates(conn)
     except Exception:
         _log_failure(sys.exc_info()[1] or RuntimeError("metadata lookup failed"))
 

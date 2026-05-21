@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 STATUSES = ("watching", "completed", "dropped", "on_hold", "plan_to_watch")
+SHORT_SOURCE_SUFFIX_RE = re.compile(r"\s*\((?=[A-Za-z0-9_-]{1,8}\))(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\)\s*$")
 
 
 def now_iso() -> str:
@@ -28,6 +29,31 @@ def canonicalize_title(title: str) -> str:
     title = title.replace("'", "").replace(chr(0x2019), "")
     title = re.sub(r"[^0-9a-z]+", " ", title)
     return re.sub(r"\s+", " ", title).strip()
+
+
+def title_match_key(title: str) -> str:
+    cleaned = clean_display_title(title)
+    cleaned = SHORT_SOURCE_SUFFIX_RE.sub("", cleaned).strip()
+    key = canonicalize_title(cleaned)
+    key = re.sub(r"\b(\d+)(?:st|nd|rd|th)? season\b", r"\1", key)
+    key = re.sub(r"\bseason\s+(\d+)\b", r"\1", key)
+    key = re.sub(r"\bs\s*(\d+)\b", r"\1", key)
+    return re.sub(r"\s+", " ", key).strip()
+
+
+def _title_match_keys(*titles: object) -> set[str]:
+    keys: set[str] = set()
+    for title in titles:
+        if title is None:
+            continue
+        canonical = canonicalize_title(str(title))
+        match_key = title_match_key(str(title))
+        keys.update(key for key in (canonical, match_key) if key)
+    return keys
+
+
+def _anime_title_match_keys(row: sqlite3.Row) -> set[str]:
+    return _title_match_keys(row["display_title"], row["source_title"], row["canonical_title"])
 
 
 def episode_key(value: Any) -> str:
@@ -57,7 +83,7 @@ def episode_title(value: Any) -> str | None:
 def get_anime(conn: sqlite3.Connection, title: str) -> sqlite3.Row | None:
     canonical = canonicalize_title(title)
     clean_title = clean_display_title(title)
-    return conn.execute(
+    row = conn.execute(
         """
         SELECT * FROM anime
         WHERE canonical_title = ?
@@ -94,10 +120,27 @@ def get_anime(conn: sqlite3.Connection, title: str) -> sqlite3.Row | None:
             f"{canonical} %",
         ),
     ).fetchone()
+    if row is not None:
+        return row
+    keys = _title_match_keys(title)
+    for candidate in conn.execute("SELECT * FROM anime ORDER BY id"):
+        if keys & _anime_title_match_keys(candidate):
+            return candidate
+    return None
 
 
 def get_anime_by_id(conn: sqlite3.Connection, anime_id: int) -> sqlite3.Row | None:
     return conn.execute("SELECT * FROM anime WHERE id = ?", (anime_id,)).fetchone()
+
+
+def get_anime_by_anilist_id(conn: sqlite3.Connection, anilist_id: str | int | None) -> sqlite3.Row | None:
+    if anilist_id is None or str(anilist_id).strip() == "":
+        return None
+    try:
+        media_id = int(anilist_id)
+    except (TypeError, ValueError):
+        return None
+    return conn.execute("SELECT * FROM anime WHERE anilist_id = ? ORDER BY id LIMIT 1", (media_id,)).fetchone()
 
 
 def get_or_create_anime(
@@ -124,6 +167,10 @@ def get_or_create_anime(
     ).fetchone()
     if existing is not None:
         return existing, False
+    keys = _title_match_keys(title, source)
+    for candidate in conn.execute("SELECT * FROM anime ORDER BY id"):
+        if keys & _anime_title_match_keys(candidate):
+            return candidate, False
 
     ts = now_iso()
     next_sort = conn.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 AS next FROM anime WHERE status = ?", (status,)).fetchone()[
@@ -443,7 +490,7 @@ def recently_watched_anime(conn: sqlite3.Connection, limit: int = 10) -> list[sq
 def likely_duplicates(conn: sqlite3.Connection) -> list[tuple[str, list[sqlite3.Row]]]:
     groups: dict[str, list[sqlite3.Row]] = {}
     for row in conn.execute("SELECT * FROM anime ORDER BY display_title"):
-        keys = [row["canonical_title"]]
+        keys = list(_anime_title_match_keys(row))
         if row["anilist_id"] is not None:
             keys.append(f"anilist:{row['anilist_id']}")
         for key in keys:
@@ -469,6 +516,72 @@ def likely_duplicates(conn: sqlite3.Connection) -> list[tuple[str, list[sqlite3.
                 seen.add(ids)
                 duplicates.append((f"similar:{left_title} ~ {right_title}", [left, right]))
     return duplicates
+
+
+def safe_duplicate_groups(conn: sqlite3.Connection) -> list[tuple[str, list[sqlite3.Row]]]:
+    groups: dict[str, list[sqlite3.Row]] = {}
+    for row in conn.execute("SELECT * FROM anime ORDER BY id"):
+        keys: list[str] = []
+        if row["anilist_id"] is not None:
+            keys.append(f"anilist:{row['anilist_id']}")
+        keys.extend(f"title:{key}" for key in _anime_title_match_keys(row))
+        for key in keys:
+            groups.setdefault(key, []).append(row)
+    seen: set[tuple[int, ...]] = set()
+    duplicates: list[tuple[str, list[sqlite3.Row]]] = []
+    for key, rows in groups.items():
+        ids = tuple(sorted(int(row["id"]) for row in rows))
+        if len(ids) > 1 and ids not in seen:
+            seen.add(ids)
+            duplicates.append((key, rows))
+    return duplicates
+
+
+def _anime_merge_rank(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[int, int, int, int, int, int]:
+    stats = conn.execute(
+        """
+        SELECT
+            COUNT(*) AS episode_count,
+            COALESCE(SUM(CASE WHEN watched = 1 THEN 1 ELSE 0 END), 0) AS watched_count
+        FROM episodes
+        WHERE anime_id = ?
+        """,
+        (row["id"],),
+    ).fetchone()
+    status_rank = {
+        "watching": 4,
+        "completed": 3,
+        "on_hold": 2,
+        "plan_to_watch": 1,
+        "dropped": 0,
+    }.get(str(row["status"]), 0)
+    return (
+        int(stats["watched_count"] or 0),
+        status_rank,
+        1 if row["last_watched_at"] else 0,
+        int(stats["episode_count"] or 0),
+        1 if row["anilist_id"] is not None else 0,
+        -int(row["id"]),
+    )
+
+
+def merge_safe_duplicates(conn: sqlite3.Connection) -> dict[str, Any]:
+    merged: list[dict[str, Any]] = []
+    while True:
+        groups = safe_duplicate_groups(conn)
+        if not groups:
+            break
+        _key, rows = groups[0]
+        target = max(rows, key=lambda row: _anime_merge_rank(conn, row))
+        for source in rows:
+            if int(source["id"]) == int(target["id"]):
+                continue
+            if get_anime_by_id(conn, int(source["id"])) is None:
+                continue
+            result = merge_anime(conn, int(target["id"]), int(source["id"]))
+            merged.append(result)
+            target = get_anime_by_id(conn, int(target["id"])) or target
+    return {"merged": len(merged), "merges": merged}
 
 
 def merge_anime(conn: sqlite3.Connection, target_id: int, source_id: int) -> dict[str, Any]:
@@ -681,6 +794,7 @@ def repair_database(conn: sqlite3.Connection, fix: bool = False) -> dict[str, An
             """
         )
     )
+    duplicate_anime_groups = safe_duplicate_groups(conn)
     missing_watched_at = list(conn.execute("SELECT * FROM episodes WHERE watched = 1 AND watched_at IS NULL"))
     missing_started_at = list(
         conn.execute(
@@ -719,6 +833,7 @@ def repair_database(conn: sqlite3.Connection, fix: bool = False) -> dict[str, An
     report.update(
         {
             "orphaned_episodes": len(orphaned),
+            "duplicate_anime_groups": len(duplicate_anime_groups),
             "duplicate_episode_groups": len(duplicate_groups),
             "watched_missing_watched_at": len(missing_watched_at),
             "started_missing_first_started_at": len(missing_started_at),
@@ -727,6 +842,7 @@ def repair_database(conn: sqlite3.Connection, fix: bool = False) -> dict[str, An
         }
     )
     if fix:
+        duplicate_merge_report = merge_safe_duplicates(conn)
         ts = now_iso()
         with conn:
             conn.execute(
@@ -758,6 +874,7 @@ def repair_database(conn: sqlite3.Connection, fix: bool = False) -> dict[str, An
             for row in broken_covers:
                 conn.execute("UPDATE anime SET cover_path = NULL, updated_at = ? WHERE id = ?", (ts, row["id"]))
         report["fixed"] = True
+        report["duplicate_anime_merged"] = duplicate_merge_report["merged"]
     else:
         report["fixed"] = False
     return report

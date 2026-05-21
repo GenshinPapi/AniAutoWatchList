@@ -48,10 +48,12 @@ from .store import (
     clean_display_title,
     delete_anime,
     episodes_for_anime,
+    get_anime_by_anilist_id,
     get_anime_by_id,
     get_or_create_anime,
     list_anime,
     mark_episode,
+    merge_safe_duplicates,
     status_counts,
     update_anime_fields,
     upsert_episodes,
@@ -184,6 +186,7 @@ class WatchlistApp:
         self.root.minsize(780, 540)
         self.root.configure(bg=COLORS["bg"])
         self.conn = initialize()
+        merge_safe_duplicates(self.conn)
         self.auto_refresh_ms = WATCHLIST_AUTO_REFRESH_MS
         self.auto_discovery_enabled = auto_discovery
         self.selected_status = tk.StringVar(value="watching")
@@ -1660,7 +1663,11 @@ class WatchlistApp:
 
     def add_discovery_to_plan(self, item: dict[str, object]) -> None:
         title = str(item.get("display_title") or "Unknown title")
-        anime, created = get_or_create_anime(self.conn, title, status="plan_to_watch")
+        anime = get_anime_by_anilist_id(self.conn, item.get("id"))
+        if anime is None:
+            anime, created = get_or_create_anime(self.conn, title, status="plan_to_watch")
+        else:
+            created = False
         metadata_payload = item.get("metadata_payload") if isinstance(item.get("metadata_payload"), dict) else None
         updates = {
             "anilist_id": item.get("id") or anime["anilist_id"],

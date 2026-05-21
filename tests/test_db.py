@@ -5,8 +5,10 @@ from ani_watchlist.store import (
     clean_display_title,
     episodes_for_anime,
     get_anime,
+    get_anime_by_anilist_id,
     get_or_create_anime,
     mark_episode,
+    title_match_key,
     upsert_episodes,
     update_anime_fields,
 )
@@ -66,6 +68,25 @@ def test_source_title_still_matches_after_english_metadata_rename(app_env):
 
     assert created is False
     assert found["id"] == anime["id"]
+
+
+def test_season_title_alias_matches_existing_anime(app_env):
+    conn = initialize()
+    anime, _ = get_or_create_anime(conn, "Farming Life in Another World 2 (Isekai Nonbiri Nouka 2)")
+
+    found, created = get_or_create_anime(conn, "Farming Life in Another World Season 2 (Isekai Nonbiri Nouka 2) (7 episodes)")
+
+    assert created is False
+    assert found["id"] == anime["id"]
+    assert title_match_key("Farming Life in Another World Season 2") == title_match_key("Farming Life in Another World 2")
+
+
+def test_anilist_lookup_returns_existing_row(app_env):
+    conn = initialize()
+    anime, _ = get_or_create_anime(conn, "One Piece")
+    update_anime_fields(conn, anime["id"], anilist_id=21)
+
+    assert get_anime_by_anilist_id(conn, 21)["id"] == anime["id"]
 
 
 def test_display_title_update_does_not_fail_on_existing_canonical(app_env):

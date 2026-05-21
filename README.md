@@ -20,6 +20,7 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 - Global AniList title search with suggestions and card results
 - Related seasons on anime detail pages
 - Automatic released episode refresh from AllAnime when titles are added or opened
+- Automatic duplicate cleanup for matching AniList titles and season-title aliases
 - AniList metadata search and cover caching
 - English-first display titles when metadata is available
 - Notes per anime
@@ -200,6 +201,7 @@ The GUI includes:
 - Related seasons and side stories on detail pages
 - Episode checklist
 - Automatic released episode list refresh from AllAnime
+- Startup cleanup for duplicate watchlist rows that refer to the same anime
 - Continue selected episode through ani-cli
 - Notes editor
 - Metadata refresh
