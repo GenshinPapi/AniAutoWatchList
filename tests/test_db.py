@@ -81,6 +81,22 @@ def test_season_title_alias_matches_existing_anime(app_env):
     assert title_match_key("Farming Life in Another World Season 2") == title_match_key("Farming Life in Another World 2")
 
 
+def test_parenthetical_alias_variant_matches_existing_anime(app_env):
+    conn = initialize()
+    anime, _ = get_or_create_anime(
+        conn,
+        "Is It Wrong to Try to Pick Up Girls in a Dungeon? (Dungeon ni Deai wo Motomeru no wa Machigatteiru Darou ka)",
+    )
+
+    found, created = get_or_create_anime(
+        conn,
+        "Is It Wrong to Try to Pick Up Girls in a Dungeon? (Dungeon ni Deai o Motomeru no wa Machigatte Iru Darouka) (13 episodes)",
+    )
+
+    assert created is False
+    assert found["id"] == anime["id"]
+
+
 def test_anilist_lookup_returns_existing_row(app_env):
     conn = initialize()
     anime, _ = get_or_create_anime(conn, "One Piece")

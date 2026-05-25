@@ -11,6 +11,14 @@ from typing import Any, Iterable
 
 STATUSES = ("watching", "completed", "dropped", "on_hold", "plan_to_watch")
 SHORT_SOURCE_SUFFIX_RE = re.compile(r"\s*\((?=[A-Za-z0-9_-]{1,8}\))(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\)\s*$")
+PAREN_ALIAS_SKIP_RE = re.compile(
+    r"\b(?:"
+    r"\d{4}|season|part|cour|arc|ova|ona|movie|special|recap|pilot|tv|"
+    r"dub|sub|uncut|uncensored|censored|remaster|remastered|version"
+    r")\b",
+    re.IGNORECASE,
+)
+SAFE_METADATA_MATCH_CONFIDENCE = 0.995
 
 
 def now_iso() -> str:
@@ -41,14 +49,42 @@ def title_match_key(title: str) -> str:
     return re.sub(r"\s+", " ", key).strip()
 
 
+def _primary_title_alias(title: str) -> str | None:
+    cleaned = clean_display_title(title)
+    if not cleaned.endswith(")") or " (" not in cleaned:
+        return None
+    primary, parenthetical = cleaned.rsplit(" (", 1)
+    primary = primary.strip()
+    parenthetical = parenthetical[:-1].strip()
+    if not primary or not parenthetical:
+        return None
+    primary_key = canonicalize_title(primary)
+    parenthetical_key = canonicalize_title(parenthetical)
+    if len(_significant_title_tokens(primary_key)) < 4:
+        return None
+    if PAREN_ALIAS_SKIP_RE.search(parenthetical_key):
+        return None
+    return primary
+
+
+def _significant_title_tokens(key: str) -> set[str]:
+    tokens = set(key.split())
+    return {token for token in tokens if token not in {"a", "an", "and", "in", "is", "it", "of", "the", "to"}} or tokens
+
+
 def _title_match_keys(*titles: object) -> set[str]:
     keys: set[str] = set()
     for title in titles:
         if title is None:
             continue
-        canonical = canonicalize_title(str(title))
-        match_key = title_match_key(str(title))
-        keys.update(key for key in (canonical, match_key) if key)
+        variants = [str(title)]
+        primary = _primary_title_alias(str(title))
+        if primary:
+            variants.append(primary)
+        for variant in variants:
+            canonical = canonicalize_title(variant)
+            match_key = title_match_key(variant)
+            keys.update(key for key in (canonical, match_key) if key)
     return keys
 
 
@@ -459,6 +495,16 @@ def status_counts(conn: sqlite3.Connection) -> dict[str, int]:
     return counts
 
 
+def _status_merge_rank(status: object) -> int:
+    return {
+        "watching": 4,
+        "completed": 3,
+        "on_hold": 2,
+        "plan_to_watch": 1,
+        "dropped": 0,
+    }.get(str(status), 0)
+
+
 def next_unwatched_episode(conn: sqlite3.Connection, anime_id: int) -> sqlite3.Row | None:
     return conn.execute(
         """
@@ -489,19 +535,22 @@ def recently_watched_anime(conn: sqlite3.Connection, limit: int = 10) -> list[sq
 
 def likely_duplicates(conn: sqlite3.Connection) -> list[tuple[str, list[sqlite3.Row]]]:
     groups: dict[str, list[sqlite3.Row]] = {}
+    metadata_keys = _safe_metadata_anilist_keys(conn)
     for row in conn.execute("SELECT * FROM anime ORDER BY display_title"):
         keys = list(_anime_title_match_keys(row))
         if row["anilist_id"] is not None:
             keys.append(f"anilist:{row['anilist_id']}")
-        for key in keys:
+        keys.extend(metadata_keys.get(int(row["id"]), set()))
+        for key in set(keys):
             groups.setdefault(key, []).append(row)
     seen: set[tuple[int, ...]] = set()
     duplicates: list[tuple[str, list[sqlite3.Row]]] = []
     for key, rows in groups.items():
-        ids = tuple(sorted(int(row["id"]) for row in rows))
+        unique_rows = list({int(row["id"]): row for row in rows}.values())
+        ids = tuple(sorted(int(row["id"]) for row in unique_rows))
         if len(ids) > 1 and ids not in seen:
             seen.add(ids)
-            duplicates.append((key, rows))
+            duplicates.append((key, unique_rows))
     rows = list(conn.execute("SELECT * FROM anime ORDER BY display_title"))
     for idx, left in enumerate(rows):
         for right in rows[idx + 1 :]:
@@ -518,26 +567,64 @@ def likely_duplicates(conn: sqlite3.Connection) -> list[tuple[str, list[sqlite3.
     return duplicates
 
 
+def _safe_metadata_anilist_keys(conn: sqlite3.Connection) -> dict[int, set[str]]:
+    trusted_ids = {
+        str(row["anilist_id"])
+        for row in conn.execute("SELECT anilist_id FROM anime WHERE anilist_id IS NOT NULL")
+        if str(row["anilist_id"]).strip()
+    }
+    trusted_ids.update(
+        str(row["provider_media_id"])
+        for row in conn.execute(
+            """
+            SELECT provider_media_id FROM metadata_matches
+            WHERE provider = 'anilist' AND selected = 1
+            """
+        )
+        if str(row["provider_media_id"]).strip()
+    )
+    keys_by_anime: dict[int, set[str]] = {}
+    for row in conn.execute(
+        """
+        SELECT anime_id, provider_media_id, confidence_score, selected
+        FROM metadata_matches
+        WHERE provider = 'anilist'
+        """
+    ):
+        media_id = str(row["provider_media_id"] or "").strip()
+        if not media_id:
+            continue
+        selected = bool(row["selected"])
+        confidence = float(row["confidence_score"] or 0)
+        if not selected and (media_id not in trusted_ids or confidence < SAFE_METADATA_MATCH_CONFIDENCE):
+            continue
+        keys_by_anime.setdefault(int(row["anime_id"]), set()).add(f"anilist:{media_id}")
+    return keys_by_anime
+
+
 def safe_duplicate_groups(conn: sqlite3.Connection) -> list[tuple[str, list[sqlite3.Row]]]:
     groups: dict[str, list[sqlite3.Row]] = {}
+    metadata_keys = _safe_metadata_anilist_keys(conn)
     for row in conn.execute("SELECT * FROM anime ORDER BY id"):
         keys: list[str] = []
         if row["anilist_id"] is not None:
             keys.append(f"anilist:{row['anilist_id']}")
+        keys.extend(metadata_keys.get(int(row["id"]), set()))
         keys.extend(f"title:{key}" for key in _anime_title_match_keys(row))
-        for key in keys:
+        for key in set(keys):
             groups.setdefault(key, []).append(row)
     seen: set[tuple[int, ...]] = set()
     duplicates: list[tuple[str, list[sqlite3.Row]]] = []
     for key, rows in groups.items():
-        ids = tuple(sorted(int(row["id"]) for row in rows))
+        unique_rows = list({int(row["id"]): row for row in rows}.values())
+        ids = tuple(sorted(int(row["id"]) for row in unique_rows))
         if len(ids) > 1 and ids not in seen:
             seen.add(ids)
-            duplicates.append((key, rows))
+            duplicates.append((key, unique_rows))
     return duplicates
 
 
-def _anime_merge_rank(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[int, int, int, int, int, int]:
+def _anime_merge_rank(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[int, int, int, int, int, int, int]:
     stats = conn.execute(
         """
         SELECT
@@ -548,19 +635,13 @@ def _anime_merge_rank(conn: sqlite3.Connection, row: sqlite3.Row) -> tuple[int, 
         """,
         (row["id"],),
     ).fetchone()
-    status_rank = {
-        "watching": 4,
-        "completed": 3,
-        "on_hold": 2,
-        "plan_to_watch": 1,
-        "dropped": 0,
-    }.get(str(row["status"]), 0)
     return (
+        1 if row["anilist_id"] is not None else 0,
+        1 if row["cover_path"] or row["cover_url"] else 0,
         int(stats["watched_count"] or 0),
-        status_rank,
+        _status_merge_rank(row["status"]),
         1 if row["last_watched_at"] else 0,
         int(stats["episode_count"] or 0),
-        1 if row["anilist_id"] is not None else 0,
         -int(row["id"]),
     )
 
@@ -654,6 +735,8 @@ def merge_anime(conn: sqlite3.Connection, target_id: int, source_id: int) -> dic
         if source_notes and source_notes not in notes:
             notes = (notes + "\n\nMerged notes from " + source["display_title"] + ":\n" + source_notes).strip()
         fields: dict[str, Any] = {"notes": notes or None}
+        if _status_merge_rank(source["status"]) > _status_merge_rank(target["status"]):
+            fields["status"] = source["status"]
         for field in ("anilist_id", "total_episodes", "cover_url", "cover_path", "last_watched_at"):
             if target[field] is None and source[field] is not None:
                 fields[field] = source[field]

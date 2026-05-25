@@ -9,10 +9,14 @@ from ani_watchlist.hook import run
 from ani_watchlist.store import (
     episodes_for_anime,
     get_anime,
+    get_anime_by_anilist_id,
+    get_anime_by_id,
     get_or_create_anime,
     likely_duplicates,
+    mark_episode,
     merge_anime,
     merge_safe_duplicates,
+    now_iso,
     repair_database,
     upsert_episodes,
     update_anime_fields,
@@ -85,6 +89,68 @@ def test_safe_duplicate_merge_combines_same_anilist_progress(app_env):
     assert merged["id"] == target["id"]
     assert get_anime(conn, "Temporary Duplicate") is None
     assert [episode["episode_key"] for episode in episodes_for_anime(conn, merged["id"])] == ["1", "2"]
+
+
+def test_safe_duplicate_merge_keeps_metadata_card_when_alias_duplicate_has_progress(app_env):
+    conn = initialize()
+    target, _ = get_or_create_anime(
+        conn,
+        "Is It Wrong to Try to Pick Up Girls in a Dungeon? (Dungeon ni Deai wo Motomeru no wa Machigatteiru Darou ka)",
+    )
+    update_anime_fields(
+        conn,
+        target["id"],
+        anilist_id=20920,
+        cover_path="/tmp/anilist-20920.jpg",
+        status="watching",
+    )
+    source, _ = get_or_create_anime(conn, "Temporary DanMachi Duplicate")
+    update_anime_fields(
+        conn,
+        source["id"],
+        display_title="Is It Wrong to Try to Pick Up Girls in a Dungeon? (Dungeon ni Deai o Motomeru no wa Machigatte Iru Darouka)",
+        source_title="Is It Wrong to Try to Pick Up Girls in a Dungeon? (Dungeon ni Deai o Motomeru no wa Machigatte Iru Darouka) (13 episodes)",
+        status="watching",
+    )
+    upsert_episodes(conn, target["id"], ["1"])
+    upsert_episodes(conn, source["id"], ["2"])
+    mark_episode(conn, source["id"], "2", watched=True)
+
+    report = merge_safe_duplicates(conn)
+
+    merged = get_anime_by_anilist_id(conn, 20920)
+    episodes = episodes_for_anime(conn, merged["id"])
+    assert report["merged"] == 1
+    assert merged["id"] == target["id"]
+    assert merged["cover_path"] == "/tmp/anilist-20920.jpg"
+    assert get_anime_by_id(conn, source["id"]) is None
+    assert [episode["episode_key"] for episode in episodes] == ["1", "2"]
+    assert [episode["watched"] for episode in episodes] == [0, 1]
+
+
+def test_safe_duplicate_merge_uses_trusted_high_confidence_metadata_candidate(app_env):
+    conn = initialize()
+    target, _ = get_or_create_anime(conn, "Known Metadata Show")
+    source, _ = get_or_create_anime(conn, "Unmatched Hook Alias")
+    update_anime_fields(conn, target["id"], anilist_id=12345)
+    upsert_episodes(conn, source["id"], ["1"])
+    with conn:
+        conn.execute(
+            """
+            INSERT INTO metadata_matches(
+                anime_id, provider, provider_media_id, confidence_score, selected, payload_json, created_at
+            ) VALUES (?, 'anilist', '12345', 1.0, 0, '{}', ?)
+            """,
+            (source["id"], now_iso()),
+        )
+
+    report = merge_safe_duplicates(conn)
+
+    merged = get_anime_by_anilist_id(conn, 12345)
+    assert report["merged"] == 1
+    assert merged["id"] == target["id"]
+    assert get_anime_by_id(conn, source["id"]) is None
+    assert [episode["episode_key"] for episode in episodes_for_anime(conn, target["id"])] == ["1"]
 
 
 def test_import_json_preserves_progress(app_env, tmp_path):
