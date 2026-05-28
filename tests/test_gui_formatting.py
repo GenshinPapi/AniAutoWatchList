@@ -3,12 +3,15 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from ani_watchlist.gui import (
+    IDLE_CLOSE_GRACE_MS,
+    IDLE_PROMPT_AFTER_MS,
     UNWATCHED_ICON,
     WATCHED_ICON,
     WATCHLIST_AUTO_REFRESH_MS,
     discovery_page_count,
     discovery_page_items,
     discovery_title_preview,
+    idle_prompt_due,
     metadata_payload_is_adult,
     scroll_units_from_mousewheel,
     split_display_title,
@@ -56,6 +59,18 @@ def test_discovery_title_preview_preserves_start_of_long_titles() -> None:
 
 def test_watchlist_auto_refresh_is_thirty_seconds() -> None:
     assert WATCHLIST_AUTO_REFRESH_MS == 30_000
+
+
+def test_idle_watchdog_uses_four_hour_prompt_and_thirty_minute_close() -> None:
+    assert IDLE_PROMPT_AFTER_MS == 4 * 60 * 60 * 1000
+    assert IDLE_CLOSE_GRACE_MS == 30 * 60 * 1000
+
+
+def test_idle_prompt_due_uses_elapsed_user_activity_time() -> None:
+    last_activity = 10_000
+
+    assert idle_prompt_due(last_activity, last_activity + IDLE_PROMPT_AFTER_MS)
+    assert not idle_prompt_due(last_activity, last_activity + IDLE_PROMPT_AFTER_MS - 1)
 
 
 def test_metadata_payload_is_adult_only_for_explicit_anilist_adult_flag() -> None:

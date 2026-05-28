@@ -7,6 +7,8 @@ import re
 import threading
 import webbrowser
 from datetime import datetime, timedelta
+from math import ceil
+from time import monotonic
 from textwrap import wrap
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
@@ -98,6 +100,11 @@ COVER_H = 204
 DETAIL_COVER_W = 170
 DETAIL_COVER_H = 244
 WATCHLIST_AUTO_REFRESH_MS = 30_000
+IDLE_PROMPT_AFTER_MS = 4 * 60 * 60 * 1000
+IDLE_CLOSE_GRACE_MS = 30 * 60 * 1000
+IDLE_CHECK_INTERVAL_MS = 60_000
+IDLE_ACTIVITY_THROTTLE_MS = 1000
+IDLE_ACTIVITY_EVENTS = ("<KeyPress>", "<ButtonPress>", "<MouseWheel>", "<Button-4>", "<Button-5>", "<Motion>")
 WATCHED_ICON = "✅"
 UNWATCHED_ICON = "❌"
 ADULT_TITLE_LABEL_RE = re.compile(r"\[\s*(?:18\s*\+?|adult)\s*\]", re.IGNORECASE)
@@ -178,6 +185,14 @@ def discovery_page_items(items: list[object], page_index: int, *, page_size: int
     return items[start : start + page_size]
 
 
+def monotonic_ms() -> int:
+    return int(monotonic() * 1000)
+
+
+def idle_prompt_due(last_activity_ms: int, now_ms: int, *, prompt_after_ms: int = IDLE_PROMPT_AFTER_MS) -> bool:
+    return now_ms - last_activity_ms >= prompt_after_ms
+
+
 class WatchlistApp:
     def __init__(self, root: tk.Tk, *, auto_discovery: bool = True, check_updates: bool = True):
         self.root = root
@@ -187,7 +202,19 @@ class WatchlistApp:
         self.root.configure(bg=COLORS["bg"])
         self.conn = initialize()
         merge_safe_duplicates(self.conn)
+        self.shutting_down = False
         self.auto_refresh_ms = WATCHLIST_AUTO_REFRESH_MS
+        self.auto_refresh_job: str | None = None
+        self.idle_prompt_after_ms = IDLE_PROMPT_AFTER_MS
+        self.idle_close_grace_ms = IDLE_CLOSE_GRACE_MS
+        self.idle_check_interval_ms = IDLE_CHECK_INTERVAL_MS
+        self.last_user_activity_ms = monotonic_ms()
+        self.idle_check_job: str | None = None
+        self.idle_close_job: str | None = None
+        self.idle_countdown_job: str | None = None
+        self.idle_prompt: tk.Toplevel | None = None
+        self.idle_prompt_countdown_label: tk.Label | None = None
+        self.idle_prompt_deadline_ms: int | None = None
         self.auto_discovery_enabled = auto_discovery
         self.selected_status = tk.StringVar(value="watching")
         self.search_text = tk.StringVar()
@@ -237,6 +264,8 @@ class WatchlistApp:
         self.discovery_page_indexes = {name: 0 for name in DISCOVERY_MEDIA_PAGES}
         self._configure_style()
         self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+        self.install_idle_watchdog()
         self.show_trending()
         if auto_discovery:
             self.start_discovery_refresh(force=False)
@@ -938,7 +967,7 @@ class WatchlistApp:
                     append_discovery_media_page(conn, page_name, load_config(), genre=popular_genre)
             except Exception as exc:  # pragma: no cover - defensive UI boundary
                 error = str(exc)
-            self.root.after(0, lambda: self.finish_discovery_load_more(page_name, target_page_index, error))
+            self.run_on_ui(lambda: self.finish_discovery_load_more(page_name, target_page_index, error))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -985,10 +1014,188 @@ class WatchlistApp:
         self.load_detail()
         self.start_episode_availability_refresh(anime_id)
 
+    def run_on_ui(self, callback) -> None:
+        if self.shutting_down:
+            return
+        try:
+            self.root.after(0, callback)
+        except (RuntimeError, tk.TclError):
+            pass
+
+    def install_idle_watchdog(self) -> None:
+        for sequence in IDLE_ACTIVITY_EVENTS:
+            self.root.bind_all(sequence, self.record_user_activity, add="+")
+        self.schedule_idle_check()
+
+    def record_user_activity(self, _event=None) -> None:
+        if self.shutting_down or self.idle_prompt is not None:
+            return
+        now = monotonic_ms()
+        if now - self.last_user_activity_ms < IDLE_ACTIVITY_THROTTLE_MS:
+            return
+        self.last_user_activity_ms = now
+        self.schedule_idle_check()
+
+    def schedule_idle_check(self) -> None:
+        if self.shutting_down:
+            return
+        if self.idle_check_job is not None:
+            try:
+                self.root.after_cancel(self.idle_check_job)
+            except tk.TclError:
+                pass
+        now = monotonic_ms()
+        remaining = self.idle_prompt_after_ms - (now - self.last_user_activity_ms)
+        delay = max(1000, min(self.idle_check_interval_ms, max(1000, remaining)))
+        self.idle_check_job = self.root.after(delay, self.check_idle_timeout)
+
+    def check_idle_timeout(self) -> None:
+        self.idle_check_job = None
+        if self.shutting_down or self.idle_prompt is not None:
+            return
+        now = monotonic_ms()
+        if idle_prompt_due(self.last_user_activity_ms, now, prompt_after_ms=self.idle_prompt_after_ms):
+            self.show_idle_prompt()
+            return
+        self.schedule_idle_check()
+
+    def show_idle_prompt(self) -> None:
+        if self.shutting_down or self.idle_prompt is not None:
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Still watching?")
+        win.configure(bg=COLORS["panel"])
+        win.resizable(False, False)
+        win.transient(self.root)
+        win.protocol("WM_DELETE_WINDOW", self.acknowledge_idle_prompt)
+        self.idle_prompt = win
+
+        frame = tk.Frame(win, bg=COLORS["panel"], padx=20, pady=18)
+        frame.grid(row=0, column=0, sticky="nsew")
+        tk.Label(
+            frame,
+            text="Still watching?",
+            bg=COLORS["panel"],
+            fg=COLORS["text"],
+            font=("", 16, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        tk.Label(
+            frame,
+            text="The watchlist has been idle for a while.",
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.idle_prompt_countdown_label = tk.Label(frame, text="", bg=COLORS["panel"], fg=COLORS["muted"])
+        self.idle_prompt_countdown_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 14))
+        ttk.Button(frame, text="Continue", style="Accent.TButton", command=self.acknowledge_idle_prompt).grid(
+            row=3, column=0, sticky="ew", padx=(0, 8)
+        )
+        ttk.Button(frame, text="Close Now", style="Dark.TButton", command=self.close_app).grid(row=3, column=1, sticky="ew")
+        frame.columnconfigure(0, weight=1)
+        frame.columnconfigure(1, weight=1)
+        win.bind("<Return>", lambda _event: self.acknowledge_idle_prompt())
+        win.bind("<Escape>", lambda _event: self.close_app())
+        win.update_idletasks()
+        self.center_idle_prompt(win)
+        try:
+            win.grab_set()
+            win.focus_force()
+        except tk.TclError:
+            pass
+        self.idle_prompt_deadline_ms = monotonic_ms() + self.idle_close_grace_ms
+        self.update_idle_prompt_countdown()
+        self.idle_close_job = self.root.after(self.idle_close_grace_ms, self.close_app)
+
+    def center_idle_prompt(self, win: tk.Toplevel) -> None:
+        self.root.update_idletasks()
+        root_x = self.root.winfo_rootx()
+        root_y = self.root.winfo_rooty()
+        root_w = max(1, self.root.winfo_width())
+        root_h = max(1, self.root.winfo_height())
+        win_w = max(1, win.winfo_width())
+        win_h = max(1, win.winfo_height())
+        x = root_x + max(0, (root_w - win_w) // 2)
+        y = root_y + max(0, (root_h - win_h) // 2)
+        win.geometry(f"+{x}+{y}")
+
+    def update_idle_prompt_countdown(self) -> None:
+        if self.shutting_down or self.idle_prompt is None or self.idle_prompt_deadline_ms is None:
+            return
+        remaining_ms = max(0, self.idle_prompt_deadline_ms - monotonic_ms())
+        minutes = max(1, ceil(remaining_ms / 60_000))
+        if self.idle_prompt_countdown_label is not None:
+            self.idle_prompt_countdown_label.configure(
+                text=f"The GUI will close in about {minutes} minute{'s' if minutes != 1 else ''} without a response."
+            )
+        delay = min(60_000, max(1000, remaining_ms))
+        self.idle_countdown_job = self.root.after(delay, self.update_idle_prompt_countdown)
+
+    def acknowledge_idle_prompt(self) -> None:
+        if self.shutting_down:
+            return
+        self.last_user_activity_ms = monotonic_ms()
+        self.dismiss_idle_prompt()
+        self.schedule_idle_check()
+
+    def dismiss_idle_prompt(self) -> None:
+        for attr in ("idle_close_job", "idle_countdown_job"):
+            job = getattr(self, attr)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+        win = self.idle_prompt
+        self.idle_prompt = None
+        self.idle_prompt_countdown_label = None
+        self.idle_prompt_deadline_ms = None
+        if win is None:
+            return
+        try:
+            win.grab_release()
+        except tk.TclError:
+            pass
+        try:
+            win.destroy()
+        except tk.TclError:
+            pass
+
+    def close_app(self) -> None:
+        if self.shutting_down:
+            return
+        self.shutting_down = True
+        for attr in ("idle_check_job", "idle_close_job", "idle_countdown_job", "auto_refresh_job", "search_suggestion_job"):
+            job = getattr(self, attr, None)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+        self.dismiss_idle_prompt()
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+        try:
+            self.root.quit()
+        except tk.TclError:
+            pass
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
     def schedule_auto_refresh(self) -> None:
-        self.root.after(self.auto_refresh_ms, self.auto_refresh)
+        if self.shutting_down:
+            return
+        self.auto_refresh_job = self.root.after(self.auto_refresh_ms, self.auto_refresh)
 
     def auto_refresh(self) -> None:
+        if self.shutting_down:
+            return
+        self.auto_refresh_job = None
         try:
             if self.current_page == "library":
                 self.refresh_library(preserve_scroll=True)
@@ -1240,7 +1447,7 @@ class WatchlistApp:
 
         def worker() -> None:
             payload = search_media(query, load_config(), limit=SEARCH_SUGGESTION_LIMIT, cache_covers=False)
-            self.root.after(0, lambda: self.finish_search_suggestions(generation, query, payload))
+            self.run_on_ui(lambda: self.finish_search_suggestions(generation, query, payload))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1292,7 +1499,7 @@ class WatchlistApp:
 
         def worker() -> None:
             payload = search_media(query, load_config(), limit=SEARCH_RESULT_LIMIT, cache_covers=True)
-            self.root.after(0, lambda: self.finish_global_search(generation, query, payload))
+            self.run_on_ui(lambda: self.finish_global_search(generation, query, payload))
 
         threading.Thread(target=worker, daemon=True).start()
         return "break"
@@ -1325,7 +1532,7 @@ class WatchlistApp:
                 info = check_for_update()
             except Exception:
                 info = None
-            self.root.after(0, lambda: self.finish_update_check(info))
+            self.run_on_ui(lambda: self.finish_update_check(info))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1381,7 +1588,7 @@ class WatchlistApp:
                         refresh_discovery(conn, load_config(), force=force, popular_genre=popular_genre)
             except Exception as exc:  # pragma: no cover - defensive UI boundary
                 error = str(exc)
-            self.root.after(0, lambda: self.finish_discovery_refresh(error))
+            self.run_on_ui(lambda: self.finish_discovery_refresh(error))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1717,7 +1924,7 @@ class WatchlistApp:
                     payload.update(refresh_available_episodes_for_anime(conn, anime_id))
             except Exception as exc:  # pragma: no cover - defensive UI boundary
                 payload["error"] = str(exc)
-            self.root.after(0, lambda: self.finish_episode_availability_refresh(anime_id, payload))
+            self.run_on_ui(lambda: self.finish_episode_availability_refresh(anime_id, payload))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1770,7 +1977,7 @@ class WatchlistApp:
 
         def worker() -> None:
             payload = related_media(media_id_int, load_config(), cache_covers=True)
-            self.root.after(0, lambda: self.finish_related_media_refresh(media_id_int, payload))
+            self.run_on_ui(lambda: self.finish_related_media_refresh(media_id_int, payload))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2175,7 +2382,7 @@ def main(argv: list[str] | None = None) -> int:
                 app.choose_match()
         app.auto_refresh()
         root.update_idletasks()
-        root.destroy()
+        app.close_app()
         print("GUI action smoke test: OK" if args.action_smoke_test else "GUI smoke test: OK")
         return 0
     root.mainloop()
