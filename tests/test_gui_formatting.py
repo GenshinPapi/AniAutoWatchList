@@ -17,6 +17,7 @@ from ani_watchlist.gui import (
     split_display_title,
     title_has_adult_label,
     widget_class_owns_mousewheel,
+    yview_can_scroll,
 )
 
 
@@ -51,6 +52,14 @@ def test_nested_scroll_widgets_own_mousewheel_events() -> None:
         assert widget_class_owns_mousewheel(widget_class)
     for widget_class in ("Canvas", "Entry", "Frame", "Label"):
         assert not widget_class_owns_mousewheel(widget_class)
+
+
+def test_yview_edge_detection_allows_page_scroll_at_nested_edges() -> None:
+    assert yview_can_scroll((0.25, 0.75), 1)
+    assert yview_can_scroll((0.25, 0.75), -1)
+    assert not yview_can_scroll((0.0, 0.5), -1)
+    assert not yview_can_scroll((0.5, 1.0), 1)
+    assert not yview_can_scroll((0.0, 1.0), 1)
 
 
 def test_discovery_title_preview_preserves_start_of_long_titles() -> None:

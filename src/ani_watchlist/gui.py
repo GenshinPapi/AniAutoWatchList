@@ -106,6 +106,7 @@ IDLE_CHECK_INTERVAL_MS = 60_000
 IDLE_ACTIVITY_THROTTLE_MS = 1000
 IDLE_ACTIVITY_EVENTS = ("<KeyPress>", "<ButtonPress>", "<MouseWheel>", "<Button-4>", "<Button-5>", "<Motion>")
 NESTED_MOUSEWHEEL_WIDGET_CLASSES = {"Listbox", "Scrollbar", "Text", "Treeview", "TScrollbar"}
+SCROLL_EDGE_EPSILON = 0.001
 WATCHED_ICON = "✅"
 UNWATCHED_ICON = "❌"
 ADULT_TITLE_LABEL_RE = re.compile(r"\[\s*(?:18\s*\+?|adult)\s*\]", re.IGNORECASE)
@@ -196,6 +197,14 @@ def idle_prompt_due(last_activity_ms: int, now_ms: int, *, prompt_after_ms: int 
 
 def widget_class_owns_mousewheel(widget_class: str) -> bool:
     return widget_class in NESTED_MOUSEWHEEL_WIDGET_CLASSES
+
+
+def yview_can_scroll(yview: tuple[float, float], scroll_units: int) -> bool:
+    if scroll_units < 0:
+        return yview[0] > SCROLL_EDGE_EPSILON
+    if scroll_units > 0:
+        return yview[1] < 1.0 - SCROLL_EDGE_EPSILON
+    return False
 
 
 class WatchlistApp:
@@ -1280,11 +1289,12 @@ class WatchlistApp:
         return text
 
     def scroll_card_title(self, widget: tk.Text, event) -> str | None:
+        self.record_user_activity(event)
         scroll_units = scroll_units_from_mousewheel(event)
         if scroll_units == 0:
             return None
         first, last = widget.yview()
-        if (scroll_units < 0 and first <= 0.0) or (scroll_units > 0 and last >= 1.0):
+        if not yview_can_scroll((first, last), scroll_units):
             return None
         widget.yview_scroll(scroll_units, "units")
         return "break"
@@ -1377,28 +1387,39 @@ class WatchlistApp:
     def _on_schedule_resize(self, event) -> None:
         self.schedule_canvas.itemconfigure(self.schedule_window, width=event.width)
 
-    def _event_widget_owns_mousewheel(self, event) -> bool:
+    def _event_mousewheel_owner(self, event):
         widget = getattr(event, "widget", None)
         while widget is not None:
             try:
                 if widget_class_owns_mousewheel(widget.winfo_class()):
-                    return True
+                    return widget
                 parent = widget.winfo_parent()
             except tk.TclError:
-                return False
+                return None
             if not parent:
-                return False
+                return None
             try:
                 widget = widget.nametowidget(parent)
             except (KeyError, tk.TclError):
-                return False
-        return False
+                return None
+        return None
+
+    def _widget_can_scroll_with_wheel(self, widget, scroll_units: int) -> bool:
+        try:
+            yview = widget.yview()
+        except (AttributeError, tk.TclError):
+            return True
+        if not isinstance(yview, tuple) or len(yview) < 2:
+            return True
+        return yview_can_scroll((float(yview[0]), float(yview[1])), scroll_units)
 
     def _on_mousewheel(self, event) -> str | None:
+        self.record_user_activity(event)
         scroll_units = scroll_units_from_mousewheel(event)
         if scroll_units == 0:
             return None
-        if self._event_widget_owns_mousewheel(event):
+        owner = self._event_mousewheel_owner(event)
+        if owner is not None and self._widget_can_scroll_with_wheel(owner, scroll_units):
             return "break"
         if self.current_page == "library":
             self.grid_canvas.yview_scroll(scroll_units, "units")
