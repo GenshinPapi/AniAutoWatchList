@@ -16,6 +16,7 @@ from ani_watchlist.gui import (
     scroll_units_from_mousewheel,
     split_display_title,
     title_has_adult_label,
+    widget_class_owns_mousewheel,
 )
 
 
@@ -43,6 +44,13 @@ def test_scroll_units_support_common_mousewheel_events() -> None:
     assert scroll_units_from_mousewheel(SimpleNamespace(delta=1)) == -1
     assert scroll_units_from_mousewheel(SimpleNamespace(num=4)) == -1
     assert scroll_units_from_mousewheel(SimpleNamespace(num=5)) == 1
+
+
+def test_nested_scroll_widgets_own_mousewheel_events() -> None:
+    for widget_class in ("Listbox", "Scrollbar", "Text", "Treeview", "TScrollbar"):
+        assert widget_class_owns_mousewheel(widget_class)
+    for widget_class in ("Canvas", "Entry", "Frame", "Label"):
+        assert not widget_class_owns_mousewheel(widget_class)
 
 
 def test_discovery_title_preview_preserves_start_of_long_titles() -> None:

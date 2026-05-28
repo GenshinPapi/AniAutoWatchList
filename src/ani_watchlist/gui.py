@@ -105,6 +105,7 @@ IDLE_CLOSE_GRACE_MS = 30 * 60 * 1000
 IDLE_CHECK_INTERVAL_MS = 60_000
 IDLE_ACTIVITY_THROTTLE_MS = 1000
 IDLE_ACTIVITY_EVENTS = ("<KeyPress>", "<ButtonPress>", "<MouseWheel>", "<Button-4>", "<Button-5>", "<Motion>")
+NESTED_MOUSEWHEEL_WIDGET_CLASSES = {"Listbox", "Scrollbar", "Text", "Treeview", "TScrollbar"}
 WATCHED_ICON = "✅"
 UNWATCHED_ICON = "❌"
 ADULT_TITLE_LABEL_RE = re.compile(r"\[\s*(?:18\s*\+?|adult)\s*\]", re.IGNORECASE)
@@ -191,6 +192,10 @@ def monotonic_ms() -> int:
 
 def idle_prompt_due(last_activity_ms: int, now_ms: int, *, prompt_after_ms: int = IDLE_PROMPT_AFTER_MS) -> bool:
     return now_ms - last_activity_ms >= prompt_after_ms
+
+
+def widget_class_owns_mousewheel(widget_class: str) -> bool:
+    return widget_class in NESTED_MOUSEWHEEL_WIDGET_CLASSES
 
 
 class WatchlistApp:
@@ -1372,10 +1377,29 @@ class WatchlistApp:
     def _on_schedule_resize(self, event) -> None:
         self.schedule_canvas.itemconfigure(self.schedule_window, width=event.width)
 
-    def _on_mousewheel(self, event) -> None:
+    def _event_widget_owns_mousewheel(self, event) -> bool:
+        widget = getattr(event, "widget", None)
+        while widget is not None:
+            try:
+                if widget_class_owns_mousewheel(widget.winfo_class()):
+                    return True
+                parent = widget.winfo_parent()
+            except tk.TclError:
+                return False
+            if not parent:
+                return False
+            try:
+                widget = widget.nametowidget(parent)
+            except (KeyError, tk.TclError):
+                return False
+        return False
+
+    def _on_mousewheel(self, event) -> str | None:
         scroll_units = scroll_units_from_mousewheel(event)
         if scroll_units == 0:
             return None
+        if self._event_widget_owns_mousewheel(event):
+            return "break"
         if self.current_page == "library":
             self.grid_canvas.yview_scroll(scroll_units, "units")
         elif self.current_page in self.discovery_canvases:
