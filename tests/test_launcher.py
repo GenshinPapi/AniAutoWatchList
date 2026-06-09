@@ -51,6 +51,29 @@ def test_build_ani_cli_command_can_target_allanime_id() -> None:
     ]
 
 
+def test_build_ani_cli_command_can_enable_skip_intro_outro() -> None:
+    command = launcher.build_ani_cli_command(
+        "Daemons of the Shadow Realm",
+        "4",
+        ani_cli="/home/me/.local/bin/ani-cli",
+        skip_intro_outro=True,
+        skip_title="Daemons of the Shadow Realm",
+    )
+
+    assert command == [
+        "/home/me/.local/bin/ani-cli",
+        "--no-detach",
+        "--select-nth",
+        "1",
+        "--episode",
+        "4",
+        "--skip",
+        "--skip-title",
+        "Daemons of the Shadow Realm",
+        "Daemons of the Shadow Realm",
+    ]
+
+
 def test_build_ani_cli_command_rejects_unknown_mode() -> None:
     try:
         launcher.build_ani_cli_command("Frieren", "12", ani_cli="/home/me/.local/bin/ani-cli", mode="raw")
@@ -386,7 +409,27 @@ def test_terminal_command_uses_shell_wrapper(monkeypatch) -> None:
     ]
 
 
-def test_launch_episode_resolves_ani_cli_and_does_not_block(monkeypatch) -> None:
+def test_launch_environment_persists_mpv_volume_state(app_env) -> None:
+    state_path = launcher.player_volume_state_path()
+    state_path.write_text("42.5\n", encoding="utf-8")
+
+    env = launcher.build_launch_environment({"PATH": "/bin", "ANI_WATCH_MPV_VOLUME": "99"})
+
+    assert env["PATH"] == "/bin"
+    assert env["ANI_WATCH_MPV_VOLUME"] == "42.5"
+    assert env["ANI_WATCH_MPV_VOLUME_STATE"] == str(state_path)
+    assert "observe_property" in launcher.mpv_volume_script_path().read_text(encoding="utf-8")
+
+
+def test_launch_environment_ignores_invalid_saved_volume(app_env) -> None:
+    launcher.player_volume_state_path().write_text("loud\n", encoding="utf-8")
+
+    env = launcher.build_launch_environment({"ANI_WATCH_MPV_VOLUME": "99"})
+
+    assert "ANI_WATCH_MPV_VOLUME" not in env
+
+
+def test_launch_episode_resolves_ani_cli_and_does_not_block(app_env, monkeypatch) -> None:
     seen: dict[str, object] = {}
 
     def fake_which(name: str) -> str | None:
@@ -397,9 +440,10 @@ def test_launch_episode_resolves_ani_cli_and_does_not_block(monkeypatch) -> None
     class FakeProcess:
         pid = 4321
 
-    def fake_popen(command: list[str], *, start_new_session: bool):
+    def fake_popen(command: list[str], *, start_new_session: bool, env: dict[str, str]):
         seen["command"] = command
         seen["start_new_session"] = start_new_session
+        seen["env"] = env
         return FakeProcess()
 
     monkeypatch.setattr(launcher.shutil, "which", fake_which)
@@ -423,3 +467,7 @@ def test_launch_episode_resolves_ani_cli_and_does_not_block(monkeypatch) -> None
     assert result.pid == 4321
     assert result.used_terminal is False
     assert seen["start_new_session"] is True
+    env = seen["env"]
+    assert isinstance(env, dict)
+    assert "ANI_WATCH_MPV_VOLUME_STATE" in env
+    assert "ANI_WATCH_MPV_VOLUME_SCRIPT" in env

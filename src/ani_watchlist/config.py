@@ -15,6 +15,9 @@ from .paths import get_paths
 DEFAULT_CONFIG_TEXT = """[tracking]
 mark_watched_after_seconds = 0
 
+[playback]
+skip_intro_outro = false
+
 [metadata]
 search_on_new_title = true
 auto_link_confidence = 0.86
@@ -29,6 +32,11 @@ timeout_seconds = 8
 @dataclass(frozen=True)
 class TrackingConfig:
     mark_watched_after_seconds: int = 0
+
+
+@dataclass(frozen=True)
+class PlaybackConfig:
+    skip_intro_outro: bool = False
 
 
 @dataclass(frozen=True)
@@ -47,6 +55,7 @@ class AniListConfig:
 @dataclass(frozen=True)
 class AppConfig:
     tracking: TrackingConfig = TrackingConfig()
+    playback: PlaybackConfig = PlaybackConfig()
     metadata: MetadataConfig = MetadataConfig()
     anilist: AniListConfig = AniListConfig()
 
@@ -71,11 +80,15 @@ def load_config(path: Path | None = None) -> AppConfig:
     raw = load_raw_config(path)
 
     tracking = raw.get("tracking", {})
+    playback = raw.get("playback", {})
     metadata = raw.get("metadata", {})
     anilist = raw.get("anilist", {})
     return AppConfig(
         tracking=TrackingConfig(
             mark_watched_after_seconds=int(tracking.get("mark_watched_after_seconds", 0)),
+        ),
+        playback=PlaybackConfig(
+            skip_intro_outro=bool(playback.get("skip_intro_outro", False)),
         ),
         metadata=MetadataConfig(
             search_on_new_title=bool(metadata.get("search_on_new_title", True)),
@@ -125,7 +138,7 @@ def _format_toml_value(value: Any) -> str:
 def write_raw_config(raw: dict[str, Any], path: Path | None = None) -> Path:
     cfg_path = ensure_config(path)
     lines: list[str] = []
-    for section in ("tracking", "metadata", "anilist"):
+    for section in ("tracking", "playback", "metadata", "anilist"):
         values = raw.get(section, {})
         if not isinstance(values, dict):
             continue

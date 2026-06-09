@@ -579,9 +579,9 @@ play_episode() {
             ;;
         mpv*)
             if [ "$no_detach" = 0 ]; then
-                ani_watch_run_detached $player_function $skip_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag
+                ani_watch_run_detached $player_function $ani_watch_mpv_flags $skip_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag
             else
-                ani_watch_run_foreground $player_function $skip_flag $subs_flag $refr_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
+                ani_watch_run_foreground $player_function $ani_watch_mpv_flags $skip_flag $subs_flag $refr_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
@@ -598,7 +598,7 @@ play_episode() {
                 ani_watch_run_detached $player_function --no-stdin --keep-running --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag "$episode"
             fi
             ;;
-        flatpak_mpv) ani_watch_run_detached flatpak run io.mpv.Mpv --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag ;;
+        flatpak_mpv) ani_watch_run_detached flatpak run io.mpv.Mpv $ani_watch_mpv_flags --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag ;;
         vlc*)
             vlc_refr="${refr_flag#--referrer=}"
             [ "$vlc_refr" = "$refr_flag" ] && vlc_refr="$allanime_refr"
@@ -675,6 +675,13 @@ use_external_menu="${ANI_CLI_EXTERNAL_MENU:-0}"
 external_menu_normal_window="${ANI_CLI_EXTERNAL_MENU_NORMAL_WINDOW:-0}"
 skip_intro="${ANI_CLI_SKIP_INTRO:-0}"
 skip_title="${ANI_CLI_SKIP_TITLE:-}"
+ani_watch_mpv_flags=""
+case "${ANI_WATCH_MPV_VOLUME:-}" in
+    "" | *[!0-9.]* | *.*.*) ;;
+    *) ani_watch_mpv_flags="$ani_watch_mpv_flags --volume=$ANI_WATCH_MPV_VOLUME" ;;
+esac
+[ -n "${ANI_WATCH_MPV_VOLUME_SCRIPT:-}" ] && ani_watch_mpv_flags="$ani_watch_mpv_flags --script=$ANI_WATCH_MPV_VOLUME_SCRIPT"
+[ -n "${ANI_WATCH_MPV_VOLUME_STATE:-}" ] && ani_watch_mpv_flags="$ani_watch_mpv_flags --script-opts=ani_watch_volume-state_file=$ANI_WATCH_MPV_VOLUME_STATE"
 [ -t 0 ] || (command -v dmenu && use_external_menu=2)
 [ -t 0 ] || (command -v rofi && use_external_menu=1)
 hist_dir="${ANI_CLI_HIST_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/ani-cli}"
