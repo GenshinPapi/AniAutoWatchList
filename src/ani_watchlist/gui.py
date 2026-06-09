@@ -21,7 +21,7 @@ except Exception:  # pragma: no cover - optional GUI enhancement
     ImageTk = None
 
 from .availability import refresh_available_episodes_for_anime
-from .config import load_config, set_config_value
+from .config import load_config
 from .db import initialize
 from .discovery import (
     POPULAR_FILTERS,
@@ -236,7 +236,6 @@ class WatchlistApp:
         self.detail_status = tk.StringVar(value=STATUS_LABELS["watching"])
         self.popular_genre = tk.StringVar(value=POPULAR_GENRE_ALL_LABEL)
         self.show_alt_title = tk.BooleanVar(value=False)
-        self.skip_intro_outro = tk.BooleanVar(value=load_config().playback.skip_intro_outro)
         self.selected_anime_id: int | None = None
         self.detail_primary_title = ""
         self.detail_alt_title: str | None = None
@@ -765,20 +764,6 @@ class WatchlistApp:
         continue_menu.add_command(label="Dub", command=lambda: self.continue_selected_episode("dub"))
         continue_button.configure(menu=continue_menu)
         continue_button.grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
-        self.skip_intro_outro_checkbox = tk.Checkbutton(
-            actions,
-            text="Skip intro/outro",
-            variable=self.skip_intro_outro,
-            command=self.save_skip_intro_outro,
-            bg=COLORS["bg"],
-            fg=COLORS["text"],
-            activebackground=COLORS["bg"],
-            activeforeground=COLORS["text"],
-            selectcolor=COLORS["entry"],
-            relief="flat",
-            cursor="hand2",
-        )
-        self.skip_intro_outro_checkbox.grid(row=0, column=4, padx=(0, 8), pady=4, sticky="w")
         for idx, (text, command, style) in enumerate(
             [
                 ("Mark Watched", lambda: self.mark_selected_episode(True), "Accent.TButton"),
@@ -2168,14 +2153,6 @@ class WatchlistApp:
         update_anime_fields(self.conn, self.selected_anime_id, notes=self.notes.get("1.0", tk.END).strip())
         self.load_detail()
 
-    def save_skip_intro_outro(self) -> None:
-        value = "true" if self.skip_intro_outro.get() else "false"
-        try:
-            set_config_value("playback.skip_intro_outro", value)
-        except Exception as exc:
-            if hasattr(self, "launch_label"):
-                self.launch_label.configure(text=f"Skip intro/outro setting failed to save: {exc}", fg=COLORS["danger"])
-
     def add_episode(self) -> None:
         if self.selected_anime_id is None:
             return
@@ -2287,8 +2264,6 @@ class WatchlistApp:
                 episode,
                 mode=launch_mode,
                 allanime_id=target.show_id if target is not None else None,
-                skip_intro_outro=self.skip_intro_outro.get(),
-                skip_title=title_for_message,
             )
         except LaunchError as exc:
             self.launch_label.configure(text=f"Launch failed: {exc}", fg=COLORS["danger"])

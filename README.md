@@ -16,7 +16,6 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 - Status tabs: Watching, Completed, Dropped, On Hold, Plan to Watch
 - Episode watched/unwatched tracking
 - Continue button in the GUI for launching a selected episode through ani-cli
-- Persistent mpv volume between GUI-launched episodes
 - Startup update check against the GitHub `main` branch
 - Global AniList title search with suggestions and card results
 - Related seasons on anime detail pages
@@ -93,8 +92,6 @@ The GUI does not need to be open for tracking to work.
 By default, an episode is marked watched when the player exits successfully. Playback failures are recorded but do not mark episodes watched.
 
 In the GUI detail page, select an episode and click **Continue** to choose **Sub** or **Dub** and open ani-cli for that title and episode. Continue uses selected metadata to resolve the intended AllAnime show when it can do so confidently, then opens that show through ani-cli. If the metadata match is not confident enough, it falls back to the normal ani-cli title search. Dub launches use ani-cli's `--dub` option; if no dub is found for the selected episode, the GUI offers to search sub instead.
-
-GUI-launched mpv playback remembers the last volume you used and applies it to the next episode, even when switching shows. The detail page also has a global **Skip intro/outro** checkbox. It uses ani-cli's existing ani-skip integration, so titles with Aniskip opening/ending data can auto-skip and titles without data keep playing normally.
 
 To open the GUI automatically for a single ani-cli run:
 

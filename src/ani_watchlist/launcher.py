@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import math
-import os
 import json
 import shutil
 import subprocess
@@ -10,8 +8,6 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-
-from .paths import get_paths
 
 
 TERMINAL_CANDIDATES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -50,38 +46,6 @@ ALLANIME_REFERER = "https://allmanga.to"
 ALLANIME_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
 ALLANIME_SEARCH_GQL = "query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name englishName nativeName availableEpisodes __typename } }}"
 ALLANIME_EPISODES_GQL = "query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}"
-MPV_VOLUME_SCRIPT = r"""
-local mp = require "mp"
-local options = require "mp.options"
-local utils = require "mp.utils"
-
-local opts = { state_file = "" }
-options.read_options(opts, "ani_watch_volume")
-
-local function persist_volume()
-    if opts.state_file == "" then
-        return
-    end
-    local volume = mp.get_property_number("volume")
-    if volume == nil then
-        return
-    end
-    local path = opts.state_file
-    if string.sub(path, 1, 7) ~= "file://" then
-        path = "file://" .. path
-    end
-    utils.write_file(path, string.format("%.2f\n", volume))
-end
-
-mp.observe_property("volume", "number", function(_, value)
-    if value ~= nil then
-        persist_volume()
-    end
-end)
-mp.register_event("shutdown", persist_volume)
-""".strip()
-MIN_PLAYER_VOLUME = 0.0
-MAX_PLAYER_VOLUME = 200.0
 
 
 @dataclass(frozen=True)
@@ -118,67 +82,6 @@ def resolve_ani_cli() -> str:
     if local_path.exists():
         return str(local_path)
     raise LaunchError("ani-cli was not found on PATH or at ~/.local/bin/ani-cli")
-
-
-def player_volume_state_path() -> Path:
-    paths = get_paths()
-    paths.state_dir.mkdir(parents=True, exist_ok=True)
-    return paths.state_dir / "player-volume.txt"
-
-
-def mpv_volume_script_path() -> Path:
-    paths = get_paths()
-    paths.state_dir.mkdir(parents=True, exist_ok=True)
-    return paths.state_dir / "mpv-volume.lua"
-
-
-def parse_player_volume(value: object) -> float | None:
-    try:
-        volume = float(str(value).strip())
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(volume) or volume < MIN_PLAYER_VOLUME or volume > MAX_PLAYER_VOLUME:
-        return None
-    return volume
-
-
-def format_player_volume(volume: float) -> str:
-    return f"{volume:.2f}".rstrip("0").rstrip(".")
-
-
-def read_saved_player_volume(path: Path | None = None) -> float | None:
-    state_path = path or player_volume_state_path()
-    try:
-        return parse_player_volume(state_path.read_text(encoding="utf-8"))
-    except OSError:
-        return None
-
-
-def ensure_mpv_volume_script(path: Path | None = None) -> Path:
-    script_path = path or mpv_volume_script_path()
-    script_path.parent.mkdir(parents=True, exist_ok=True)
-    text = MPV_VOLUME_SCRIPT + "\n"
-    try:
-        if script_path.read_text(encoding="utf-8") == text:
-            return script_path
-    except OSError:
-        pass
-    script_path.write_text(text, encoding="utf-8")
-    return script_path
-
-
-def build_launch_environment(base_env: dict[str, str] | None = None) -> dict[str, str]:
-    env = dict(os.environ if base_env is None else base_env)
-    state_path = player_volume_state_path()
-    script_path = ensure_mpv_volume_script()
-    saved_volume = read_saved_player_volume(state_path)
-    env["ANI_WATCH_MPV_VOLUME_STATE"] = str(state_path)
-    env["ANI_WATCH_MPV_VOLUME_SCRIPT"] = str(script_path)
-    if saved_volume is not None:
-        env["ANI_WATCH_MPV_VOLUME"] = format_player_volume(saved_volume)
-    else:
-        env.pop("ANI_WATCH_MPV_VOLUME", None)
-    return env
 
 
 def clean_ani_cli_search_title(title: str) -> str:
@@ -288,14 +191,11 @@ def build_ani_cli_command(
     *,
     mode: str = "sub",
     allanime_id: str | None = None,
-    skip_intro_outro: bool = False,
-    skip_title: str | None = None,
 ) -> list[str]:
     cleaned_title = title.strip()
     cleaned_episode = str(episode).strip()
     cleaned_mode = _validate_mode(mode)
     cleaned_allanime_id = str(allanime_id).strip() if allanime_id is not None else ""
-    cleaned_skip_title = str(skip_title).strip() if skip_title is not None else ""
     if not cleaned_title:
         raise LaunchError("anime title is empty")
     if not cleaned_episode:
@@ -311,10 +211,6 @@ def build_ani_cli_command(
     command.extend(["--episode", cleaned_episode])
     if cleaned_mode == "dub":
         command.append("--dub")
-    if skip_intro_outro:
-        command.append("--skip")
-        if cleaned_skip_title:
-            command.extend(["--skip-title", cleaned_skip_title])
     command.append(cleaned_title)
     return command
 
@@ -730,22 +626,13 @@ def launch_episode(
     mode: str = "sub",
     prefer_terminal: bool = True,
     allanime_id: str | None = None,
-    skip_intro_outro: bool = False,
-    skip_title: str | None = None,
 ) -> LaunchResult:
-    command = build_ani_cli_command(
-        title,
-        episode,
-        mode=mode,
-        allanime_id=allanime_id,
-        skip_intro_outro=skip_intro_outro,
-        skip_title=skip_title,
-    )
+    command = build_ani_cli_command(title, episode, mode=mode, allanime_id=allanime_id)
     used_terminal = False
     if prefer_terminal:
         command, used_terminal = build_terminal_command(command)
     try:
-        process = subprocess.Popen(command, start_new_session=True, env=build_launch_environment())
+        process = subprocess.Popen(command, start_new_session=True)
     except OSError as exc:
         raise LaunchError(str(exc)) from exc
     return LaunchResult(command=command, pid=process.pid, used_terminal=used_terminal)
