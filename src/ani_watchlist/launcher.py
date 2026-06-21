@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import re
@@ -626,13 +627,21 @@ def launch_episode(
     mode: str = "sub",
     prefer_terminal: bool = True,
     allanime_id: str | None = None,
+    mpv_ipc_path: str | None = None,
 ) -> LaunchResult:
     command = build_ani_cli_command(title, episode, mode=mode, allanime_id=allanime_id)
     used_terminal = False
     if prefer_terminal:
         command, used_terminal = build_terminal_command(command)
+    env = None
+    if mpv_ipc_path:
+        env = os.environ.copy()
+        env["ANI_WATCH_MPV_IPC"] = str(mpv_ipc_path)
     try:
-        process = subprocess.Popen(command, start_new_session=True)
+        if env is None:
+            process = subprocess.Popen(command, start_new_session=True)
+        else:
+            process = subprocess.Popen(command, start_new_session=True, env=env)
     except OSError as exc:
         raise LaunchError(str(exc)) from exc
     return LaunchResult(command=command, pid=process.pid, used_terminal=used_terminal)

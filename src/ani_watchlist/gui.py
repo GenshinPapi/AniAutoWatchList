@@ -6,9 +6,9 @@ import os
 import re
 import threading
 import webbrowser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import ceil
-from time import monotonic
+from time import monotonic, sleep
 from textwrap import wrap
 import tkinter as tk
 from tkinter import messagebox, simpledialog, ttk
@@ -42,6 +42,14 @@ from .launcher import (
     resolve_allanime_launch_target,
 )
 from .metadata import refresh_metadata_for_anime, select_match, selected_metadata_payload, store_selected_metadata_payload
+from .party import (
+    MpvIpcController,
+    WatchPartyError,
+    WatchPartyMedia,
+    WatchPartyRemoteClient,
+    party_ipc_path,
+    start_host_session,
+)
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
 from .updater import UpdateInfo, check_for_update, launch_update
@@ -56,6 +64,7 @@ from .store import (
     list_anime,
     mark_episode,
     merge_safe_duplicates,
+    next_unwatched_episode,
     status_counts,
     update_anime_fields,
     upsert_episodes,
@@ -104,6 +113,9 @@ IDLE_PROMPT_AFTER_MS = 4 * 60 * 60 * 1000
 IDLE_CLOSE_GRACE_MS = 30 * 60 * 1000
 IDLE_CHECK_INTERVAL_MS = 60_000
 IDLE_ACTIVITY_THROTTLE_MS = 1000
+PARTY_HOST_REFRESH_MS = 10_000
+PARTY_HOST_STATE_SYNC_MS = 2_000
+PARTY_INITIAL_SYNC_TIMEOUT_SECONDS = 45.0
 IDLE_ACTIVITY_EVENTS = ("<KeyPress>", "<ButtonPress>", "<MouseWheel>", "<Button-4>", "<Button-5>", "<Motion>")
 NESTED_MOUSEWHEEL_WIDGET_CLASSES = {"Listbox", "Scrollbar", "Text", "Treeview", "TScrollbar"}
 SCROLL_EDGE_EPSILON = 0.001
@@ -262,6 +274,19 @@ class WatchlistApp:
         self.related_anilist_id: int | None = None
         self.related_columns = 1
         self.episode_availability_refreshing: set[int] = set()
+        self.party_host_session = None
+        self.party_client: WatchPartyRemoteClient | None = None
+        self.party_join_polling = False
+        self.party_playback_controller: MpvIpcController | None = None
+        self.party_current_media: WatchPartyMedia | None = None
+        self.party_window: tk.Toplevel | None = None
+        self.party_link_var = tk.StringVar()
+        self.party_username_var = tk.StringVar()
+        self.party_status_text = tk.StringVar(value="")
+        self.party_participant_list: tk.Listbox | None = None
+        self.party_participant_ids: list[str] = []
+        self.party_host_refresh_job: str | None = None
+        self.party_host_state_sync_job: str | None = None
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
         self.discovery_pages: dict[str, tk.Frame] = {}
@@ -323,6 +348,15 @@ class WatchlistApp:
         style.map("Accent.TButton", background=[("active", COLORS["accent_hover"])])
         style.configure("Accent.TMenubutton", background=COLORS["accent"], foreground="#111111", padding=(10, 6))
         style.map("Accent.TMenubutton", background=[("active", COLORS["accent_hover"])])
+        style.configure(
+            "Dark.TMenubutton",
+            background=COLORS["panel_alt"],
+            foreground=COLORS["text"],
+            bordercolor=COLORS["border"],
+            focusthickness=0,
+            padding=(10, 6),
+        )
+        style.map("Dark.TMenubutton", background=[("active", COLORS["border"])])
         style.configure(
             "Dark.TCombobox",
             fieldbackground=COLORS["entry"],
@@ -764,6 +798,20 @@ class WatchlistApp:
         continue_menu.add_command(label="Dub", command=lambda: self.continue_selected_episode("dub"))
         continue_button.configure(menu=continue_menu)
         continue_button.grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
+        party_button = ttk.Menubutton(actions, text="Watch Party", style="Dark.TMenubutton")
+        party_menu = tk.Menu(
+            party_button,
+            tearoff=False,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            activebackground=COLORS["accent"],
+            activeforeground="#111111",
+            relief="flat",
+        )
+        party_menu.add_command(label="Host Watch Party", command=self.host_watch_party)
+        party_menu.add_command(label="Join Watch Party", command=self.join_watch_party)
+        party_button.configure(menu=party_menu)
+        party_button.grid(row=0, column=1, padx=(0, 8), pady=4, sticky="w")
         for idx, (text, command, style) in enumerate(
             [
                 ("Mark Watched", lambda: self.mark_selected_episode(True), "Accent.TButton"),
@@ -774,7 +822,7 @@ class WatchlistApp:
                 ("Edit Title", self.edit_title, "Dark.TButton"),
                 ("Delete", self.delete_selected, "Dark.TButton"),
             ],
-            start=1,
+            start=2,
         ):
             ttk.Button(actions, text=text, style=style, command=command).grid(
                 row=idx // 4,
@@ -1179,7 +1227,15 @@ class WatchlistApp:
         if self.shutting_down:
             return
         self.shutting_down = True
-        for attr in ("idle_check_job", "idle_close_job", "idle_countdown_job", "auto_refresh_job", "search_suggestion_job"):
+        for attr in (
+            "idle_check_job",
+            "idle_close_job",
+            "idle_countdown_job",
+            "auto_refresh_job",
+            "search_suggestion_job",
+            "party_host_refresh_job",
+            "party_host_state_sync_job",
+        ):
             job = getattr(self, attr, None)
             if job is not None:
                 try:
@@ -1188,6 +1244,20 @@ class WatchlistApp:
                     pass
                 setattr(self, attr, None)
         self.dismiss_idle_prompt()
+        self.party_join_polling = False
+        if self.party_client is not None:
+            try:
+                self.party_client.leave()
+            except Exception:
+                pass
+            self.party_client = None
+        if self.party_host_session is not None:
+            try:
+                self.party_host_session.close()
+            except Exception:
+                pass
+            self.party_host_session = None
+        self.destroy_party_window()
         try:
             self.conn.close()
         except Exception:
@@ -2275,6 +2345,654 @@ class WatchlistApp:
             text=f"Opened {title_for_message} episode {episode} ({mode_label}) in {target}.",
             fg=COLORS["muted"],
         )
+
+    def detail_party_episode_key(self) -> str | None:
+        if self.selected_anime_id is None:
+            return None
+        selected = self.selected_episode_key()
+        if selected:
+            return selected
+        next_episode = next_unwatched_episode(self.conn, self.selected_anime_id)
+        if next_episode is not None:
+            episode_key = str(next_episode["episode_key"])
+            if self.episode_tree.exists(episode_key):
+                self.episode_tree.selection_set(episode_key)
+            return episode_key
+        episodes = episodes_for_anime(self.conn, self.selected_anime_id)
+        if episodes:
+            episode_key = str(episodes[0]["episode_key"])
+            if self.episode_tree.exists(episode_key):
+                self.episode_tree.selection_set(episode_key)
+            return episode_key
+        return None
+
+    def ask_party_mode(self) -> str | None:
+        mode = simpledialog.askstring("Watch party mode", "Playback mode: sub or dub", initialvalue="sub")
+        if mode is None:
+            return None
+        normalized = mode.strip().casefold()
+        if normalized not in {"sub", "dub"}:
+            messagebox.showinfo("Playback mode", "Use sub or dub.")
+            return None
+        return normalized
+
+    def host_watch_party(self) -> None:
+        if self.selected_anime_id is None:
+            messagebox.showinfo("Anime required", "Open an anime detail page before hosting a watch party.")
+            return
+        anime = get_anime_by_id(self.conn, self.selected_anime_id)
+        if anime is None:
+            return
+        episode = self.detail_party_episode_key()
+        if not episode:
+            messagebox.showinfo("Episode required", "Add or select an episode before hosting a watch party.")
+            return
+        mode = self.ask_party_mode()
+        if mode is None:
+            return
+        title_for_message, _alt_title = split_display_title(anime["display_title"])
+        party_title = simpledialog.askstring(
+            "Host watch party",
+            "Party title:",
+            initialvalue=f"{title_for_message} episode {episode}",
+        )
+        if not party_title:
+            return
+        username = simpledialog.askstring("Host watch party", "Your display name:", initialvalue="Host")
+        if not username:
+            return
+        if self.party_host_session is not None:
+            if not messagebox.askyesno("Watch party active", "End the current watch party and start a new one?"):
+                return
+            self.end_host_party(show_message=False)
+        metadata_payload = selected_metadata_payload(self.conn, self.selected_anime_id)
+        total_episodes = int(anime["total_episodes"]) if anime["total_episodes"] is not None else None
+        target = None
+        try:
+            target = resolve_allanime_launch_target(
+                anime["display_title"],
+                anime["source_title"],
+                metadata_payload,
+                total_episodes=total_episodes,
+                mode=mode,
+            )
+        except LaunchError:
+            target = None
+        if target is None and (metadata_payload_is_adult(metadata_payload) or title_has_adult_label(anime["display_title"])):
+            message = (
+                f"AllAnime did not return a playable result for {title_for_message}. "
+                "Watch parties can only launch titles available from AllAnime."
+            )
+            self.launch_label.configure(text=message, fg=COLORS["danger"])
+            messagebox.showwarning("AllAnime result not found", message)
+            return
+        launch_title = target.title if target is not None else choose_ani_cli_search_title(anime["display_title"], anime["source_title"])
+        media = WatchPartyMedia(
+            party_title=party_title,
+            anime_title=anime["display_title"],
+            source_title=anime["source_title"],
+            episode=episode,
+            mode=mode,
+            allanime_id=target.show_id if target is not None else None,
+            allanime_title=target.title if target is not None else launch_title,
+            total_episodes=total_episodes,
+        )
+        self.launch_label.configure(text="Creating public watch party tunnel...", fg=COLORS["muted"])
+        self.root.update_idletasks()
+        try:
+            session = start_host_session(media, host_username=username)
+        except Exception as exc:
+            messagebox.showwarning("Watch party failed", str(exc))
+            return
+        ipc_path = party_ipc_path(f"host-{session.room.room_id}")
+        try:
+            launch_episode(
+                launch_title,
+                episode,
+                mode=mode,
+                allanime_id=target.show_id if target is not None else None,
+                mpv_ipc_path=ipc_path,
+            )
+        except LaunchError as exc:
+            session.close()
+            messagebox.showwarning("ani-cli launch failed", str(exc))
+            return
+        self.party_host_session = session
+        self.party_client = None
+        self.party_join_polling = False
+        self.party_playback_controller = MpvIpcController(ipc_path)
+        self.party_current_media = media
+        self.party_link_var.set(session.share_url)
+        tunnel_note = "Public tunnel active." if session.public else f"Public tunnel unavailable: {session.tunnel_error or 'unknown error'}"
+        self.party_status_text.set(tunnel_note)
+        self.launch_label.configure(text=f"Watch party started for episode {episode}. {tunnel_note}", fg=COLORS["muted"])
+        self.show_host_party_window()
+        self.publish_host_party_state()
+        self.schedule_host_party_state_sync()
+        self.schedule_host_party_refresh()
+
+    def join_watch_party(self) -> None:
+        link = simpledialog.askstring("Join watch party", "Paste the watch party link:")
+        if not link:
+            return
+        username = simpledialog.askstring("Join watch party", "Your display name:", initialvalue="Guest")
+        if not username:
+            return
+        client = WatchPartyRemoteClient(link, username)
+        try:
+            payload = client.join()
+        except WatchPartyError as exc:
+            messagebox.showwarning("Join watch party failed", str(exc))
+            return
+        state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+        media_payload = state.get("media") if isinstance(state.get("media"), dict) else {}
+        media = WatchPartyMedia.from_json(media_payload)
+        ipc_path = party_ipc_path(f"join-{client.participant_id or 'guest'}")
+        try:
+            self.launch_party_media(media, ipc_path)
+        except LaunchError as exc:
+            try:
+                client.leave()
+            except WatchPartyError:
+                pass
+            messagebox.showwarning("ani-cli launch failed", str(exc))
+            return
+        self.party_client = client
+        self.party_join_polling = True
+        self.party_host_session = None
+        self.party_playback_controller = MpvIpcController(ipc_path)
+        self.party_current_media = media
+        self.party_username_var.set(username)
+        self.party_status_text.set(f"Joined {media.party_title}. Waiting for host controls.")
+        self.show_joined_party_window(state)
+        self.start_party_initial_sync(state)
+        self.start_party_event_poll()
+
+    def launch_party_media(self, media: WatchPartyMedia, ipc_path: str) -> None:
+        launch_title = media.allanime_title or media.anime_title
+        launch_episode(
+            launch_title,
+            media.episode,
+            mode=media.mode,
+            allanime_id=media.allanime_id,
+            mpv_ipc_path=ipc_path,
+        )
+
+    def playback_state_target_position(self, playback_state: dict[str, object]) -> float:
+        try:
+            position = float(playback_state.get("position_seconds") or 0.0)
+        except (TypeError, ValueError):
+            position = 0.0
+        if playback_state.get("paused"):
+            return max(0.0, position)
+        updated_at = self.parse_party_timestamp(str(playback_state.get("updated_at") or ""))
+        if updated_at is None:
+            return max(0.0, position)
+        elapsed = max(0.0, (datetime.now(timezone.utc) - updated_at).total_seconds())
+        return max(0.0, position + elapsed)
+
+    def parse_party_timestamp(self, value: str) -> datetime | None:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+
+    def start_party_initial_sync(self, state: dict[str, object]) -> None:
+        playback_state = state.get("playback_state") if isinstance(state.get("playback_state"), dict) else None
+        if playback_state is None:
+            return
+        self.apply_party_playback_state(playback_state, wait_for_socket=True)
+
+    def apply_party_playback_state(self, playback_state: dict[str, object], *, wait_for_socket: bool = False) -> None:
+        controller = self.party_playback_controller
+        if controller is None:
+            return
+        target_position = self.playback_state_target_position(playback_state)
+        paused = bool(playback_state.get("paused"))
+
+        def worker() -> None:
+            deadline = monotonic() + PARTY_INITIAL_SYNC_TIMEOUT_SECONDS
+            while wait_for_socket and monotonic() < deadline and not controller.available():
+                sleep(0.5)
+            try:
+                if paused:
+                    controller.pause()
+                controller.seek(target_position)
+                if paused:
+                    controller.pause()
+                else:
+                    controller.play()
+            except Exception as exc:
+                self.run_on_ui(lambda error=str(exc): self.party_status_text.set(f"Playback sync failed: {error}"))
+                return
+            state_text = "paused" if paused else "playing"
+            self.run_on_ui(
+                lambda: self.party_status_text.set(
+                    f"Synced to host at {int(target_position // 60)}:{int(target_position % 60):02d} ({state_text})."
+                )
+            )
+
+        if wait_for_socket:
+            threading.Thread(target=worker, daemon=True).start()
+        else:
+            worker()
+
+    def show_host_party_window(self) -> None:
+        if self.party_host_session is None:
+            return
+        self.destroy_party_window()
+        win = tk.Toplevel(self.root)
+        win.title("Watch Party Host")
+        win.configure(bg=COLORS["bg"])
+        win.geometry("680x500")
+        win.columnconfigure(0, weight=1)
+        win.rowconfigure(4, weight=1)
+        self.party_window = win
+        media = self.party_current_media
+        heading = media.party_title if media is not None else "Watch Party"
+        tk.Label(win, text=heading, bg=COLORS["bg"], fg=COLORS["text"], font=("", 16, "bold")).grid(
+            row=0, column=0, sticky="w", padx=14, pady=(14, 4)
+        )
+        tk.Label(win, textvariable=self.party_status_text, bg=COLORS["bg"], fg=COLORS["muted"], anchor="w").grid(
+            row=1, column=0, sticky="ew", padx=14
+        )
+        link_row = tk.Frame(win, bg=COLORS["bg"])
+        link_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(10, 6))
+        link_row.columnconfigure(0, weight=1)
+        link_entry = tk.Entry(
+            link_row,
+            textvariable=self.party_link_var,
+            bg=COLORS["entry"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["text"],
+            relief="flat",
+        )
+        link_entry.grid(row=0, column=0, sticky="ew", ipady=6)
+        ttk.Button(link_row, text="Copy Link", style="Dark.TButton", command=self.copy_party_link).grid(
+            row=0, column=1, padx=(8, 0)
+        )
+        controls = tk.Frame(win, bg=COLORS["bg"])
+        controls.grid(row=3, column=0, sticky="ew", padx=14, pady=(4, 8))
+        for idx, (text, command, style) in enumerate(
+            [
+                ("Play", lambda: self.host_party_control("play"), "Accent.TButton"),
+                ("Pause", lambda: self.host_party_control("pause"), "Dark.TButton"),
+                ("-10s", lambda: self.host_party_seek(-10), "Dark.TButton"),
+                ("+10s", lambda: self.host_party_seek(10), "Dark.TButton"),
+                ("Prev Episode", lambda: self.host_party_change_episode(-1), "Dark.TButton"),
+                ("Next Episode", lambda: self.host_party_change_episode(1), "Dark.TButton"),
+                ("End Party", self.end_host_party, "Dark.TButton"),
+            ]
+        ):
+            ttk.Button(controls, text=text, style=style, command=command).grid(row=0, column=idx, padx=(0, 6), pady=4)
+        participants_box = tk.Frame(win, bg=COLORS["panel"], highlightthickness=1, highlightbackground=COLORS["border"])
+        participants_box.grid(row=4, column=0, sticky="nsew", padx=14, pady=(0, 14))
+        participants_box.columnconfigure(0, weight=1)
+        participants_box.rowconfigure(1, weight=1)
+        tk.Label(participants_box, text="Participants", bg=COLORS["panel"], fg=COLORS["text"], font=("", 12, "bold")).grid(
+            row=0, column=0, sticky="w", padx=10, pady=(10, 4)
+        )
+        self.party_participant_list = tk.Listbox(
+            participants_box,
+            bg=COLORS["panel"],
+            fg=COLORS["text"],
+            selectbackground=COLORS["accent"],
+            selectforeground="#111111",
+            relief="flat",
+            highlightthickness=0,
+        )
+        self.party_participant_list.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
+        action_row = tk.Frame(participants_box, bg=COLORS["panel"])
+        action_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
+        ttk.Button(action_row, text="Refresh", style="Dark.TButton", command=self.render_host_party_participants).grid(
+            row=0, column=0, padx=(0, 8)
+        )
+        ttk.Button(action_row, text="Kick Selected", style="Dark.TButton", command=self.kick_selected_party_participant).grid(row=0, column=1)
+        win.protocol("WM_DELETE_WINDOW", self.destroy_party_window)
+        self.render_host_party_participants()
+
+    def show_joined_party_window(self, state: dict[str, object]) -> None:
+        self.destroy_party_window()
+        win = tk.Toplevel(self.root)
+        win.title("Watch Party")
+        win.configure(bg=COLORS["bg"])
+        win.geometry("520x260")
+        win.columnconfigure(0, weight=1)
+        self.party_window = win
+        media_payload = state.get("media") if isinstance(state.get("media"), dict) else {}
+        media = WatchPartyMedia.from_json(media_payload)
+        tk.Label(win, text=media.party_title, bg=COLORS["bg"], fg=COLORS["text"], font=("", 16, "bold")).grid(
+            row=0, column=0, sticky="w", padx=14, pady=(14, 4)
+        )
+        tk.Label(
+            win,
+            text=f"{split_display_title(media.anime_title)[0]} episode {media.episode} ({media.mode})",
+            bg=COLORS["bg"],
+            fg=COLORS["muted"],
+            anchor="w",
+        ).grid(row=1, column=0, sticky="ew", padx=14)
+        tk.Label(win, textvariable=self.party_status_text, bg=COLORS["bg"], fg=COLORS["muted"], anchor="w").grid(
+            row=2, column=0, sticky="ew", padx=14, pady=(8, 0)
+        )
+        username_row = tk.Frame(win, bg=COLORS["bg"])
+        username_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(14, 6))
+        username_row.columnconfigure(1, weight=1)
+        tk.Label(username_row, text="Username", bg=COLORS["bg"], fg=COLORS["muted"]).grid(row=0, column=0, padx=(0, 8))
+        tk.Entry(
+            username_row,
+            textvariable=self.party_username_var,
+            bg=COLORS["entry"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["text"],
+            relief="flat",
+        ).grid(row=0, column=1, sticky="ew", ipady=6)
+        ttk.Button(username_row, text="Update", style="Dark.TButton", command=self.change_party_username).grid(
+            row=0, column=2, padx=(8, 0)
+        )
+        ttk.Button(win, text="Leave Party", style="Dark.TButton", command=self.leave_joined_party).grid(
+            row=4, column=0, sticky="ew", padx=14, pady=(10, 0)
+        )
+        win.protocol("WM_DELETE_WINDOW", self.leave_joined_party)
+
+    def destroy_party_window(self) -> None:
+        if self.party_window is None:
+            return
+        try:
+            self.party_window.destroy()
+        except tk.TclError:
+            pass
+        self.party_window = None
+        self.party_participant_list = None
+
+    def copy_party_link(self) -> None:
+        link = self.party_link_var.get()
+        if not link:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(link)
+        self.party_status_text.set("Watch party link copied.")
+
+    def schedule_host_party_refresh(self) -> None:
+        if self.shutting_down or self.party_host_session is None:
+            return
+        if self.party_host_refresh_job is not None:
+            try:
+                self.root.after_cancel(self.party_host_refresh_job)
+            except tk.TclError:
+                pass
+        self.party_host_refresh_job = self.root.after(PARTY_HOST_REFRESH_MS, self.host_party_refresh_tick)
+
+    def host_party_refresh_tick(self) -> None:
+        self.party_host_refresh_job = None
+        if self.shutting_down or self.party_host_session is None:
+            return
+        self.render_host_party_participants()
+        self.schedule_host_party_refresh()
+
+    def schedule_host_party_state_sync(self) -> None:
+        if self.shutting_down or self.party_host_session is None:
+            return
+        if self.party_host_state_sync_job is not None:
+            try:
+                self.root.after_cancel(self.party_host_state_sync_job)
+            except tk.TclError:
+                pass
+        self.party_host_state_sync_job = self.root.after(PARTY_HOST_STATE_SYNC_MS, self.host_party_state_sync_tick)
+
+    def host_party_state_sync_tick(self) -> None:
+        self.party_host_state_sync_job = None
+        if self.shutting_down or self.party_host_session is None:
+            return
+        self.publish_host_party_state()
+        self.schedule_host_party_state_sync()
+
+    def cancel_host_party_jobs(self) -> None:
+        for attr in ("party_host_refresh_job", "party_host_state_sync_job"):
+            job = getattr(self, attr)
+            if job is not None:
+                try:
+                    self.root.after_cancel(job)
+                except tk.TclError:
+                    pass
+                setattr(self, attr, None)
+
+    def publish_host_party_state(self) -> dict[str, object] | None:
+        if self.party_host_session is None or self.party_playback_controller is None:
+            return None
+        snapshot = self.party_playback_controller.snapshot()
+        if snapshot is None:
+            return None
+        self.party_host_session.room.update_playback_state(
+            position_seconds=float(snapshot.get("position_seconds") or 0.0),
+            paused=bool(snapshot.get("paused")),
+            episode=self.party_current_media.episode if self.party_current_media is not None else None,
+        )
+        return snapshot
+
+    def render_host_party_participants(self) -> None:
+        if self.party_host_session is None or self.party_participant_list is None:
+            return
+        self.publish_host_party_state()
+        state = self.party_host_session.room.public_state()
+        participants = list(state.get("participants") or [])
+        self.party_participant_ids = []
+        self.party_participant_list.delete(0, tk.END)
+        if not participants:
+            self.party_participant_list.insert(tk.END, "No one has joined yet.")
+            return
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            self.party_participant_ids.append(str(participant.get("participant_id") or ""))
+            joined = local_time(str(participant.get("joined_at") or ""))
+            self.party_participant_list.insert(tk.END, f"{participant.get('username') or 'Guest'}  joined {joined}")
+
+    def kick_selected_party_participant(self) -> None:
+        if self.party_host_session is None or self.party_participant_list is None:
+            return
+        selection = self.party_participant_list.curselection()
+        if not selection:
+            return
+        participant_ids = getattr(self, "party_participant_ids", [])
+        if selection[0] >= len(participant_ids):
+            return
+        participant_id = participant_ids[selection[0]]
+        try:
+            participant = self.party_host_session.room.kick(participant_id)
+        except WatchPartyError as exc:
+            messagebox.showwarning("Kick failed", str(exc))
+            return
+        self.party_status_text.set(f"Removed {participant.username} from the watch party.")
+        self.render_host_party_participants()
+
+    def host_party_control(self, action: str, payload: dict[str, object] | None = None) -> None:
+        if self.party_host_session is None:
+            return
+        payload = dict(payload or {})
+        snapshot = self.publish_host_party_state()
+        if snapshot is not None and payload.get("position_seconds") is None:
+            payload["position_seconds"] = float(snapshot.get("position_seconds") or 0.0)
+        self.apply_local_party_control(action, payload)
+        try:
+            self.party_host_session.room.control(action, payload)
+        except WatchPartyError as exc:
+            messagebox.showwarning("Watch party control failed", str(exc))
+            return
+        self.party_status_text.set(f"Sent {action.replace('_', ' ')} to the watch party.")
+
+    def host_party_seek(self, delta_seconds: int) -> None:
+        self.host_party_control("relative_seek", {"delta_seconds": delta_seconds})
+
+    def host_party_change_episode(self, direction: int) -> None:
+        if self.party_host_session is None or self.party_current_media is None or self.selected_anime_id is None:
+            return
+        episodes = [str(row["episode_key"]) for row in episodes_for_anime(self.conn, self.selected_anime_id)]
+        if not episodes:
+            messagebox.showinfo("Episode required", "No episode list is available for this anime.")
+            return
+        current = self.party_current_media.episode
+        if current not in episodes:
+            messagebox.showinfo("Episode required", f"Current party episode {current} is not in the episode list.")
+            return
+        next_index = episodes.index(current) + direction
+        if next_index < 0 or next_index >= len(episodes):
+            messagebox.showinfo("Episode unavailable", "There is no episode in that direction.")
+            return
+        next_episode = episodes[next_index]
+        previous_controller = self.party_playback_controller
+        if previous_controller is not None:
+            try:
+                previous_controller.stop()
+            except Exception:
+                pass
+        media = WatchPartyMedia(
+            party_title=self.party_current_media.party_title,
+            anime_title=self.party_current_media.anime_title,
+            source_title=self.party_current_media.source_title,
+            episode=next_episode,
+            mode=self.party_current_media.mode,
+            allanime_id=self.party_current_media.allanime_id,
+            allanime_title=self.party_current_media.allanime_title,
+            total_episodes=self.party_current_media.total_episodes,
+        )
+        ipc_path = party_ipc_path(f"host-{self.party_host_session.room.room_id}-{next_episode}")
+        try:
+            self.launch_party_media(media, ipc_path)
+        except LaunchError as exc:
+            messagebox.showwarning("ani-cli launch failed", str(exc))
+            return
+        self.party_current_media = media
+        self.party_playback_controller = MpvIpcController(ipc_path)
+        action = "next_episode" if direction > 0 else "previous_episode"
+        self.host_party_control(action, {"episode": next_episode, "media": media.to_json(), "position_seconds": 0.0})
+
+    def apply_local_party_control(self, action: str, payload: dict[str, object]) -> None:
+        controller = self.party_playback_controller
+        if controller is None:
+            return
+        try:
+            if action == "play":
+                controller.play()
+            elif action == "pause":
+                controller.pause()
+            elif action == "seek":
+                controller.seek(float(payload.get("position_seconds") or 0))
+            elif action == "relative_seek":
+                controller.relative_seek(float(payload.get("delta_seconds") or 0))
+            elif action == "stop":
+                controller.stop()
+        except Exception:
+            self.party_status_text.set("Sent control event. Local mpv control is not ready yet.")
+
+    def end_host_party(self, show_message: bool = True) -> None:
+        self.cancel_host_party_jobs()
+        session = self.party_host_session
+        self.party_host_session = None
+        if session is not None:
+            session.close()
+        self.destroy_party_window()
+        if show_message:
+            messagebox.showinfo("Watch party ended", "The watch party has ended.")
+
+    def start_party_event_poll(self) -> None:
+        client = self.party_client
+        if client is None:
+            return
+
+        def worker() -> None:
+            while self.party_join_polling and self.party_client is client:
+                try:
+                    payload = client.poll_events()
+                except WatchPartyError as exc:
+                    self.run_on_ui(lambda error=str(exc): self.party_poll_failed(error))
+                    break
+                self.run_on_ui(lambda value=payload: self.apply_party_events(value))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def party_poll_failed(self, error: str) -> None:
+        self.party_join_polling = False
+        self.party_status_text.set(f"Watch party connection lost: {error}")
+
+    def apply_party_events(self, payload: dict[str, object]) -> None:
+        events = payload.get("events") if isinstance(payload.get("events"), list) else []
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            event_type = str(event.get("event_type") or "")
+            event_payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+            if event_type == "participant_kicked":
+                participant = event_payload.get("participant") if isinstance(event_payload.get("participant"), dict) else {}
+                if self.party_client is not None and participant.get("participant_id") == self.party_client.participant_id:
+                    self.party_join_polling = False
+                    self.apply_local_party_control("stop", {})
+                    self.party_status_text.set("You were removed from the watch party.")
+                    messagebox.showinfo("Watch party", "You were removed from the watch party.")
+                    return
+            elif event_type == "party_ended":
+                self.party_join_polling = False
+                self.apply_local_party_control("stop", {})
+                self.party_status_text.set("The host ended the watch party.")
+                messagebox.showinfo("Watch party", "The host ended the watch party.")
+                return
+            elif event_type in {"play", "pause", "seek", "relative_seek", "playback_state"}:
+                playback_state = event_payload.get("playback_state") if isinstance(event_payload.get("playback_state"), dict) else None
+                if playback_state is not None:
+                    self.apply_party_playback_state(playback_state)
+                else:
+                    self.apply_local_party_control(event_type, event_payload)
+            elif event_type == "stop":
+                self.apply_local_party_control(event_type, event_payload)
+            elif event_type in {"next_episode", "previous_episode"}:
+                media_payload = event_payload.get("media") if isinstance(event_payload.get("media"), dict) else None
+                if media_payload is None:
+                    continue
+                media = WatchPartyMedia.from_json(media_payload)
+                previous_controller = self.party_playback_controller
+                if previous_controller is not None:
+                    try:
+                        previous_controller.stop()
+                    except Exception:
+                        pass
+                ipc_path = party_ipc_path(f"join-{self.party_client.participant_id if self.party_client else 'guest'}-{media.episode}")
+                try:
+                    self.launch_party_media(media, ipc_path)
+                except LaunchError as exc:
+                    self.party_status_text.set(f"Episode launch failed: {exc}")
+                    continue
+                self.party_current_media = media
+                self.party_playback_controller = MpvIpcController(ipc_path)
+                self.party_status_text.set(f"Host changed to episode {media.episode}.")
+                playback_state = event_payload.get("playback_state") if isinstance(event_payload.get("playback_state"), dict) else None
+                if playback_state is not None:
+                    self.apply_party_playback_state(playback_state, wait_for_socket=True)
+
+    def change_party_username(self) -> None:
+        if self.party_client is None:
+            return
+        username = self.party_username_var.get().strip()
+        if not username:
+            return
+        try:
+            self.party_client.set_username(username)
+        except WatchPartyError as exc:
+            messagebox.showwarning("Username update failed", str(exc))
+            return
+        self.party_status_text.set(f"Username changed to {username}.")
+
+    def leave_joined_party(self) -> None:
+        self.party_join_polling = False
+        client = self.party_client
+        self.party_client = None
+        if client is not None:
+            try:
+                client.leave()
+            except WatchPartyError:
+                pass
+        self.destroy_party_window()
 
     def reorder_selected(self, direction: int) -> None:
         if self.selected_anime_id is None:

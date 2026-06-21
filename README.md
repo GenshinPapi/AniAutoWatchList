@@ -93,6 +93,14 @@ By default, an episode is marked watched when the player exits successfully. Pla
 
 In the GUI detail page, select an episode and click **Continue** to choose **Sub** or **Dub** and open ani-cli for that title and episode. Continue uses selected metadata to resolve the intended AllAnime show when it can do so confidently, then opens that show through ani-cli. If the metadata match is not confident enough, it falls back to the normal ani-cli title search. Dub launches use ani-cli's `--dub` option; if no dub is found for the selected episode, the GUI offers to search sub instead.
 
+The anime detail page also includes a **Watch Party** menu. Hosting a watch party starts the selected episode, opens a host control window, and generates a share link. Guests can paste the link into **Watch Party > Join Watch Party** or run:
+
+```sh
+ani-watch party join URL
+```
+
+Watch parties synchronize local playback control only; video is not rebroadcast. For friends outside your local network, AniAutoWatchList uses Cloudflare Tunnel through `cloudflared` to create a temporary public link. If `cloudflared` is not already installed, the app downloads a user-local copy into its app data directory. If the download or tunnel startup fails, the generated link is local-only and the host window shows the tunnel error.
+
 To open the GUI automatically for a single ani-cli run:
 
 ```sh

@@ -7,6 +7,8 @@ import os
 import re
 import shutil
 import sys
+import time
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -15,7 +17,9 @@ from .config import get_config_value, load_config, set_config_value
 from .db import initialize
 from .discovery import load_discovery, refresh_discovery
 from .doctor import run_doctor
+from .launcher import LaunchError, launch_episode
 from .metadata import refresh_metadata_for_anime, search_and_store_matches, select_match, set_anilist_id
+from .party import MpvIpcController, WatchPartyError, WatchPartyMedia, WatchPartyRemoteClient, party_ipc_path
 from .paths import get_paths
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
@@ -618,6 +622,146 @@ def cmd_logs(args: argparse.Namespace) -> int:
     return 0
 
 
+def _party_launch_media(media: WatchPartyMedia, ipc_path: str) -> None:
+    launch_episode(
+        media.allanime_title or media.anime_title,
+        media.episode,
+        mode=media.mode,
+        allanime_id=media.allanime_id,
+        mpv_ipc_path=ipc_path,
+    )
+
+
+def _party_state_target_position(playback_state: dict[str, Any]) -> float:
+    try:
+        position = float(playback_state.get("position_seconds") or 0.0)
+    except (TypeError, ValueError):
+        position = 0.0
+    if playback_state.get("paused"):
+        return max(0.0, position)
+    updated = str(playback_state.get("updated_at") or "")
+    try:
+        parsed = datetime.fromisoformat(updated.replace("Z", "+00:00"))
+    except ValueError:
+        return max(0.0, position)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    elapsed = max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds())
+    return max(0.0, position + elapsed)
+
+
+def _party_apply_playback_state(
+    controller: MpvIpcController,
+    playback_state: dict[str, Any],
+    *,
+    wait_for_socket: bool = False,
+) -> None:
+    deadline = time.monotonic() + 45
+    while wait_for_socket and time.monotonic() < deadline and not controller.available():
+        time.sleep(0.5)
+    position = _party_state_target_position(playback_state)
+    paused = bool(playback_state.get("paused"))
+    if paused:
+        controller.pause()
+    controller.seek(position)
+    if paused:
+        controller.pause()
+    else:
+        controller.play()
+
+
+def cmd_party_join(args: argparse.Namespace) -> int:
+    client = WatchPartyRemoteClient(args.link, args.username)
+    try:
+        payload = client.join()
+    except WatchPartyError as exc:
+        print(f"watch party join failed: {exc}", file=sys.stderr)
+        return 1
+    state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+    media_payload = state.get("media") if isinstance(state.get("media"), dict) else {}
+    media = WatchPartyMedia.from_json(media_payload)
+    print(f"Joined: {media.party_title}")
+    print(f"Anime: {media.anime_title}")
+    print(f"Episode: {media.episode} ({media.mode})")
+    ipc_path = party_ipc_path(f"cli-{client.participant_id or 'guest'}")
+    controller = MpvIpcController(ipc_path)
+    if not args.no_launch:
+        try:
+            _party_launch_media(media, ipc_path)
+        except LaunchError as exc:
+            try:
+                client.leave()
+            except WatchPartyError:
+                pass
+            print(f"ani-cli launch failed: {exc}", file=sys.stderr)
+            return 1
+        playback_state = state.get("playback_state") if isinstance(state.get("playback_state"), dict) else None
+        if playback_state is not None:
+            try:
+                _party_apply_playback_state(controller, playback_state, wait_for_socket=True)
+            except Exception as exc:
+                print(f"warning: initial playback sync failed: {exc}", file=sys.stderr)
+    if args.once:
+        return 0
+    print("Waiting for host controls. Press Ctrl-C to leave.")
+    try:
+        while True:
+            payload = client.poll_events()
+            events = payload.get("events") if isinstance(payload.get("events"), list) else []
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                event_type = str(event.get("event_type") or "")
+                event_payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                try:
+                    if event_type in {"play", "pause", "seek", "relative_seek", "playback_state"}:
+                        playback_state = event_payload.get("playback_state") if isinstance(event_payload.get("playback_state"), dict) else None
+                        if playback_state is not None:
+                            _party_apply_playback_state(controller, playback_state)
+                        elif event_type == "play":
+                            controller.play()
+                        elif event_type == "pause":
+                            controller.pause()
+                        elif event_type == "seek":
+                            controller.seek(float(event_payload.get("position_seconds") or 0))
+                        elif event_type == "relative_seek":
+                            controller.relative_seek(float(event_payload.get("delta_seconds") or 0))
+                    elif event_type == "stop":
+                        controller.stop()
+                    elif event_type in {"next_episode", "previous_episode"}:
+                        media_payload = event_payload.get("media") if isinstance(event_payload.get("media"), dict) else None
+                        if media_payload is None:
+                            continue
+                        controller.stop()
+                        media = WatchPartyMedia.from_json(media_payload)
+                        ipc_path = party_ipc_path(f"cli-{client.participant_id or 'guest'}-{media.episode}")
+                        controller = MpvIpcController(ipc_path)
+                        _party_launch_media(media, ipc_path)
+                        playback_state = event_payload.get("playback_state") if isinstance(event_payload.get("playback_state"), dict) else None
+                        if playback_state is not None:
+                            _party_apply_playback_state(controller, playback_state, wait_for_socket=True)
+                    elif event_type == "participant_kicked":
+                        participant = event_payload.get("participant") if isinstance(event_payload.get("participant"), dict) else {}
+                        if participant.get("participant_id") == client.participant_id:
+                            controller.stop()
+                            print("You were removed from the watch party.")
+                            return 0
+                    elif event_type == "party_ended":
+                        controller.stop()
+                        print("The host ended the watch party.")
+                        return 0
+                except Exception as exc:
+                    print(f"warning: could not apply {event_type}: {exc}", file=sys.stderr)
+    except KeyboardInterrupt:
+        print()
+    finally:
+        try:
+            client.leave()
+        except WatchPartyError:
+            pass
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ani-watch")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -757,6 +901,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("logs")
     p.add_argument("--tail", nargs="?", const=100, type=int)
     p.set_defaults(func=cmd_logs)
+
+    party = sub.add_parser("party")
+    party_sub = party.add_subparsers(dest="party_command", required=True)
+    p = party_sub.add_parser("join")
+    p.add_argument("link")
+    p.add_argument("--username", default=os.environ.get("USER", "Guest"))
+    p.add_argument("--no-launch", action="store_true", help="join and listen without launching ani-cli")
+    p.add_argument("--once", action="store_true", help="join, print room details, and exit")
+    p.set_defaults(func=cmd_party_join)
     return parser
 
 
