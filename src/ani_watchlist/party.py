@@ -27,8 +27,10 @@ from .store import now_iso
 
 DEFAULT_PARTY_HOST = "127.0.0.1"
 CLOUDFLARED_URL_RE = re.compile(r"https://[-a-z0-9]+\.trycloudflare\.com", re.IGNORECASE)
+PARTY_LINK_URL_RE = re.compile(r"https?://[^\s<>'\"]+", re.IGNORECASE)
 CLOUDFLARED_DOWNLOAD_BASE_URL = "https://github.com/cloudflare/cloudflared/releases/latest/download"
 CLOUDFLARED_MIN_DOWNLOAD_BYTES = 100_000
+PARTY_LINK_RESOLVER_USER_AGENT = "ani-watchlist-party-link-resolver/0.1"
 MAX_EVENT_HISTORY = 400
 
 
@@ -381,11 +383,20 @@ class WatchPartyRequestHandler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         parts = _path_parts(parsed.path)
         query = urllib.parse.parse_qs(parsed.query)
+        if not parts:
+            self._send_redirect(self.room.share_link(_request_base_url(self)))
+            return
         if len(parts) == 2 and parts[0] == "party":
             self._send_html(self._landing_html(query.get("invite", [None])[0]))
             return
         if parts == ["api", "health"]:
-            self._send_json({"ok": True, "room_id": self.room.room_id})
+            self._send_json(
+                {
+                    "ok": True,
+                    "room_id": self.room.room_id,
+                    "share_url": self.room.share_link(_request_base_url(self)),
+                }
+            )
             return
         if len(parts) == 3 and parts[:2] == ["api", "party"]:
             self._require_room(parts[2])
@@ -516,6 +527,13 @@ class WatchPartyRequestHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _send_redirect(self, location: str) -> None:
+        self.send_response(HTTPStatus.FOUND)
+        self._write_cors_headers()
+        self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def _write_cors_headers(self) -> None:
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -738,7 +756,7 @@ def _start_cloudflared_process(
 class WatchPartyRemoteClient:
     def __init__(self, link: str, username: str, *, timeout: float = 12.0):
         self.link = link
-        parsed = parse_party_link(link)
+        parsed = resolve_party_link(link, timeout=timeout)
         self.base_url = parsed["base_url"]
         self.room_id = parsed["room_id"]
         self.invite_token = parsed["invite"]
@@ -902,21 +920,116 @@ class MpvIpcController:
 
 
 def parse_party_link(link: str) -> dict[str, str]:
-    parsed = urllib.parse.urlparse(str(link).strip())
+    errors: list[WatchPartyError] = []
+    for candidate in _party_link_candidates(str(link)):
+        try:
+            return _parse_party_link_url(candidate)
+        except WatchPartyError as exc:
+            errors.append(exc)
+    if errors:
+        raise errors[-1]
+    raise WatchPartyError("watch party link must be an http or https URL")
+
+
+def resolve_party_link(link: str, *, timeout: float = 8.0) -> dict[str, str]:
+    try:
+        return parse_party_link(link)
+    except WatchPartyError as original_error:
+        for candidate in _party_link_candidates(str(link)):
+            for resolved_link in _resolve_party_link_candidates(candidate, timeout=timeout):
+                try:
+                    return parse_party_link(resolved_link)
+                except WatchPartyError:
+                    continue
+        raise original_error
+
+
+def _parse_party_link_url(link: str) -> dict[str, str]:
+    parsed = urllib.parse.urlparse(link)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
         raise WatchPartyError("watch party link must be an http or https URL")
     parts = _path_parts(parsed.path)
     if len(parts) != 2 or parts[0] != "party" or not parts[1]:
-        raise WatchPartyError("watch party link is missing the room id")
+        raise WatchPartyError(
+            "watch party link is incomplete. Paste the full invite link from the host window, "
+            "including /party/... and ?invite=..."
+        )
     query = urllib.parse.parse_qs(parsed.query)
     invite = query.get("invite", [""])[0]
     if not invite:
-        raise WatchPartyError("watch party link is missing the invite token")
+        raise WatchPartyError(
+            "watch party link is missing the invite token. Paste the full invite link from the host window."
+        )
     return {
         "base_url": f"{parsed.scheme}://{parsed.netloc}",
         "room_id": urllib.parse.unquote(parts[1]),
         "invite": invite,
     }
+
+
+def _party_link_candidates(value: str) -> list[str]:
+    candidates: list[str] = []
+    raw = _clean_pasted_url(value)
+    if raw:
+        candidates.append(raw)
+    for match in PARTY_LINK_URL_RE.finditer(value):
+        candidate = _clean_pasted_url(match.group(0))
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _clean_pasted_url(value: str) -> str:
+    cleaned = str(value).strip().strip("<>'\"`")
+    while cleaned and cleaned[-1] in ".,;)]}>":
+        cleaned = cleaned[:-1]
+    return cleaned.strip()
+
+
+def _resolve_party_link_candidates(link: str, *, timeout: float) -> list[str]:
+    parsed = urllib.parse.urlparse(link)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return []
+    candidates: list[str] = []
+    request = urllib.request.Request(
+        link,
+        headers={"User-Agent": PARTY_LINK_RESOLVER_USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            final_url = _clean_pasted_url(response.geturl())
+            if final_url and final_url != link:
+                candidates.append(final_url)
+            body = response.read(65_536).decode("utf-8", errors="replace")
+    except (OSError, urllib.error.URLError, ValueError):
+        body = ""
+    for candidate in _party_link_candidates(body):
+        if candidate not in candidates:
+            candidates.append(candidate)
+    health_link = _resolve_party_link_from_health(parsed, timeout=timeout)
+    if health_link and health_link not in candidates:
+        candidates.append(health_link)
+    return candidates
+
+
+def _resolve_party_link_from_health(parsed: urllib.parse.ParseResult, *, timeout: float) -> str | None:
+    base_url = f"{parsed.scheme}://{parsed.netloc}"
+    request = urllib.request.Request(
+        f"{base_url}/api/health",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": PARTY_LINK_RESOLVER_USER_AGENT,
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read(65_536).decode("utf-8"))
+    except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    share_url = payload.get("share_url")
+    return str(share_url).strip() if share_url else None
 
 
 def party_ipc_path(prefix: str) -> str:

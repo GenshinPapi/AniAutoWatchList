@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from ani_watchlist.party import (
@@ -8,6 +10,7 @@ from ani_watchlist.party import (
     WatchPartyRoom,
     cloudflared_asset_name,
     parse_party_link,
+    resolve_party_link,
 )
 
 
@@ -35,6 +38,57 @@ def test_parse_party_link_requires_room_and_invite() -> None:
 
     with pytest.raises(WatchPartyError):
         parse_party_link("https://example.test/party/room123")
+
+
+def test_parse_party_link_accepts_pasted_command_text() -> None:
+    parsed = parse_party_link("ani-watch party join https://example.test/party/room123?invite=abc.")
+
+    assert parsed["base_url"] == "https://example.test"
+    assert parsed["room_id"] == "room123"
+    assert parsed["invite"] == "abc"
+
+
+def test_parse_party_link_explains_incomplete_base_url() -> None:
+    with pytest.raises(WatchPartyError, match="full invite link"):
+        parse_party_link("https://example.test")
+
+
+def test_resolve_party_link_uses_health_share_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeResponse:
+        def __init__(self, url: str, body: str):
+            self._url = url
+            self._body = body.encode("utf-8")
+
+        def __enter__(self) -> "FakeResponse":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def geturl(self) -> str:
+            return self._url
+
+        def read(self, _size: int = -1) -> bytes:
+            return self._body
+
+    def fake_urlopen(request: object, timeout: float) -> FakeResponse:
+        _ = timeout
+        url = getattr(request, "full_url", str(request))
+        if url == "https://room.trycloudflare.com":
+            return FakeResponse(url, "<html>No invite link here.</html>")
+        if url == "https://room.trycloudflare.com/api/health":
+            return FakeResponse(
+                url,
+                json.dumps({"share_url": "https://room.trycloudflare.com/party/room123?invite=abc"}),
+            )
+        raise AssertionError(f"unexpected URL: {url}")
+
+    monkeypatch.setattr("ani_watchlist.party.urllib.request.urlopen", fake_urlopen)
+
+    parsed = resolve_party_link("https://room.trycloudflare.com", timeout=0.1)
+
+    assert parsed["room_id"] == "room123"
+    assert parsed["invite"] == "abc"
 
 
 def test_party_room_join_and_control_events() -> None:

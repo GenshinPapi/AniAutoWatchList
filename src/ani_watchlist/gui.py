@@ -2478,8 +2478,8 @@ class WatchlistApp:
         username = simpledialog.askstring("Join watch party", "Your display name:", initialvalue="Guest")
         if not username:
             return
-        client = WatchPartyRemoteClient(link, username)
         try:
+            client = WatchPartyRemoteClient(link, username)
             payload = client.join()
         except WatchPartyError as exc:
             messagebox.showwarning("Join watch party failed", str(exc))

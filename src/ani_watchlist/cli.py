@@ -671,8 +671,8 @@ def _party_apply_playback_state(
 
 
 def cmd_party_join(args: argparse.Namespace) -> int:
-    client = WatchPartyRemoteClient(args.link, args.username)
     try:
+        client = WatchPartyRemoteClient(args.link, args.username)
         payload = client.join()
     except WatchPartyError as exc:
         print(f"watch party join failed: {exc}", file=sys.stderr)
