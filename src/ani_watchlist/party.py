@@ -32,6 +32,35 @@ CLOUDFLARED_DOWNLOAD_BASE_URL = "https://github.com/cloudflare/cloudflared/relea
 CLOUDFLARED_MIN_DOWNLOAD_BYTES = 100_000
 PARTY_LINK_RESOLVER_USER_AGENT = "ani-watchlist-party-link-resolver/0.1"
 MAX_EVENT_HISTORY = 400
+MAX_RECENT_ACTIVITY = 80
+MAX_CHAT_MESSAGE_LENGTH = 500
+PARTY_USER_COLORS = (
+    "#ff7a45",
+    "#60a5fa",
+    "#34d399",
+    "#f472b6",
+    "#fbbf24",
+    "#a78bfa",
+    "#22d3ee",
+    "#fb7185",
+    "#84cc16",
+    "#c084fc",
+)
+VISIBLE_PARTY_EVENT_TYPES = {
+    "party_started",
+    "participant_joined",
+    "participant_left",
+    "participant_updated",
+    "participant_kicked",
+    "chat_message",
+    "play",
+    "pause",
+    "seek",
+    "relative_seek",
+    "next_episode",
+    "previous_episode",
+    "party_ended",
+}
 
 
 @dataclass(frozen=True)
@@ -77,6 +106,7 @@ class WatchPartyParticipant:
     username: str
     joined_at: str
     last_seen_at: str
+    color: str = ""
     kicked: bool = False
 
     def to_json(self) -> dict[str, Any]:
@@ -85,6 +115,7 @@ class WatchPartyParticipant:
             "username": self.username,
             "joined_at": self.joined_at,
             "last_seen_at": self.last_seen_at,
+            "color": self.color,
             "kicked": self.kicked,
         }
 
@@ -141,6 +172,7 @@ class WatchPartyRoom:
         self.host_token = host_token or secrets.token_urlsafe(24)
         self.created_at = now_iso()
         self.host_username = _clean_username(host_username)
+        self.host_color = secrets.choice(PARTY_USER_COLORS)
         self.ended = False
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
@@ -151,6 +183,7 @@ class WatchPartyRoom:
             "paused": False,
             "position_seconds": 0.0,
             "episode": media.episode,
+            "sync_pending": False,
             "updated_at": self.created_at,
         }
         with self._condition:
@@ -158,6 +191,7 @@ class WatchPartyRoom:
                 "party_started",
                 {
                     "host_username": self.host_username,
+                    "host_color": self.host_color,
                     "media": self.media.to_json(),
                     "playback_state": dict(self._playback_state),
                 },
@@ -174,11 +208,17 @@ class WatchPartyRoom:
                 "room_id": self.room_id,
                 "party_title": self.media.party_title,
                 "host_username": self.host_username,
+                "host_color": self.host_color,
                 "created_at": self.created_at,
                 "ended": self.ended,
                 "media": self.media.to_json(),
                 "playback_state": self._current_playback_state_locked(),
                 "participants": [participant.to_json() for participant in self._participants.values() if not participant.kicked],
+                "recent_events": [
+                    event.to_json()
+                    for event in self._events[-MAX_RECENT_ACTIVITY:]
+                    if event.event_type in VISIBLE_PARTY_EVENT_TYPES
+                ],
                 "latest_sequence": self._next_sequence,
             }
 
@@ -198,6 +238,7 @@ class WatchPartyRoom:
                 username=_clean_username(username),
                 joined_at=ts,
                 last_seen_at=ts,
+                color=self._next_participant_color_locked(),
             )
             self._participants[participant.participant_id] = participant
             self._append_event_locked("participant_joined", {"participant": participant.to_json()})
@@ -220,6 +261,7 @@ class WatchPartyRoom:
                 username=participant.username,
                 joined_at=participant.joined_at,
                 last_seen_at=now_iso(),
+                color=participant.color,
                 kicked=participant.kicked,
             )
             self._participants[participant_id] = updated
@@ -233,6 +275,7 @@ class WatchPartyRoom:
                 username=_clean_username(username),
                 joined_at=participant.joined_at,
                 last_seen_at=now_iso(),
+                color=participant.color,
                 kicked=participant.kicked,
             )
             self._participants[participant_id] = updated
@@ -255,11 +298,46 @@ class WatchPartyRoom:
                 username=participant.username,
                 joined_at=participant.joined_at,
                 last_seen_at=now_iso(),
+                color=participant.color,
                 kicked=True,
             )
             self._participants[participant_id] = kicked
             self._append_event_locked("participant_kicked", {"participant": kicked.to_json()})
             return kicked
+
+    def send_chat(
+        self,
+        message: str,
+        *,
+        participant_id: str | None = None,
+        username: str | None = None,
+        host: bool = False,
+    ) -> WatchPartyEvent:
+        message = _clean_chat_message(message)
+        if not message:
+            raise WatchPartyError("chat message cannot be empty")
+        with self._condition:
+            participant_payload = None
+            if not host and not participant_id:
+                raise WatchPartyError("participant id required")
+            display_name = _clean_username(username or self.host_username)
+            if participant_id:
+                participant = self.touch_participant(participant_id)
+                participant_payload = participant.to_json()
+                display_name = participant.username
+            color = participant_payload.get("color") if isinstance(participant_payload, dict) else self.host_color
+            return self._append_event_locked(
+                "chat_message",
+                {
+                    "message_id": secrets.token_urlsafe(8),
+                    "message": message,
+                    "username": display_name,
+                    "color": color,
+                    "host": bool(host),
+                    "participant_id": participant_id or "",
+                    "participant": participant_payload,
+                },
+            )
 
     def control(self, action: str, payload: dict[str, Any] | None = None) -> WatchPartyEvent:
         payload = dict(payload or {})
@@ -267,21 +345,31 @@ class WatchPartyRoom:
         if action not in {"play", "pause", "seek", "relative_seek", "next_episode", "previous_episode", "stop"}:
             raise WatchPartyError(f"unsupported watch party control: {action}")
         with self._condition:
+            payload.setdefault("host_username", self.host_username)
+            payload.setdefault("host_color", self.host_color)
             if isinstance(payload.get("media"), dict):
                 self.media = WatchPartyMedia.from_json(payload["media"])
             if payload.get("position_seconds") is not None:
                 self._playback_state["position_seconds"] = max(0.0, float(payload.get("position_seconds") or 0))
+            if payload.get("paused") is not None:
+                self._playback_state["paused"] = bool(payload.get("paused"))
+            if payload.get("sync_pending") is not None:
+                self._playback_state["sync_pending"] = bool(payload.get("sync_pending"))
             if action == "play":
                 self._playback_state["paused"] = False
+                self._playback_state["sync_pending"] = False
             elif action == "pause":
                 self._playback_state["paused"] = True
+                self._playback_state["sync_pending"] = False
             elif action == "seek":
                 self._playback_state["position_seconds"] = float(payload.get("position_seconds") or 0)
+                self._playback_state["sync_pending"] = False
             elif action == "relative_seek":
                 self._playback_state["position_seconds"] = max(
                     0.0,
                     float(self._playback_state.get("position_seconds") or 0) + float(payload.get("delta_seconds") or 0),
                 )
+                self._playback_state["sync_pending"] = False
             elif action in {"next_episode", "previous_episode"} and payload.get("episode"):
                 self._playback_state["episode"] = str(payload["episode"])
             self._playback_state["updated_at"] = now_iso()
@@ -303,6 +391,7 @@ class WatchPartyRoom:
                 self._playback_state["paused"] = bool(paused)
             if episode:
                 self._playback_state["episode"] = str(episode)
+            self._playback_state["sync_pending"] = False
             self._playback_state["updated_at"] = now_iso()
             payload = {"playback_state": self._current_playback_state_locked()}
             if emit_event:
@@ -341,6 +430,11 @@ class WatchPartyRoom:
         del self._events[:-MAX_EVENT_HISTORY]
         self._condition.notify_all()
         return event
+
+    def _next_participant_color_locked(self) -> str:
+        used = {self.host_color, *(participant.color for participant in self._participants.values() if participant.color)}
+        available = [color for color in PARTY_USER_COLORS if color not in used]
+        return secrets.choice(available or list(PARTY_USER_COLORS))
 
 
 class WatchPartyHTTPServer(ThreadingHTTPServer):
@@ -440,6 +534,18 @@ class WatchPartyRequestHandler(BaseHTTPRequestHandler):
             self._require_host()
             participant = self.room.kick(str(body.get("participant_id") or ""))
             self._send_json({"participant": participant.to_json()})
+            return
+        if len(parts) == 4 and parts[:2] == ["api", "party"] and parts[3] == "chat":
+            self._require_room(parts[2])
+            self._require_invite(str(body.get("invite") or ""))
+            participant_id = str(body.get("participant_id") or "")
+            if not participant_id:
+                raise WatchPartyError("participant id required")
+            event = self.room.send_chat(
+                str(body.get("message") or ""),
+                participant_id=participant_id,
+            )
+            self._send_json({"event": event.to_json(), "state": self.room.public_state()})
             return
         if len(parts) == 4 and parts[:2] == ["api", "party"] and parts[3] == "end":
             self._require_room(parts[2])
@@ -803,6 +909,13 @@ class WatchPartyRemoteClient:
             self.state = payload["state"]
         return payload
 
+    def fetch_state(self) -> dict[str, Any]:
+        query = urllib.parse.urlencode({"invite": self.invite_token})
+        payload = self._request("GET", f"/api/party/{urllib.parse.quote(self.room_id)}?{query}", None)
+        state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
+        self.state = state
+        return state
+
     def set_username(self, username: str) -> dict[str, Any]:
         if not self.participant_id:
             raise WatchPartyError("not joined to a watch party")
@@ -811,6 +924,15 @@ class WatchPartyRemoteClient:
             "POST",
             f"/api/party/{urllib.parse.quote(self.room_id)}/participants/{urllib.parse.quote(self.participant_id)}",
             {"username": self.username, "invite": self.invite_token},
+        )
+
+    def send_chat(self, message: str) -> dict[str, Any]:
+        if not self.participant_id:
+            raise WatchPartyError("not joined to a watch party")
+        return self._request(
+            "POST",
+            f"/api/party/{urllib.parse.quote(self.room_id)}/chat",
+            {"message": message, "participant_id": self.participant_id, "invite": self.invite_token},
         )
 
     def leave(self) -> None:
@@ -873,28 +995,37 @@ class MpvIpcController:
     def stop(self) -> None:
         self._command(["quit"])
 
+    def set_property(self, name: str, value: Any) -> None:
+        self._command(["set_property", name, value])
+
+    def set_fullscreen(self, enabled: bool) -> None:
+        self.set_property("fullscreen", bool(enabled))
+
     def get_property(self, name: str) -> Any:
         response = self._command(["get_property", name])
         if not isinstance(response, dict) or response.get("error") != "success":
             return None
         return response.get("data")
 
+    def time_position(self) -> float | None:
+        position = self.get_property("time-pos")
+        try:
+            return max(0.0, float(position))
+        except (TypeError, ValueError):
+            return None
+
     def snapshot(self) -> dict[str, Any] | None:
         if not self.available():
             return None
         try:
-            position = self.get_property("time-pos")
+            position_seconds = self.time_position()
             paused = self.get_property("pause")
         except OSError:
             return None
-        try:
-            position_seconds = float(position)
-        except (TypeError, ValueError):
-            position_seconds = None
-        if position_seconds is None and paused is None:
+        if position_seconds is None:
             return None
         return {
-            "position_seconds": max(0.0, position_seconds or 0.0),
+            "position_seconds": max(0.0, position_seconds),
             "paused": bool(paused) if paused is not None else False,
         }
 
@@ -1050,6 +1181,12 @@ def _path_parts(path: str) -> list[str]:
 def _clean_username(username: str) -> str:
     cleaned = re.sub(r"\s+", " ", str(username or "").strip())
     return cleaned[:40] or "Guest"
+
+
+def _clean_chat_message(message: str) -> str:
+    cleaned = re.sub(r"[ \t\r\f\v]+", " ", str(message or ""))
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned[:MAX_CHAT_MESSAGE_LENGTH]
 
 
 def _int_or_none(value: object) -> int | None:

@@ -746,6 +746,19 @@ def cmd_party_join(args: argparse.Namespace) -> int:
                             controller.stop()
                             print("You were removed from the watch party.")
                             return 0
+                    elif event_type == "participant_joined":
+                        participant = event_payload.get("participant") if isinstance(event_payload.get("participant"), dict) else {}
+                        print(f"{participant.get('username') or 'Guest'} joined.")
+                    elif event_type == "participant_left":
+                        participant = event_payload.get("participant") if isinstance(event_payload.get("participant"), dict) else {}
+                        print(f"{participant.get('username') or 'Guest'} left.")
+                    elif event_type == "participant_updated":
+                        participant = event_payload.get("participant") if isinstance(event_payload.get("participant"), dict) else {}
+                        print(f"{participant.get('username') or 'Guest'} updated their name.")
+                    elif event_type == "chat_message":
+                        username = event_payload.get("username") or "Guest"
+                        suffix = " (host)" if event_payload.get("host") else ""
+                        print(f"{username}{suffix}: {event_payload.get('message') or ''}")
                     elif event_type == "party_ended":
                         controller.stop()
                         print("The host ended the watch party.")

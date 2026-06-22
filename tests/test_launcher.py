@@ -423,3 +423,46 @@ def test_launch_episode_resolves_ani_cli_and_does_not_block(monkeypatch) -> None
     assert result.pid == 4321
     assert result.used_terminal is False
     assert seen["start_new_session"] is True
+
+
+def test_launch_episode_can_pass_mpv_ipc_and_wid(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_which(name: str) -> str | None:
+        if name == "ani-cli":
+            return "/home/me/.local/bin/ani-cli"
+        return None
+
+    class FakeProcess:
+        pid = 4322
+
+    def fake_popen(command: list[str], *, start_new_session: bool, env: dict[str, str]):
+        seen["command"] = command
+        seen["start_new_session"] = start_new_session
+        seen["ipc"] = env.get("ANI_WATCH_MPV_IPC")
+        seen["wid"] = env.get("ANI_WATCH_MPV_WID")
+        return FakeProcess()
+
+    monkeypatch.setattr(launcher.shutil, "which", fake_which)
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+
+    result = launcher.launch_episode(
+        "One Piece",
+        "1090",
+        prefer_terminal=False,
+        mpv_ipc_path="/tmp/party.sock",
+        mpv_wid=12345,
+    )
+
+    assert result.command == [
+        "/home/me/.local/bin/ani-cli",
+        "--no-detach",
+        "--select-nth",
+        "1",
+        "--episode",
+        "1090",
+        "One Piece",
+    ]
+    assert result.pid == 4322
+    assert seen["ipc"] == "/tmp/party.sock"
+    assert seen["wid"] == "12345"

@@ -115,7 +115,16 @@ IDLE_CHECK_INTERVAL_MS = 60_000
 IDLE_ACTIVITY_THROTTLE_MS = 1000
 PARTY_HOST_REFRESH_MS = 10_000
 PARTY_HOST_STATE_SYNC_MS = 2_000
+PARTY_HOST_EVENT_POLL_MS = 1_000
 PARTY_INITIAL_SYNC_TIMEOUT_SECONDS = 45.0
+PARTY_FORCE_SYNC_TIMEOUT_SECONDS = 45.0
+PARTY_FORCE_SYNC_INTERVAL_SECONDS = 1.25
+PARTY_FORCE_SYNC_VERIFY_DELAY_SECONDS = 0.75
+PARTY_FORCE_SYNC_TOLERANCE_SECONDS = 3.0
+PARTY_HOST_MPV_OBSERVER_INTERVAL_SECONDS = 0.75
+PARTY_HOST_MPV_SEEK_THRESHOLD_SECONDS = 3.0
+PARTY_FULLSCREEN_OBSERVER_INTERVAL_SECONDS = 0.5
+PARTY_SIDEBAR_WIDTH = 280
 IDLE_ACTIVITY_EVENTS = ("<KeyPress>", "<ButtonPress>", "<MouseWheel>", "<Button-4>", "<Button-5>", "<Motion>")
 NESTED_MOUSEWHEEL_WIDGET_CLASSES = {"Listbox", "Scrollbar", "Text", "Treeview", "TScrollbar"}
 SCROLL_EDGE_EPSILON = 0.001
@@ -280,13 +289,32 @@ class WatchlistApp:
         self.party_playback_controller: MpvIpcController | None = None
         self.party_current_media: WatchPartyMedia | None = None
         self.party_window: tk.Toplevel | None = None
+        self.party_header_frame: tk.Frame | None = None
+        self.party_body_frame: tk.Frame | None = None
+        self.party_sidebar_frame: tk.Frame | None = None
+        self.party_video_panel: tk.Frame | None = None
+        self.party_video_frame: tk.Frame | None = None
         self.party_link_var = tk.StringVar()
         self.party_username_var = tk.StringVar()
+        self.party_chat_var = tk.StringVar()
         self.party_status_text = tk.StringVar(value="")
+        self.party_host_username = "Host"
+        self.party_user_colors: dict[str, str] = {}
         self.party_participant_list: tk.Listbox | None = None
         self.party_participant_ids: list[str] = []
+        self.party_activity_text: tk.Text | None = None
         self.party_host_refresh_job: str | None = None
         self.party_host_state_sync_job: str | None = None
+        self.party_host_event_job: str | None = None
+        self.party_host_latest_sequence = 0
+        self.party_host_observer_stop: threading.Event | None = None
+        self.party_host_observer_thread: threading.Thread | None = None
+        self.party_host_observer_ignore_until = 0.0
+        self.party_force_sync_generation = 0
+        self.party_fullscreen = False
+        self.party_fullscreen_observer_stop: threading.Event | None = None
+        self.party_fullscreen_observer_thread: threading.Thread | None = None
+        self.party_mpv_fullscreen_state: bool | None = None
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
         self.discovery_pages: dict[str, tk.Frame] = {}
@@ -346,6 +374,8 @@ class WatchlistApp:
         style.map("Compact.Dark.TButton", background=[("active", COLORS["border"])])
         style.configure("Accent.TButton", background=COLORS["accent"], foreground="#111111", padding=(10, 6))
         style.map("Accent.TButton", background=[("active", COLORS["accent_hover"])])
+        style.configure("Compact.Accent.TButton", background=COLORS["accent"], foreground="#111111", padding=(6, 4))
+        style.map("Compact.Accent.TButton", background=[("active", COLORS["accent_hover"])])
         style.configure("Accent.TMenubutton", background=COLORS["accent"], foreground="#111111", padding=(10, 6))
         style.map("Accent.TMenubutton", background=[("active", COLORS["accent_hover"])])
         style.configure(
@@ -1235,6 +1265,7 @@ class WatchlistApp:
             "search_suggestion_job",
             "party_host_refresh_job",
             "party_host_state_sync_job",
+            "party_host_event_job",
         ):
             job = getattr(self, attr, None)
             if job is not None:
@@ -1245,12 +1276,14 @@ class WatchlistApp:
                 setattr(self, attr, None)
         self.dismiss_idle_prompt()
         self.party_join_polling = False
+        self.stop_party_fullscreen_observer()
         if self.party_client is not None:
             try:
                 self.party_client.leave()
             except Exception:
                 pass
             self.party_client = None
+        self.stop_host_party_mpv_observer()
         if self.party_host_session is not None:
             try:
                 self.party_host_session.close()
@@ -2444,6 +2477,15 @@ class WatchlistApp:
         except Exception as exc:
             messagebox.showwarning("Watch party failed", str(exc))
             return
+        self.party_host_session = session
+        self.party_client = None
+        self.party_join_polling = False
+        self.party_playback_controller = None
+        self.party_current_media = media
+        self.party_link_var.set(session.share_url)
+        tunnel_note = "Public tunnel active." if session.public else f"Public tunnel unavailable: {session.tunnel_error or 'unknown error'}"
+        self.party_status_text.set(tunnel_note)
+        self.show_host_party_window()
         ipc_path = party_ipc_path(f"host-{session.room.room_id}")
         try:
             launch_episode(
@@ -2452,22 +2494,21 @@ class WatchlistApp:
                 mode=mode,
                 allanime_id=target.show_id if target is not None else None,
                 mpv_ipc_path=ipc_path,
+                mpv_wid=self.party_embed_window_id(),
+                prefer_terminal=False,
             )
         except LaunchError as exc:
             session.close()
+            self.party_host_session = None
+            self.party_current_media = None
+            self.destroy_party_window()
             messagebox.showwarning("ani-cli launch failed", str(exc))
             return
-        self.party_host_session = session
-        self.party_client = None
-        self.party_join_polling = False
         self.party_playback_controller = MpvIpcController(ipc_path)
-        self.party_current_media = media
-        self.party_link_var.set(session.share_url)
-        tunnel_note = "Public tunnel active." if session.public else f"Public tunnel unavailable: {session.tunnel_error or 'unknown error'}"
-        self.party_status_text.set(tunnel_note)
         self.launch_label.configure(text=f"Watch party started for episode {episode}. {tunnel_note}", fg=COLORS["muted"])
-        self.show_host_party_window()
         self.publish_host_party_state()
+        self.start_party_fullscreen_observer()
+        self.start_host_party_mpv_observer()
         self.schedule_host_party_state_sync()
         self.schedule_host_party_refresh()
 
@@ -2487,28 +2528,33 @@ class WatchlistApp:
         state = payload.get("state") if isinstance(payload.get("state"), dict) else {}
         media_payload = state.get("media") if isinstance(state.get("media"), dict) else {}
         media = WatchPartyMedia.from_json(media_payload)
+        self.party_client = client
+        self.party_join_polling = False
+        self.party_host_session = None
+        self.party_playback_controller = None
+        self.party_current_media = media
+        self.party_username_var.set(username)
+        self.party_status_text.set(f"Joined {media.party_title}. Waiting for host controls.")
+        self.show_joined_party_window(state)
         ipc_path = party_ipc_path(f"join-{client.participant_id or 'guest'}")
         try:
-            self.launch_party_media(media, ipc_path)
+            self.launch_party_media(media, ipc_path, embed_wid=self.party_embed_window_id())
         except LaunchError as exc:
             try:
                 client.leave()
             except WatchPartyError:
                 pass
+            self.party_client = None
+            self.destroy_party_window()
             messagebox.showwarning("ani-cli launch failed", str(exc))
             return
-        self.party_client = client
-        self.party_join_polling = True
-        self.party_host_session = None
         self.party_playback_controller = MpvIpcController(ipc_path)
-        self.party_current_media = media
-        self.party_username_var.set(username)
-        self.party_status_text.set(f"Joined {media.party_title}. Waiting for host controls.")
-        self.show_joined_party_window(state)
+        self.party_join_polling = True
+        self.start_party_fullscreen_observer()
         self.start_party_initial_sync(state)
         self.start_party_event_poll()
 
-    def launch_party_media(self, media: WatchPartyMedia, ipc_path: str) -> None:
+    def launch_party_media(self, media: WatchPartyMedia, ipc_path: str, *, embed_wid: int | None = None) -> None:
         launch_title = media.allanime_title or media.anime_title
         launch_episode(
             launch_title,
@@ -2516,6 +2562,8 @@ class WatchlistApp:
             mode=media.mode,
             allanime_id=media.allanime_id,
             mpv_ipc_path=ipc_path,
+            mpv_wid=embed_wid,
+            prefer_terminal=False,
         )
 
     def playback_state_target_position(self, playback_state: dict[str, object]) -> float:
@@ -2541,30 +2589,19 @@ class WatchlistApp:
         return parsed.astimezone(timezone.utc)
 
     def start_party_initial_sync(self, state: dict[str, object]) -> None:
-        playback_state = state.get("playback_state") if isinstance(state.get("playback_state"), dict) else None
-        if playback_state is None:
-            return
-        self.apply_party_playback_state(playback_state, wait_for_socket=True)
+        self.start_party_force_sync("join", state=state)
 
     def apply_party_playback_state(self, playback_state: dict[str, object], *, wait_for_socket: bool = False) -> None:
         controller = self.party_playback_controller
         if controller is None:
             return
-        target_position = self.playback_state_target_position(playback_state)
-        paused = bool(playback_state.get("paused"))
 
         def worker() -> None:
             deadline = monotonic() + PARTY_INITIAL_SYNC_TIMEOUT_SECONDS
             while wait_for_socket and monotonic() < deadline and not controller.available():
                 sleep(0.5)
             try:
-                if paused:
-                    controller.pause()
-                controller.seek(target_position)
-                if paused:
-                    controller.pause()
-                else:
-                    controller.play()
+                target_position, paused = self.apply_party_playback_state_to_controller(controller, playback_state)
             except Exception as exc:
                 self.run_on_ui(lambda error=str(exc): self.party_status_text.set(f"Playback sync failed: {error}"))
                 return
@@ -2580,6 +2617,551 @@ class WatchlistApp:
         else:
             worker()
 
+    def apply_party_playback_state_to_controller(
+        self,
+        controller: MpvIpcController,
+        playback_state: dict[str, object],
+    ) -> tuple[float, bool]:
+        target_position = self.playback_state_target_position(playback_state)
+        paused = bool(playback_state.get("paused"))
+        if paused:
+            controller.pause()
+        controller.seek(target_position)
+        if paused:
+            controller.pause()
+        else:
+            controller.play()
+        return target_position, paused
+
+    def start_party_force_sync(self, reason: str, *, state: dict[str, object] | None = None) -> None:
+        client = self.party_client
+        controller = self.party_playback_controller
+        media = self.party_current_media
+        if client is None or controller is None or media is None:
+            return
+        self.party_force_sync_generation += 1
+        generation = self.party_force_sync_generation
+        initial_state = state if isinstance(state, dict) else None
+        self.party_status_text.set("Syncing to host...")
+
+        def worker() -> None:
+            deadline = monotonic() + PARTY_FORCE_SYNC_TIMEOUT_SECONDS
+            next_state = initial_state
+            last_error = ""
+            while monotonic() < deadline:
+                if not self.party_force_sync_active(generation, client, controller):
+                    return
+                if not controller.available():
+                    sleep(0.35)
+                    continue
+                try:
+                    used_initial_state = next_state is not None
+                    current_state = next_state if next_state is not None else client.fetch_state()
+                    next_state = None
+                except WatchPartyError as exc:
+                    last_error = str(exc)
+                    sleep(PARTY_FORCE_SYNC_INTERVAL_SECONDS)
+                    continue
+                if not isinstance(current_state, dict):
+                    sleep(PARTY_FORCE_SYNC_INTERVAL_SECONDS)
+                    continue
+                if not self.party_state_matches_current_media(current_state, media):
+                    sleep(PARTY_FORCE_SYNC_INTERVAL_SECONDS)
+                    continue
+                playback_state = current_state.get("playback_state") if isinstance(current_state.get("playback_state"), dict) else None
+                if playback_state is None:
+                    sleep(PARTY_FORCE_SYNC_INTERVAL_SECONDS)
+                    continue
+                try:
+                    target_position, paused = self.apply_party_playback_state_to_controller(controller, playback_state)
+                except Exception as exc:
+                    last_error = str(exc)
+                    sleep(PARTY_FORCE_SYNC_INTERVAL_SECONDS)
+                    continue
+                sleep(PARTY_FORCE_SYNC_VERIFY_DELAY_SECONDS)
+                if not self.party_force_sync_active(generation, client, controller):
+                    return
+                if (
+                    not used_initial_state
+                    and not playback_state.get("sync_pending")
+                    and self.party_playback_is_close_to_host(controller, playback_state)
+                ):
+                    state_text = "paused" if paused else "playing"
+                    self.run_on_ui(
+                        lambda pos=target_position, status=state_text: self.party_status_text.set(
+                            f"Synced to host at {int(pos // 60)}:{int(pos % 60):02d} ({status})."
+                        )
+                    )
+                    return
+                sleep(PARTY_FORCE_SYNC_INTERVAL_SECONDS)
+            if self.party_force_sync_active(generation, client, controller):
+                message = f"Host sync timed out{(': ' + last_error) if last_error else '.'}"
+                self.run_on_ui(lambda value=message: self.party_status_text.set(value))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def party_force_sync_active(
+        self,
+        generation: int,
+        client: WatchPartyRemoteClient,
+        controller: MpvIpcController,
+    ) -> bool:
+        return (
+            self.party_force_sync_generation == generation
+            and self.party_client is client
+            and self.party_playback_controller is controller
+            and self.party_join_polling
+        )
+
+    def party_state_matches_current_media(self, state: dict[str, object], media: WatchPartyMedia) -> bool:
+        media_payload = state.get("media") if isinstance(state.get("media"), dict) else {}
+        state_episode = str(media_payload.get("episode") or "")
+        if state_episode and state_episode != str(media.episode):
+            return False
+        playback_state = state.get("playback_state") if isinstance(state.get("playback_state"), dict) else {}
+        playback_episode = str(playback_state.get("episode") or "")
+        return not playback_episode or playback_episode == str(media.episode)
+
+    def party_playback_is_close_to_host(
+        self,
+        controller: MpvIpcController,
+        playback_state: dict[str, object],
+    ) -> bool:
+        position = controller.time_position()
+        if position is None:
+            return False
+        expected = self.playback_state_target_position(playback_state)
+        if abs(position - expected) > PARTY_FORCE_SYNC_TOLERANCE_SECONDS:
+            return False
+        host_paused = bool(playback_state.get("paused"))
+        local_paused = controller.get_property("pause")
+        return local_paused is None or bool(local_paused) == host_paused
+
+    def build_party_activity_panel(self, parent: tk.Widget, *, row: int, column: int) -> tk.Frame:
+        panel = tk.Frame(parent, bg=COLORS["panel"], highlightthickness=1, highlightbackground=COLORS["border"])
+        panel.grid(row=row, column=column, sticky="nsew", padx=0, pady=(8, 0))
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(1, weight=1)
+        tk.Label(panel, text="Activity & Chat", bg=COLORS["panel"], fg=COLORS["text"], font=("", 11, "bold")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(8, 3)
+        )
+        activity = tk.Text(
+            panel,
+            bg=COLORS["entry"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["text"],
+            relief="flat",
+            wrap="word",
+            height=14,
+            state="disabled",
+        )
+        activity.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
+        activity.tag_configure("party_time", foreground=COLORS["muted"])
+        activity.tag_configure("party_system", foreground=COLORS["muted"])
+        self.party_activity_text = activity
+        chat_row = tk.Frame(panel, bg=COLORS["panel"])
+        chat_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+        chat_row.columnconfigure(0, weight=1)
+        entry = tk.Entry(
+            chat_row,
+            textvariable=self.party_chat_var,
+            bg=COLORS["entry"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["text"],
+            relief="flat",
+        )
+        entry.grid(row=0, column=0, sticky="ew", ipady=6)
+        entry.bind("<Return>", lambda _event: self.send_party_chat_message())
+        ttk.Button(chat_row, text="Send", style="Compact.Accent.TButton", command=self.send_party_chat_message).grid(
+            row=0, column=1, padx=(6, 0)
+        )
+        return panel
+
+    def build_party_video_panel(self, parent: tk.Widget, *, row: int, column: int) -> tk.Frame:
+        panel = tk.Frame(parent, bg="#000000", highlightthickness=1, highlightbackground=COLORS["border"])
+        panel.grid(row=row, column=column, sticky="nsew", padx=(0, 12), pady=0)
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(0, weight=1)
+        self.party_video_panel = panel
+        self.party_video_frame = tk.Frame(panel, bg="#000000", width=960, height=540)
+        self.party_video_frame.grid(row=0, column=0, sticky="nsew")
+        self.party_video_frame.grid_propagate(False)
+        self.party_video_frame.bind("<Double-Button-1>", lambda _event: self.toggle_party_fullscreen())
+        return panel
+
+    def party_embed_window_id(self) -> int | None:
+        if os.environ.get("ANI_WATCH_PARTY_DISABLE_EMBED") == "1":
+            return None
+        frame = self.party_video_frame
+        if frame is None:
+            return None
+        try:
+            if str(self.root.tk.call("tk", "windowingsystem")).casefold() != "x11":
+                return None
+            frame.update_idletasks()
+            window_id = int(frame.winfo_id())
+        except (tk.TclError, TypeError, ValueError):
+            return None
+        return window_id if window_id > 0 else None
+
+    def build_party_participants_panel(self, parent: tk.Widget, *, row: int, column: int, host: bool) -> tk.Frame:
+        panel = tk.Frame(parent, bg=COLORS["panel"], highlightthickness=1, highlightbackground=COLORS["border"])
+        panel.grid(row=row, column=column, sticky="nsew", padx=0, pady=(8, 0))
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(1, weight=1)
+        tk.Label(panel, text="Participants", bg=COLORS["panel"], fg=COLORS["text"], font=("", 11, "bold")).grid(
+            row=0, column=0, sticky="w", padx=8, pady=(8, 3)
+        )
+        self.party_participant_list = tk.Listbox(
+            panel,
+            bg=COLORS["panel"],
+            fg=COLORS["text"],
+            selectbackground=COLORS["accent"],
+            selectforeground="#111111",
+            relief="flat",
+            highlightthickness=0,
+            height=7,
+        )
+        self.party_participant_list.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
+        if host:
+            action_row = tk.Frame(panel, bg=COLORS["panel"])
+            action_row.grid(row=2, column=0, sticky="ew", padx=8, pady=(0, 8))
+            ttk.Button(action_row, text="Refresh", style="Compact.Dark.TButton", command=self.render_host_party_participants).grid(
+                row=0, column=0, padx=(0, 6)
+            )
+            ttk.Button(action_row, text="Kick", style="Compact.Dark.TButton", command=self.kick_selected_party_participant).grid(
+                row=0, column=1
+            )
+        return panel
+
+    def seed_party_activity_from_state(self, state: dict[str, object]) -> None:
+        self.clear_party_activity()
+        self.party_user_colors = {}
+        self.remember_party_state_colors(state)
+        recent_events = state.get("recent_events") if isinstance(state.get("recent_events"), list) else []
+        latest_sequence = 0
+        for event in recent_events:
+            if not isinstance(event, dict):
+                continue
+            latest_sequence = max(latest_sequence, int(event.get("sequence") or 0))
+            self.append_party_activity_event(event)
+        if self.party_host_session is not None:
+            self.party_host_latest_sequence = max(latest_sequence, int(state.get("latest_sequence") or 0))
+
+    def clear_party_activity(self) -> None:
+        if self.party_activity_text is None:
+            return
+        try:
+            self.party_activity_text.configure(state="normal")
+            self.party_activity_text.delete("1.0", tk.END)
+            self.party_activity_text.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def append_party_activity(self, message: str) -> None:
+        if self.party_activity_text is None or not message:
+            return
+        self.append_party_activity_segments([(message.rstrip(), None)])
+
+    def append_party_activity_segments(self, segments: list[tuple[str, str | None]]) -> None:
+        if self.party_activity_text is None or not segments:
+            return
+        try:
+            self.party_activity_text.configure(state="normal")
+            for text, tag in segments:
+                if not text:
+                    continue
+                if tag:
+                    self.party_activity_text.insert(tk.END, text, tag)
+                else:
+                    self.party_activity_text.insert(tk.END, text)
+            self.party_activity_text.insert(tk.END, "\n")
+            self.party_activity_text.see(tk.END)
+            self.party_activity_text.configure(state="disabled")
+        except tk.TclError:
+            pass
+
+    def append_party_activity_event(self, event: dict[str, object]) -> None:
+        segments = self.party_event_segments(event)
+        if segments:
+            self.append_party_activity_segments(segments)
+
+    def apply_party_activity_events(self, events: list[dict[str, object]]) -> None:
+        for event in events:
+            self.append_party_activity_event(event)
+
+    def party_event_message(self, event: dict[str, object]) -> str:
+        return "".join(text for text, _tag in self.party_event_segments(event))
+
+    def party_event_segments(self, event: dict[str, object]) -> list[tuple[str, str | None]]:
+        event_type = str(event.get("event_type") or "")
+        payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        prefix = self.party_event_prefix(event)
+        if event_type == "party_started":
+            return [*prefix, *self.party_user_segments(payload, host=True, default_name="Host"), (" started the party.", None)]
+        if event_type == "participant_joined":
+            participant = payload.get("participant") if isinstance(payload.get("participant"), dict) else {}
+            return [*prefix, *self.party_user_segments(participant, default_name="Guest"), (" joined.", None)]
+        if event_type == "participant_left":
+            participant = payload.get("participant") if isinstance(payload.get("participant"), dict) else {}
+            return [*prefix, *self.party_user_segments(participant, default_name="Guest"), (" left.", None)]
+        if event_type == "participant_updated":
+            participant = payload.get("participant") if isinstance(payload.get("participant"), dict) else {}
+            return [*prefix, *self.party_user_segments(participant, default_name="Guest"), (" updated their name.", None)]
+        if event_type == "participant_kicked":
+            participant = payload.get("participant") if isinstance(payload.get("participant"), dict) else {}
+            return [*prefix, *self.party_user_segments(participant, default_name="Guest"), (" was removed.", None)]
+        if event_type == "chat_message":
+            user = self.party_user_segments(payload, host=bool(payload.get("host")), default_name="Guest")
+            suffix = " (host)" if payload.get("host") else ""
+            if suffix and user:
+                user = [(user[0][0] + suffix, user[0][1])]
+            return [*prefix, *user, (f": {payload.get('message') or ''}", None)]
+        if event_type == "play":
+            return [*prefix, *self.party_user_segments(payload, host=True, default_name="Host"), (" resumed playback.", None)]
+        if event_type == "pause":
+            return [*prefix, *self.party_user_segments(payload, host=True, default_name="Host"), (" paused playback.", None)]
+        if event_type == "seek":
+            position = self.party_event_position(payload)
+            return [*prefix, *self.party_user_segments(payload, host=True, default_name="Host"), (f" jumped to {position}.", None)]
+        if event_type == "relative_seek":
+            delta = int(float(payload.get("delta_seconds") or 0))
+            return [*prefix, *self.party_user_segments(payload, host=True, default_name="Host"), (f" skipped {delta:+d}s.", None)]
+        if event_type == "next_episode":
+            return [
+                *prefix,
+                *self.party_user_segments(payload, host=True, default_name="Host"),
+                (f" moved to episode {payload.get('episode') or ''}.", None),
+            ]
+        if event_type == "previous_episode":
+            return [
+                *prefix,
+                *self.party_user_segments(payload, host=True, default_name="Host"),
+                (f" moved to episode {payload.get('episode') or ''}.", None),
+            ]
+        if event_type == "party_ended":
+            return [*prefix, ("Party ended.", "party_system")]
+        return []
+
+    def party_event_prefix(self, event: dict[str, object]) -> list[tuple[str, str | None]]:
+        stamp = self.party_event_time(str(event.get("created_at") or ""))
+        return [(f"[{stamp}] ", "party_time")] if stamp else []
+
+    def party_event_time(self, value: str) -> str:
+        parsed = self.parse_party_timestamp(value)
+        if parsed is None:
+            return ""
+        return parsed.astimezone().strftime("%H:%M")
+
+    def party_user_segments(
+        self,
+        payload: dict[str, object],
+        *,
+        host: bool = False,
+        default_name: str = "Guest",
+    ) -> list[tuple[str, str | None]]:
+        name = str(payload.get("username") or payload.get("host_username") or default_name)
+        participant_id = str(payload.get("participant_id") or "")
+        color = str(payload.get("color") or payload.get("host_color") or "")
+        participant = payload.get("participant") if isinstance(payload.get("participant"), dict) else {}
+        if participant:
+            name = str(participant.get("username") or name)
+            participant_id = str(participant.get("participant_id") or participant_id)
+            color = str(participant.get("color") or color)
+        if host:
+            name = str(payload.get("host_username") or payload.get("username") or self.party_host_username or default_name)
+        key = "host" if host else f"participant:{participant_id}" if participant_id else f"name:{name.casefold()}"
+        if color:
+            self.party_user_colors[key] = color
+        color = self.party_user_colors.get(key) or color or COLORS["accent"]
+        return [(name, self.party_color_tag(color))]
+
+    def party_color_tag(self, color: str) -> str:
+        text = self.party_activity_text
+        cleaned = color if re.fullmatch(r"#[0-9A-Fa-f]{6}", str(color)) else COLORS["accent"]
+        tag = f"party_user_{cleaned.lstrip('#').casefold()}"
+        if text is not None:
+            try:
+                text.tag_configure(tag, foreground=cleaned)
+            except tk.TclError:
+                pass
+        return tag
+
+    def remember_party_state_colors(self, state: dict[str, object]) -> None:
+        host_username = str(state.get("host_username") or "Host")
+        self.party_host_username = host_username
+        host_color = str(state.get("host_color") or "")
+        if host_color:
+            self.party_user_colors["host"] = host_color
+        participants = state.get("participants") if isinstance(state.get("participants"), list) else []
+        for participant in participants:
+            if not isinstance(participant, dict):
+                continue
+            participant_id = str(participant.get("participant_id") or "")
+            color = str(participant.get("color") or "")
+            if participant_id and color:
+                self.party_user_colors[f"participant:{participant_id}"] = color
+
+    def party_event_position(self, payload: dict[str, object]) -> str:
+        playback_state = payload.get("playback_state") if isinstance(payload.get("playback_state"), dict) else {}
+        raw_position = playback_state.get("position_seconds") if playback_state else payload.get("position_seconds")
+        try:
+            position = max(0, int(float(raw_position or 0)))
+        except (TypeError, ValueError):
+            position = 0
+        return f"{position // 60}:{position % 60:02d}"
+
+    def build_party_header(self, win: tk.Toplevel, *, heading: str, subheading: str | None, host: bool) -> None:
+        header = tk.Frame(win, bg=COLORS["bg"])
+        header.grid(row=0, column=0, sticky="ew", padx=10, pady=(8, 5))
+        header.columnconfigure(0, weight=1)
+        header.columnconfigure(1, weight=0)
+        self.party_header_frame = header
+        title_box = tk.Frame(header, bg=COLORS["bg"])
+        title_box.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        title_box.columnconfigure(0, weight=1)
+        tk.Label(title_box, text=heading, bg=COLORS["bg"], fg=COLORS["text"], font=("", 14, "bold"), anchor="w").grid(
+            row=0, column=0, sticky="ew"
+        )
+        if subheading:
+            tk.Label(title_box, text=subheading, bg=COLORS["bg"], fg=COLORS["muted"], anchor="w").grid(
+                row=1, column=0, sticky="ew"
+            )
+        else:
+            tk.Label(title_box, textvariable=self.party_status_text, bg=COLORS["bg"], fg=COLORS["muted"], anchor="w").grid(
+                row=1, column=0, sticky="ew"
+            )
+        if host:
+            link_row = tk.Frame(header, bg=COLORS["bg"])
+            link_row.grid(row=0, column=1, sticky="e")
+            link_row.columnconfigure(0, minsize=420)
+            tk.Entry(
+                link_row,
+                textvariable=self.party_link_var,
+                bg=COLORS["entry"],
+                fg=COLORS["text"],
+                insertbackground=COLORS["text"],
+                relief="flat",
+                width=48,
+            ).grid(row=0, column=0, sticky="ew", ipady=4)
+            ttk.Button(link_row, text="Copy Link", style="Compact.Dark.TButton", command=self.copy_party_link).grid(
+                row=0, column=1, padx=(6, 0)
+            )
+
+    def build_party_body(self, win: tk.Toplevel) -> tuple[tk.Frame, tk.Frame]:
+        body = tk.Frame(win, bg=COLORS["bg"])
+        body.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 10))
+        body.columnconfigure(0, weight=1)
+        body.columnconfigure(1, weight=0, minsize=PARTY_SIDEBAR_WIDTH)
+        body.rowconfigure(0, weight=1)
+        self.party_body_frame = body
+        self.build_party_video_panel(body, row=0, column=0)
+        side = tk.Frame(body, bg=COLORS["bg"], width=PARTY_SIDEBAR_WIDTH)
+        side.grid(row=0, column=1, sticky="nsew")
+        side.grid_propagate(False)
+        side.columnconfigure(0, weight=1)
+        side.rowconfigure(1, weight=3)
+        side.rowconfigure(2, weight=1)
+        self.party_sidebar_frame = side
+        return body, side
+
+    def configure_party_fullscreen_bindings(self) -> None:
+        win = self.party_window
+        if win is None:
+            return
+        win.bind("<F11>", lambda _event: self.toggle_party_fullscreen())
+        win.bind("<Escape>", lambda _event: self.set_party_fullscreen(False))
+
+    def toggle_party_fullscreen(self) -> None:
+        self.set_party_fullscreen(not self.party_fullscreen)
+
+    def set_party_fullscreen(self, enabled: bool, *, update_mpv: bool = True) -> None:
+        win = self.party_window
+        if win is None:
+            return
+        enabled = bool(enabled)
+        if self.party_fullscreen == enabled:
+            return
+        self.party_fullscreen = enabled
+        header = self.party_header_frame
+        body = self.party_body_frame
+        sidebar = self.party_sidebar_frame
+        video_panel = self.party_video_panel
+        try:
+            win.attributes("-fullscreen", enabled)
+        except tk.TclError:
+            pass
+        if enabled:
+            win.configure(bg="#000000")
+            if header is not None:
+                header.grid_remove()
+            if sidebar is not None:
+                sidebar.grid_remove()
+            if body is not None:
+                body.grid_configure(padx=0, pady=0)
+                body.columnconfigure(1, minsize=0)
+            if video_panel is not None:
+                video_panel.grid_configure(padx=0, pady=0)
+        else:
+            win.configure(bg=COLORS["bg"])
+            if header is not None:
+                header.grid()
+            if sidebar is not None:
+                sidebar.grid()
+            if body is not None:
+                body.grid_configure(padx=10, pady=(0, 10))
+                body.columnconfigure(1, minsize=PARTY_SIDEBAR_WIDTH)
+            if video_panel is not None:
+                video_panel.grid_configure(padx=(0, 12), pady=0)
+        if update_mpv and not enabled and self.party_playback_controller is not None:
+            try:
+                self.party_playback_controller.set_fullscreen(False)
+                self.party_mpv_fullscreen_state = False
+            except Exception:
+                pass
+
+    def start_party_fullscreen_observer(self) -> None:
+        self.stop_party_fullscreen_observer()
+        controller = self.party_playback_controller
+        if controller is None:
+            return
+        stop_event = threading.Event()
+        self.party_fullscreen_observer_stop = stop_event
+        self.party_mpv_fullscreen_state = None
+
+        def worker() -> None:
+            while not stop_event.is_set():
+                if not controller.available():
+                    stop_event.wait(0.5)
+                    continue
+                try:
+                    fullscreen = controller.get_property("fullscreen")
+                except Exception:
+                    fullscreen = None
+                if fullscreen is not None:
+                    enabled = bool(fullscreen)
+                    if self.party_mpv_fullscreen_state is None:
+                        self.party_mpv_fullscreen_state = enabled
+                    elif enabled != self.party_mpv_fullscreen_state:
+                        self.party_mpv_fullscreen_state = enabled
+                        self.run_on_ui(lambda value=enabled: self.set_party_fullscreen(value, update_mpv=False))
+                stop_event.wait(PARTY_FULLSCREEN_OBSERVER_INTERVAL_SECONDS)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        self.party_fullscreen_observer_thread = thread
+        thread.start()
+
+    def stop_party_fullscreen_observer(self) -> None:
+        stop_event = self.party_fullscreen_observer_stop
+        self.party_fullscreen_observer_stop = None
+        if stop_event is not None:
+            stop_event.set()
+        thread = self.party_fullscreen_observer_thread
+        self.party_fullscreen_observer_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1)
+        self.party_mpv_fullscreen_state = None
+
     def show_host_party_window(self) -> None:
         if self.party_host_session is None:
             return
@@ -2587,98 +3169,61 @@ class WatchlistApp:
         win = tk.Toplevel(self.root)
         win.title("Watch Party Host")
         win.configure(bg=COLORS["bg"])
-        win.geometry("680x500")
+        win.geometry("1280x760")
         win.columnconfigure(0, weight=1)
-        win.rowconfigure(4, weight=1)
+        win.rowconfigure(1, weight=1)
         self.party_window = win
         media = self.party_current_media
         heading = media.party_title if media is not None else "Watch Party"
-        tk.Label(win, text=heading, bg=COLORS["bg"], fg=COLORS["text"], font=("", 16, "bold")).grid(
-            row=0, column=0, sticky="w", padx=14, pady=(14, 4)
-        )
-        tk.Label(win, textvariable=self.party_status_text, bg=COLORS["bg"], fg=COLORS["muted"], anchor="w").grid(
-            row=1, column=0, sticky="ew", padx=14
-        )
-        link_row = tk.Frame(win, bg=COLORS["bg"])
-        link_row.grid(row=2, column=0, sticky="ew", padx=14, pady=(10, 6))
-        link_row.columnconfigure(0, weight=1)
-        link_entry = tk.Entry(
-            link_row,
-            textvariable=self.party_link_var,
-            bg=COLORS["entry"],
-            fg=COLORS["text"],
-            insertbackground=COLORS["text"],
-            relief="flat",
-        )
-        link_entry.grid(row=0, column=0, sticky="ew", ipady=6)
-        ttk.Button(link_row, text="Copy Link", style="Dark.TButton", command=self.copy_party_link).grid(
-            row=0, column=1, padx=(8, 0)
-        )
-        controls = tk.Frame(win, bg=COLORS["bg"])
-        controls.grid(row=3, column=0, sticky="ew", padx=14, pady=(4, 8))
+        self.build_party_header(win, heading=heading, subheading=None, host=True)
+        _body, side = self.build_party_body(win)
+        controls = tk.Frame(side, bg=COLORS["bg"])
+        controls.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        for column in range(4):
+            controls.columnconfigure(column, weight=1)
         for idx, (text, command, style) in enumerate(
             [
-                ("Play", lambda: self.host_party_control("play"), "Accent.TButton"),
-                ("Pause", lambda: self.host_party_control("pause"), "Dark.TButton"),
-                ("-10s", lambda: self.host_party_seek(-10), "Dark.TButton"),
-                ("+10s", lambda: self.host_party_seek(10), "Dark.TButton"),
-                ("Prev Episode", lambda: self.host_party_change_episode(-1), "Dark.TButton"),
-                ("Next Episode", lambda: self.host_party_change_episode(1), "Dark.TButton"),
-                ("End Party", self.end_host_party, "Dark.TButton"),
+                ("Play", lambda: self.host_party_control("play"), "Compact.Accent.TButton"),
+                ("Pause", lambda: self.host_party_control("pause"), "Compact.Dark.TButton"),
+                ("-10s", lambda: self.host_party_seek(-10), "Compact.Dark.TButton"),
+                ("+10s", lambda: self.host_party_seek(10), "Compact.Dark.TButton"),
+                ("Prev", lambda: self.host_party_change_episode(-1), "Compact.Dark.TButton"),
+                ("Next", lambda: self.host_party_change_episode(1), "Compact.Dark.TButton"),
+                ("Full", self.toggle_party_fullscreen, "Compact.Dark.TButton"),
+                ("End", self.end_host_party, "Compact.Dark.TButton"),
             ]
         ):
-            ttk.Button(controls, text=text, style=style, command=command).grid(row=0, column=idx, padx=(0, 6), pady=4)
-        participants_box = tk.Frame(win, bg=COLORS["panel"], highlightthickness=1, highlightbackground=COLORS["border"])
-        participants_box.grid(row=4, column=0, sticky="nsew", padx=14, pady=(0, 14))
-        participants_box.columnconfigure(0, weight=1)
-        participants_box.rowconfigure(1, weight=1)
-        tk.Label(participants_box, text="Participants", bg=COLORS["panel"], fg=COLORS["text"], font=("", 12, "bold")).grid(
-            row=0, column=0, sticky="w", padx=10, pady=(10, 4)
-        )
-        self.party_participant_list = tk.Listbox(
-            participants_box,
-            bg=COLORS["panel"],
-            fg=COLORS["text"],
-            selectbackground=COLORS["accent"],
-            selectforeground="#111111",
-            relief="flat",
-            highlightthickness=0,
-        )
-        self.party_participant_list.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 8))
-        action_row = tk.Frame(participants_box, bg=COLORS["panel"])
-        action_row.grid(row=2, column=0, sticky="ew", padx=10, pady=(0, 10))
-        ttk.Button(action_row, text="Refresh", style="Dark.TButton", command=self.render_host_party_participants).grid(
-            row=0, column=0, padx=(0, 8)
-        )
-        ttk.Button(action_row, text="Kick Selected", style="Dark.TButton", command=self.kick_selected_party_participant).grid(row=0, column=1)
+            ttk.Button(controls, text=text, style=style, command=command).grid(
+                row=idx // 4, column=idx % 4, padx=(0, 5), pady=3, sticky="ew"
+            )
+        self.build_party_activity_panel(side, row=1, column=0)
+        self.build_party_participants_panel(side, row=2, column=0, host=True)
         win.protocol("WM_DELETE_WINDOW", self.destroy_party_window)
+        self.configure_party_fullscreen_bindings()
+        self.seed_party_activity_from_state(self.party_host_session.room.public_state())
         self.render_host_party_participants()
+        self.schedule_host_party_event_poll()
 
     def show_joined_party_window(self, state: dict[str, object]) -> None:
         self.destroy_party_window()
         win = tk.Toplevel(self.root)
         win.title("Watch Party")
         win.configure(bg=COLORS["bg"])
-        win.geometry("520x260")
+        win.geometry("1280x760")
         win.columnconfigure(0, weight=1)
+        win.rowconfigure(1, weight=1)
         self.party_window = win
         media_payload = state.get("media") if isinstance(state.get("media"), dict) else {}
         media = WatchPartyMedia.from_json(media_payload)
-        tk.Label(win, text=media.party_title, bg=COLORS["bg"], fg=COLORS["text"], font=("", 16, "bold")).grid(
-            row=0, column=0, sticky="w", padx=14, pady=(14, 4)
-        )
-        tk.Label(
+        self.build_party_header(
             win,
-            text=f"{split_display_title(media.anime_title)[0]} episode {media.episode} ({media.mode})",
-            bg=COLORS["bg"],
-            fg=COLORS["muted"],
-            anchor="w",
-        ).grid(row=1, column=0, sticky="ew", padx=14)
-        tk.Label(win, textvariable=self.party_status_text, bg=COLORS["bg"], fg=COLORS["muted"], anchor="w").grid(
-            row=2, column=0, sticky="ew", padx=14, pady=(8, 0)
+            heading=media.party_title,
+            subheading=f"{split_display_title(media.anime_title)[0]} episode {media.episode} ({media.mode})",
+            host=False,
         )
-        username_row = tk.Frame(win, bg=COLORS["bg"])
-        username_row.grid(row=3, column=0, sticky="ew", padx=14, pady=(14, 6))
+        _body, side = self.build_party_body(win)
+        username_row = tk.Frame(side, bg=COLORS["bg"])
+        username_row.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         username_row.columnconfigure(1, weight=1)
         tk.Label(username_row, text="Username", bg=COLORS["bg"], fg=COLORS["muted"]).grid(row=0, column=0, padx=(0, 8))
         tk.Entry(
@@ -2689,23 +3234,40 @@ class WatchlistApp:
             insertbackground=COLORS["text"],
             relief="flat",
         ).grid(row=0, column=1, sticky="ew", ipady=6)
-        ttk.Button(username_row, text="Update", style="Dark.TButton", command=self.change_party_username).grid(
-            row=0, column=2, padx=(8, 0)
+        ttk.Button(username_row, text="Update", style="Compact.Dark.TButton", command=self.change_party_username).grid(
+            row=0, column=2, padx=(6, 0)
         )
-        ttk.Button(win, text="Leave Party", style="Dark.TButton", command=self.leave_joined_party).grid(
-            row=4, column=0, sticky="ew", padx=14, pady=(10, 0)
+        ttk.Button(username_row, text="Full", style="Compact.Dark.TButton", command=self.toggle_party_fullscreen).grid(
+            row=0, column=3, padx=(6, 0)
+        )
+        self.build_party_activity_panel(side, row=1, column=0)
+        self.build_party_participants_panel(side, row=2, column=0, host=False)
+        ttk.Button(side, text="Leave Party", style="Compact.Dark.TButton", command=self.leave_joined_party).grid(
+            row=3, column=0, sticky="ew", pady=(8, 0)
         )
         win.protocol("WM_DELETE_WINDOW", self.leave_joined_party)
+        self.configure_party_fullscreen_bindings()
+        self.seed_party_activity_from_state(state)
+        self.render_party_participants_from_state(state)
 
     def destroy_party_window(self) -> None:
         if self.party_window is None:
             return
+        self.stop_party_fullscreen_observer()
+        self.set_party_fullscreen(False, update_mpv=False)
         try:
             self.party_window.destroy()
         except tk.TclError:
             pass
         self.party_window = None
+        self.party_header_frame = None
+        self.party_body_frame = None
+        self.party_sidebar_frame = None
+        self.party_video_panel = None
+        self.party_video_frame = None
         self.party_participant_list = None
+        self.party_activity_text = None
+        self.party_fullscreen = False
 
     def copy_party_link(self) -> None:
         link = self.party_link_var.get()
@@ -2714,6 +3276,174 @@ class WatchlistApp:
         self.root.clipboard_clear()
         self.root.clipboard_append(link)
         self.party_status_text.set("Watch party link copied.")
+
+    def send_party_chat_message(self) -> None:
+        message = self.party_chat_var.get().strip()
+        if not message:
+            return
+        self.party_chat_var.set("")
+        if self.party_host_session is not None:
+            self.apply_host_party_pending_events()
+            try:
+                event = self.party_host_session.room.send_chat(
+                    message,
+                    username=self.party_host_session.room.host_username,
+                    host=True,
+                )
+            except WatchPartyError as exc:
+                messagebox.showwarning("Chat failed", str(exc))
+                return
+            self.apply_host_party_events([event.to_json()])
+            return
+        if self.party_client is not None:
+            try:
+                self.party_client.send_chat(message)
+            except WatchPartyError as exc:
+                messagebox.showwarning("Chat failed", str(exc))
+                return
+            self.party_status_text.set("Message sent.")
+
+    def render_party_participants(self, participants: list[object], *, empty_text: str = "No one has joined yet.") -> None:
+        if self.party_participant_list is None:
+            return
+        self.party_participant_ids = []
+        self.party_participant_list.delete(0, tk.END)
+        visible = [item for item in participants if isinstance(item, dict)]
+        if not visible:
+            self.party_participant_list.insert(tk.END, empty_text)
+            return
+        for participant in visible:
+            participant_id = str(participant.get("participant_id") or "")
+            color = str(participant.get("color") or "")
+            if participant_id and color:
+                self.party_user_colors[f"participant:{participant_id}"] = color
+            self.party_participant_ids.append(participant_id)
+            joined = local_time(str(participant.get("joined_at") or ""))
+            label = f"{participant.get('username') or 'Guest'}"
+            if joined:
+                label += f"  joined {joined}"
+            self.party_participant_list.insert(tk.END, label)
+
+    def render_party_participants_from_state(self, state: dict[str, object]) -> None:
+        participants = state.get("participants") if isinstance(state.get("participants"), list) else []
+        self.render_party_participants(participants)
+
+    def schedule_host_party_event_poll(self) -> None:
+        if self.shutting_down or self.party_host_session is None:
+            return
+        if self.party_host_event_job is not None:
+            try:
+                self.root.after_cancel(self.party_host_event_job)
+            except tk.TclError:
+                pass
+        self.party_host_event_job = self.root.after(PARTY_HOST_EVENT_POLL_MS, self.host_party_event_tick)
+
+    def host_party_event_tick(self) -> None:
+        self.party_host_event_job = None
+        if self.shutting_down or self.party_host_session is None:
+            return
+        self.apply_host_party_pending_events()
+        self.schedule_host_party_event_poll()
+
+    def apply_host_party_pending_events(self) -> None:
+        if self.party_host_session is None:
+            return
+        events = self.party_host_session.room.events_since(self.party_host_latest_sequence, timeout=0.0)
+        self.apply_host_party_events([event.to_json() for event in events])
+
+    def apply_host_party_events(self, events: list[dict[str, object]]) -> None:
+        if not events:
+            return
+        self.apply_party_activity_events(events)
+        for event in events:
+            self.party_host_latest_sequence = max(self.party_host_latest_sequence, int(event.get("sequence") or 0))
+        if any(self.party_event_updates_participants(str(event.get("event_type") or "")) for event in events):
+            self.render_host_party_participants()
+
+    def party_event_updates_participants(self, event_type: str) -> bool:
+        return event_type in {"participant_joined", "participant_left", "participant_updated", "participant_kicked"}
+
+    def start_host_party_mpv_observer(self) -> None:
+        self.stop_host_party_mpv_observer()
+        controller = self.party_playback_controller
+        if self.party_host_session is None or controller is None:
+            return
+        stop_event = threading.Event()
+        self.party_host_observer_stop = stop_event
+
+        def worker() -> None:
+            last_snapshot: dict[str, object] | None = None
+            last_wall = monotonic()
+            while not stop_event.is_set():
+                if not controller.available():
+                    stop_event.wait(0.5)
+                    continue
+                snapshot = controller.snapshot()
+                now = monotonic()
+                if snapshot is None:
+                    stop_event.wait(PARTY_HOST_MPV_OBSERVER_INTERVAL_SECONDS)
+                    continue
+                if last_snapshot is not None and now >= self.party_host_observer_ignore_until:
+                    action = self.detect_host_mpv_action(last_snapshot, snapshot, now - last_wall)
+                    if action is not None:
+                        self.run_on_ui(
+                            lambda value=action, snap=dict(snapshot): self.host_party_observed_control(value, snap)
+                        )
+                last_snapshot = snapshot
+                last_wall = now
+                stop_event.wait(PARTY_HOST_MPV_OBSERVER_INTERVAL_SECONDS)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        self.party_host_observer_thread = thread
+        thread.start()
+
+    def stop_host_party_mpv_observer(self) -> None:
+        stop_event = self.party_host_observer_stop
+        self.party_host_observer_stop = None
+        if stop_event is not None:
+            stop_event.set()
+        thread = self.party_host_observer_thread
+        self.party_host_observer_thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1)
+
+    def detect_host_mpv_action(
+        self,
+        previous: dict[str, object],
+        current: dict[str, object],
+        elapsed_seconds: float,
+    ) -> str | None:
+        previous_paused = bool(previous.get("paused"))
+        current_paused = bool(current.get("paused"))
+        if current_paused != previous_paused:
+            return "pause" if current_paused else "play"
+        try:
+            previous_position = float(previous.get("position_seconds") or 0.0)
+            current_position = float(current.get("position_seconds") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        expected_position = previous_position if previous_paused else previous_position + max(0.0, elapsed_seconds)
+        if abs(current_position - expected_position) >= PARTY_HOST_MPV_SEEK_THRESHOLD_SECONDS:
+            return "seek"
+        return None
+
+    def host_party_observed_control(self, action: str, snapshot: dict[str, object]) -> None:
+        if self.party_host_session is None:
+            return
+        self.apply_host_party_pending_events()
+        payload: dict[str, object] = {
+            "position_seconds": float(snapshot.get("position_seconds") or 0.0),
+        }
+        if self.party_current_media is not None:
+            payload["episode"] = self.party_current_media.episode
+        try:
+            event = self.party_host_session.room.control(action, payload)
+        except WatchPartyError as exc:
+            self.party_status_text.set(f"Host player sync failed: {exc}")
+            return
+        self.apply_host_party_events([event.to_json()])
+        label = "pause" if action == "pause" else "play" if action == "play" else "seek"
+        self.party_status_text.set(f"Synced host player {label} to the watch party.")
 
     def schedule_host_party_refresh(self) -> None:
         if self.shutting_down or self.party_host_session is None:
@@ -2750,7 +3480,7 @@ class WatchlistApp:
         self.schedule_host_party_state_sync()
 
     def cancel_host_party_jobs(self) -> None:
-        for attr in ("party_host_refresh_job", "party_host_state_sync_job"):
+        for attr in ("party_host_refresh_job", "party_host_state_sync_job", "party_host_event_job"):
             job = getattr(self, attr)
             if job is not None:
                 try:
@@ -2778,17 +3508,7 @@ class WatchlistApp:
         self.publish_host_party_state()
         state = self.party_host_session.room.public_state()
         participants = list(state.get("participants") or [])
-        self.party_participant_ids = []
-        self.party_participant_list.delete(0, tk.END)
-        if not participants:
-            self.party_participant_list.insert(tk.END, "No one has joined yet.")
-            return
-        for participant in participants:
-            if not isinstance(participant, dict):
-                continue
-            self.party_participant_ids.append(str(participant.get("participant_id") or ""))
-            joined = local_time(str(participant.get("joined_at") or ""))
-            self.party_participant_list.insert(tk.END, f"{participant.get('username') or 'Guest'}  joined {joined}")
+        self.render_party_participants(participants)
 
     def kick_selected_party_participant(self) -> None:
         if self.party_host_session is None or self.party_participant_list is None:
@@ -2815,12 +3535,14 @@ class WatchlistApp:
         snapshot = self.publish_host_party_state()
         if snapshot is not None and payload.get("position_seconds") is None:
             payload["position_seconds"] = float(snapshot.get("position_seconds") or 0.0)
+        self.party_host_observer_ignore_until = monotonic() + 1.25
         self.apply_local_party_control(action, payload)
         try:
-            self.party_host_session.room.control(action, payload)
+            event = self.party_host_session.room.control(action, payload)
         except WatchPartyError as exc:
             messagebox.showwarning("Watch party control failed", str(exc))
             return
+        self.apply_host_party_events([event.to_json()])
         self.party_status_text.set(f"Sent {action.replace('_', ' ')} to the watch party.")
 
     def host_party_seek(self, delta_seconds: int) -> None:
@@ -2842,6 +3564,8 @@ class WatchlistApp:
             messagebox.showinfo("Episode unavailable", "There is no episode in that direction.")
             return
         next_episode = episodes[next_index]
+        self.stop_party_fullscreen_observer()
+        self.stop_host_party_mpv_observer()
         previous_controller = self.party_playback_controller
         if previous_controller is not None:
             try:
@@ -2860,14 +3584,25 @@ class WatchlistApp:
         )
         ipc_path = party_ipc_path(f"host-{self.party_host_session.room.room_id}-{next_episode}")
         try:
-            self.launch_party_media(media, ipc_path)
+            self.launch_party_media(media, ipc_path, embed_wid=self.party_embed_window_id())
         except LaunchError as exc:
             messagebox.showwarning("ani-cli launch failed", str(exc))
             return
         self.party_current_media = media
         self.party_playback_controller = MpvIpcController(ipc_path)
         action = "next_episode" if direction > 0 else "previous_episode"
-        self.host_party_control(action, {"episode": next_episode, "media": media.to_json(), "position_seconds": 0.0})
+        self.host_party_control(
+            action,
+            {
+                "episode": next_episode,
+                "media": media.to_json(),
+                "position_seconds": 0.0,
+                "paused": True,
+                "sync_pending": True,
+            },
+        )
+        self.start_party_fullscreen_observer()
+        self.start_host_party_mpv_observer()
 
     def apply_local_party_control(self, action: str, payload: dict[str, object]) -> None:
         controller = self.party_playback_controller
@@ -2889,6 +3624,8 @@ class WatchlistApp:
 
     def end_host_party(self, show_message: bool = True) -> None:
         self.cancel_host_party_jobs()
+        self.stop_party_fullscreen_observer()
+        self.stop_host_party_mpv_observer()
         session = self.party_host_session
         self.party_host_session = None
         if session is not None:
@@ -2919,9 +3656,12 @@ class WatchlistApp:
 
     def apply_party_events(self, payload: dict[str, object]) -> None:
         events = payload.get("events") if isinstance(payload.get("events"), list) else []
-        for event in events:
-            if not isinstance(event, dict):
-                continue
+        event_dicts = [event for event in events if isinstance(event, dict)]
+        self.apply_party_activity_events(event_dicts)
+        state = payload.get("state") if isinstance(payload.get("state"), dict) else None
+        if state is not None:
+            self.render_party_participants_from_state(state)
+        for event in event_dicts:
             event_type = str(event.get("event_type") or "")
             event_payload = event.get("payload") if isinstance(event.get("payload"), dict) else {}
             if event_type == "participant_kicked":
@@ -2951,6 +3691,7 @@ class WatchlistApp:
                 if media_payload is None:
                     continue
                 media = WatchPartyMedia.from_json(media_payload)
+                self.stop_party_fullscreen_observer()
                 previous_controller = self.party_playback_controller
                 if previous_controller is not None:
                     try:
@@ -2959,16 +3700,17 @@ class WatchlistApp:
                         pass
                 ipc_path = party_ipc_path(f"join-{self.party_client.participant_id if self.party_client else 'guest'}-{media.episode}")
                 try:
-                    self.launch_party_media(media, ipc_path)
+                    self.launch_party_media(media, ipc_path, embed_wid=self.party_embed_window_id())
                 except LaunchError as exc:
                     self.party_status_text.set(f"Episode launch failed: {exc}")
                     continue
                 self.party_current_media = media
                 self.party_playback_controller = MpvIpcController(ipc_path)
+                self.start_party_fullscreen_observer()
                 self.party_status_text.set(f"Host changed to episode {media.episode}.")
                 playback_state = event_payload.get("playback_state") if isinstance(event_payload.get("playback_state"), dict) else None
-                if playback_state is not None:
-                    self.apply_party_playback_state(playback_state, wait_for_socket=True)
+                sync_state = state if state is not None else {"media": media_payload, "playback_state": playback_state}
+                self.start_party_force_sync("episode change", state=sync_state)
 
     def change_party_username(self) -> None:
         if self.party_client is None:
@@ -2985,6 +3727,7 @@ class WatchlistApp:
 
     def leave_joined_party(self) -> None:
         self.party_join_polling = False
+        self.stop_party_fullscreen_observer()
         client = self.party_client
         self.party_client = None
         if client is not None:

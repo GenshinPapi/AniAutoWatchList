@@ -628,15 +628,19 @@ def launch_episode(
     prefer_terminal: bool = True,
     allanime_id: str | None = None,
     mpv_ipc_path: str | None = None,
+    mpv_wid: int | str | None = None,
 ) -> LaunchResult:
     command = build_ani_cli_command(title, episode, mode=mode, allanime_id=allanime_id)
     used_terminal = False
     if prefer_terminal:
         command, used_terminal = build_terminal_command(command)
     env = None
-    if mpv_ipc_path:
+    if mpv_ipc_path or mpv_wid:
         env = os.environ.copy()
-        env["ANI_WATCH_MPV_IPC"] = str(mpv_ipc_path)
+        if mpv_ipc_path:
+            env["ANI_WATCH_MPV_IPC"] = str(mpv_ipc_path)
+        if mpv_wid:
+            env["ANI_WATCH_MPV_WID"] = str(mpv_wid)
     try:
         if env is None:
             process = subprocess.Popen(command, start_new_session=True)
