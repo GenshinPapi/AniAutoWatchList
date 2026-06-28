@@ -397,9 +397,12 @@ def test_launch_episode_resolves_ani_cli_and_does_not_block(monkeypatch) -> None
     class FakeProcess:
         pid = 4321
 
-    def fake_popen(command: list[str], *, start_new_session: bool):
+    def fake_popen(command: list[str], *, start_new_session: bool, env: dict[str, str], stdout=None, stderr=None):
         seen["command"] = command
         seen["start_new_session"] = start_new_session
+        seen["mpv_extra"] = env.get("ANI_WATCH_MPV_EXTRA_ARGS")
+        seen["stdout"] = stdout
+        seen["stderr"] = stderr
         return FakeProcess()
 
     monkeypatch.setattr(launcher.shutil, "which", fake_which)
@@ -423,6 +426,9 @@ def test_launch_episode_resolves_ani_cli_and_does_not_block(monkeypatch) -> None
     assert result.pid == 4321
     assert result.used_terminal is False
     assert seen["start_new_session"] is True
+    assert seen["mpv_extra"] == launcher.DEFAULT_MPV_EXTRA_ARGS
+    assert seen["stdout"] is None
+    assert seen["stderr"] is None
 
 
 def test_launch_episode_can_pass_mpv_ipc_and_wid(monkeypatch) -> None:
@@ -436,11 +442,14 @@ def test_launch_episode_can_pass_mpv_ipc_and_wid(monkeypatch) -> None:
     class FakeProcess:
         pid = 4322
 
-    def fake_popen(command: list[str], *, start_new_session: bool, env: dict[str, str]):
+    def fake_popen(command: list[str], *, start_new_session: bool, env: dict[str, str], stdout=None, stderr=None):
         seen["command"] = command
         seen["start_new_session"] = start_new_session
         seen["ipc"] = env.get("ANI_WATCH_MPV_IPC")
         seen["wid"] = env.get("ANI_WATCH_MPV_WID")
+        seen["mpv_extra"] = env.get("ANI_WATCH_MPV_EXTRA_ARGS")
+        seen["stdout"] = stdout
+        seen["stderr"] = stderr
         return FakeProcess()
 
     monkeypatch.setattr(launcher.shutil, "which", fake_which)
@@ -466,3 +475,44 @@ def test_launch_episode_can_pass_mpv_ipc_and_wid(monkeypatch) -> None:
     assert result.pid == 4322
     assert seen["ipc"] == "/tmp/party.sock"
     assert seen["wid"] == "12345"
+    assert seen["mpv_extra"] == launcher.DEFAULT_MPV_EXTRA_ARGS
+
+
+def test_launch_episode_can_detach_and_quiet_embedded_playback(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_which(name: str) -> str | None:
+        if name == "ani-cli":
+            return "/home/me/.local/bin/ani-cli"
+        return None
+
+    class FakeProcess:
+        pid = 4323
+
+    def fake_popen(command: list[str], *, start_new_session: bool, env: dict[str, str], stdout=None, stderr=None):
+        seen["command"] = command
+        seen["start_new_session"] = start_new_session
+        seen["ipc"] = env.get("ANI_WATCH_MPV_IPC")
+        seen["mpv_extra"] = env.get("ANI_WATCH_MPV_EXTRA_ARGS")
+        seen["stdout"] = stdout
+        seen["stderr"] = stderr
+        return FakeProcess()
+
+    monkeypatch.setattr(launcher.shutil, "which", fake_which)
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+
+    result = launcher.launch_episode(
+        "One Piece",
+        "1090",
+        prefer_terminal=False,
+        mpv_ipc_path="/tmp/party.sock",
+        detach_player=True,
+        quiet=True,
+    )
+
+    assert "--no-detach" not in result.command
+    assert result.pid == 4323
+    assert seen["ipc"] == "/tmp/party.sock"
+    assert seen["mpv_extra"] == launcher.DEFAULT_MPV_EXTRA_ARGS
+    assert seen["stdout"] == launcher.subprocess.DEVNULL
+    assert seen["stderr"] == launcher.subprocess.DEVNULL

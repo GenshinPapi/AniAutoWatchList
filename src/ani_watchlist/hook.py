@@ -4,7 +4,6 @@ import argparse
 import json
 import sys
 import traceback
-from pathlib import Path
 from typing import Any
 
 from .config import load_config

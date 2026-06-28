@@ -18,7 +18,7 @@ from .db import initialize
 from .discovery import load_discovery, refresh_discovery
 from .doctor import run_doctor
 from .launcher import LaunchError, launch_episode
-from .metadata import refresh_metadata_for_anime, search_and_store_matches, select_match, set_anilist_id
+from .metadata import refresh_metadata_for_anime, search_and_store_matches, set_anilist_id
 from .party import MpvIpcController, WatchPartyError, WatchPartyMedia, WatchPartyRemoteClient, party_ipc_path
 from .paths import get_paths
 from .providers.anilist import AniListProvider

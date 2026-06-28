@@ -47,6 +47,7 @@ ALLANIME_REFERER = "https://allmanga.to"
 ALLANIME_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
 ALLANIME_SEARCH_GQL = "query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name englishName nativeName availableEpisodes __typename } }}"
 ALLANIME_EPISODES_GQL = "query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}"
+DEFAULT_MPV_EXTRA_ARGS = "--video-sync=display-resample"
 
 
 @dataclass(frozen=True)
@@ -192,6 +193,7 @@ def build_ani_cli_command(
     *,
     mode: str = "sub",
     allanime_id: str | None = None,
+    detach_player: bool = False,
 ) -> list[str]:
     cleaned_title = title.strip()
     cleaned_episode = str(episode).strip()
@@ -201,10 +203,9 @@ def build_ani_cli_command(
         raise LaunchError("anime title is empty")
     if not cleaned_episode:
         raise LaunchError("episode is empty")
-    command = [
-        ani_cli or resolve_ani_cli(),
-        "--no-detach",
-    ]
+    command = [ani_cli or resolve_ani_cli()]
+    if not detach_player:
+        command.append("--no-detach")
     if cleaned_allanime_id:
         command.extend(["--allanime-id", cleaned_allanime_id])
     else:
@@ -629,23 +630,36 @@ def launch_episode(
     allanime_id: str | None = None,
     mpv_ipc_path: str | None = None,
     mpv_wid: int | str | None = None,
+    detach_player: bool = False,
+    quiet: bool = False,
 ) -> LaunchResult:
-    command = build_ani_cli_command(title, episode, mode=mode, allanime_id=allanime_id)
+    command = build_ani_cli_command(
+        title,
+        episode,
+        mode=mode,
+        allanime_id=allanime_id,
+        detach_player=detach_player,
+    )
     used_terminal = False
     if prefer_terminal:
         command, used_terminal = build_terminal_command(command)
     env = None
-    if mpv_ipc_path or mpv_wid:
+    mpv_extra_args = os.environ.get("ANI_WATCH_MPV_EXTRA_ARGS", DEFAULT_MPV_EXTRA_ARGS)
+    if mpv_ipc_path or mpv_wid or mpv_extra_args:
         env = os.environ.copy()
         if mpv_ipc_path:
             env["ANI_WATCH_MPV_IPC"] = str(mpv_ipc_path)
         if mpv_wid:
             env["ANI_WATCH_MPV_WID"] = str(mpv_wid)
+        if "ANI_WATCH_MPV_EXTRA_ARGS" not in env and mpv_extra_args:
+            env["ANI_WATCH_MPV_EXTRA_ARGS"] = mpv_extra_args
     try:
+        stdout = subprocess.DEVNULL if quiet else None
+        stderr = subprocess.DEVNULL if quiet else None
         if env is None:
-            process = subprocess.Popen(command, start_new_session=True)
+            process = subprocess.Popen(command, start_new_session=True, stdout=stdout, stderr=stderr)
         else:
-            process = subprocess.Popen(command, start_new_session=True, env=env)
+            process = subprocess.Popen(command, start_new_session=True, env=env, stdout=stdout, stderr=stderr)
     except OSError as exc:
         raise LaunchError(str(exc)) from exc
     return LaunchResult(command=command, pid=process.pid, used_terminal=used_terminal)

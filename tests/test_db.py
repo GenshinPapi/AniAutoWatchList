@@ -20,7 +20,7 @@ def test_migrations_create_required_tables(app_env):
         row["name"]
         for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
-    assert current_version(conn) == 2
+    assert current_version(conn) == 3
     assert {"anime", "episodes", "watch_events", "metadata_matches", "discovery_cache"}.issubset(tables)
 
 

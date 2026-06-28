@@ -7,7 +7,7 @@ from typing import Iterable
 from .paths import get_paths
 
 
-LATEST_SCHEMA_VERSION = 2
+LATEST_SCHEMA_VERSION = 3
 
 
 MIGRATIONS: dict[int, str] = {
@@ -90,6 +90,11 @@ MIGRATIONS: dict[int, str] = {
     );
 
     CREATE INDEX IF NOT EXISTS idx_discovery_cache_expires ON discovery_cache(expires_at);
+    """,
+    3: """
+    CREATE INDEX IF NOT EXISTS idx_episodes_anime_watched ON episodes(anime_id, watched);
+    CREATE INDEX IF NOT EXISTS idx_episodes_watched ON episodes(watched);
+    CREATE INDEX IF NOT EXISTS idx_watch_events_anime_created ON watch_events(anime_id, created_at DESC, id DESC);
     """,
 }
 

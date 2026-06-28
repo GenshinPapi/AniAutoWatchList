@@ -691,11 +691,14 @@ class WatchPartyHostSession:
     def public(self) -> bool:
         return self.tunnel is not None
 
-    def close(self) -> None:
-        try:
-            self.room.end()
-        except Exception:
-            pass
+    def close(self, *, notify_guests: bool = True, notify_grace_seconds: float = 0.0) -> None:
+        if notify_guests:
+            try:
+                self.room.end()
+            except Exception:
+                pass
+        if notify_grace_seconds > 0:
+            time.sleep(notify_grace_seconds)
         if self.tunnel is not None:
             self.tunnel.close()
             self.tunnel = None

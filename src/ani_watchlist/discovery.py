@@ -397,6 +397,8 @@ def related_media(
     *,
     provider: AniListProvider | None = None,
     cache_covers: bool = True,
+    max_depth: int = 6,
+    max_items: int = 24,
 ) -> dict[str, Any]:
     cleaned_id = str(media_id or "").strip()
     if not cleaned_id:
@@ -413,7 +415,7 @@ def related_media(
     try:
         items = [
             _normalize_media(item, provider if cache_covers else None)
-            for item in provider.get_related_anime(cleaned_id)
+            for item in provider.get_related_anime(cleaned_id, max_depth=max_depth, max_items=max_items)
         ]
         items.sort(
             key=lambda item: (

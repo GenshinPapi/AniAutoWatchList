@@ -107,7 +107,9 @@ class FakeDiscoveryProvider(AniListProvider):
         assert search == "One Piece"
         return self._media_items("trending", 0, min(limit, 3))
 
-    def get_related_anime(self, media_id: str | int):  # noqa: ANN201
+    def get_related_anime(self, media_id: str | int, *, max_depth: int = 6, max_items: int = 24):  # noqa: ANN201
+        assert max_depth == 6
+        assert max_items == 24
         assert str(media_id) == "21"
         item = self._media_items("popular", 0, 1)[0]
         item["relationType"] = "SEQUEL"

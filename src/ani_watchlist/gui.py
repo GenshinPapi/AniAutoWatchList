@@ -121,6 +121,7 @@ PARTY_FORCE_SYNC_TIMEOUT_SECONDS = 45.0
 PARTY_FORCE_SYNC_INTERVAL_SECONDS = 1.25
 PARTY_FORCE_SYNC_VERIFY_DELAY_SECONDS = 0.75
 PARTY_FORCE_SYNC_TOLERANCE_SECONDS = 3.0
+PARTY_HOST_END_NOTIFY_GRACE_SECONDS = 2.0
 PARTY_HOST_MPV_OBSERVER_INTERVAL_SECONDS = 0.75
 PARTY_HOST_MPV_SEEK_THRESHOLD_SECONDS = 3.0
 PARTY_FULLSCREEN_OBSERVER_INTERVAL_SECONDS = 0.5
@@ -274,6 +275,7 @@ class WatchlistApp:
         self.search_error: str | None = None
         self.search_suggestions: list[dict[str, object]] = []
         self.search_suggestion_job: str | None = None
+        self.library_filter_job: str | None = None
         self.search_suggestion_generation = 0
         self.search_generation = 0
         self.related_media_items: list[dict[str, object]] = []
@@ -282,6 +284,10 @@ class WatchlistApp:
         self.related_error: str | None = None
         self.related_anilist_id: int | None = None
         self.related_columns = 1
+        self.related_media_cache: dict[int, dict[str, object]] = {}
+        self.related_render_signature: tuple[object, ...] | None = None
+        self.detail_episode_signature: tuple[object, ...] | None = None
+        self.activity_signature: tuple[object, ...] | None = None
         self.episode_availability_refreshing: set[int] = set()
         self.party_host_session = None
         self.party_client: WatchPartyRemoteClient | None = None
@@ -317,6 +323,7 @@ class WatchlistApp:
         self.party_mpv_fullscreen_state: bool | None = None
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
+        self.library_render_signature: tuple[object, ...] | None = None
         self.discovery_pages: dict[str, tk.Frame] = {}
         self.discovery_status_labels: dict[str, tk.Label] = {}
         self.discovery_page_labels: dict[str, tk.Label] = {}
@@ -588,7 +595,7 @@ class WatchlistApp:
             highlightcolor=COLORS["accent"],
         )
         self.search_entry.grid(row=0, column=0, sticky="ew", ipady=8)
-        self.search_entry.bind("<KeyRelease>", lambda _event: self.refresh_library())
+        self.search_entry.bind("<KeyRelease>", lambda _event: self.schedule_library_filter_refresh())
         self.dashboard_label = tk.Label(toolbar, text="", bg=COLORS["bg"], fg=COLORS["muted"], justify="right")
         self.dashboard_label.grid(row=0, column=1, padx=(14, 0), sticky="e")
 
@@ -1263,6 +1270,7 @@ class WatchlistApp:
             "idle_countdown_job",
             "auto_refresh_job",
             "search_suggestion_job",
+            "library_filter_job",
             "party_host_refresh_job",
             "party_host_state_sync_job",
             "party_host_event_job",
@@ -1274,22 +1282,20 @@ class WatchlistApp:
                 except tk.TclError:
                     pass
                 setattr(self, attr, None)
+        if self.party_client is not None:
+            self.finish_joined_party("Watch party closed.", send_leave=True, show_message=False)
+        self.stop_host_party_mpv_observer()
+        if self.party_host_session is not None:
+            session = self.party_host_session
+            self.party_host_session = None
+            try:
+                session.close(notify_grace_seconds=0.25)
+            except Exception:
+                pass
         self.dismiss_idle_prompt()
         self.party_join_polling = False
         self.stop_party_fullscreen_observer()
-        if self.party_client is not None:
-            try:
-                self.party_client.leave()
-            except Exception:
-                pass
-            self.party_client = None
-        self.stop_host_party_mpv_observer()
-        if self.party_host_session is not None:
-            try:
-                self.party_host_session.close()
-            except Exception:
-                pass
-            self.party_host_session = None
+        self.stop_party_playback()
         self.destroy_party_window()
         try:
             self.conn.close()
@@ -1318,7 +1324,7 @@ class WatchlistApp:
                 self.refresh_library(preserve_scroll=True)
             elif self.current_page == "detail":
                 focused = self.safe_focus_get()
-                if focused is not self.notes:
+                if focused is not self.notes and self.party_playback_controller is None:
                     self.load_detail()
                 self.refresh_activity()
         finally:
@@ -1329,6 +1335,21 @@ class WatchlistApp:
             return self.root.focus_get()
         except (KeyError, tk.TclError):
             return None
+
+    def schedule_library_filter_refresh(self) -> None:
+        if self.shutting_down:
+            return
+        if self.library_filter_job is not None:
+            try:
+                self.root.after_cancel(self.library_filter_job)
+            except tk.TclError:
+                pass
+            self.library_filter_job = None
+        self.library_filter_job = self.root.after(SEARCH_DEBOUNCE_MS, self.run_library_filter_refresh)
+
+    def run_library_filter_refresh(self) -> None:
+        self.library_filter_job = None
+        self.refresh_library()
 
     def refresh_library(self, preserve_scroll: bool = False) -> None:
         scroll = self.grid_canvas.yview()[0] if preserve_scroll else 0.0
@@ -1346,12 +1367,40 @@ class WatchlistApp:
         if preserve_scroll:
             self.grid_canvas.yview_moveto(scroll)
 
+    def cover_signature_marker(self, cover_path: object) -> object:
+        if not isinstance(cover_path, str) or not cover_path:
+            return cover_path
+        cover_marker: object = cover_path
+        try:
+            cover_marker = (cover_path, os.path.getmtime(cover_path))
+        except OSError:
+            cover_marker = (cover_path, None)
+        return cover_marker
+
+    def library_row_signature(self, row) -> tuple[object, ...]:
+        return (
+            int(row["id"]),
+            row["display_title"],
+            row["status"],
+            int(row["watched_count"] or 0),
+            row["available_episode_count"],
+            row["total_episodes"],
+            row["last_watched_at"],
+            self.cover_signature_marker(row["cover_path"]),
+        )
+
     def render_grid(self) -> None:
+        width = max(self.grid_canvas.winfo_width(), CARD_W)
+        columns = max(1, width // CARD_W)
+        signature = (columns, tuple(self.library_row_signature(row) for row in self.current_rows))
+        if signature == self.library_render_signature and self.grid_frame.winfo_children():
+            self.grid_columns = columns
+            self._update_grid_scroll_region()
+            return
+        self.library_render_signature = signature
         for child in self.grid_frame.winfo_children():
             child.destroy()
         self.card_widgets.clear()
-        width = max(self.grid_canvas.winfo_width(), CARD_W)
-        columns = max(1, width // CARD_W)
         self.grid_columns = columns
         for index, row in enumerate(self.current_rows):
             card = self.create_card(row)
@@ -1540,15 +1589,28 @@ class WatchlistApp:
 
     def refresh_dashboard(self) -> None:
         counts = status_counts(self.conn)
-        self.dashboard_label.configure(
-            text=f"Total {sum(counts.values())}   Watching {counts['watching']}   Watched eps {watched_episode_count(self.conn)}"
-        )
+        text = f"Total {sum(counts.values())}   Watching {counts['watching']}   Watched eps {watched_episode_count(self.conn)}"
+        if self.dashboard_label.cget("text") != text:
+            self.dashboard_label.configure(text=text)
 
     def refresh_activity(self) -> None:
         if not hasattr(self, "activity_list"):
             return
+        events = watch_events(self.conn, recent=12)
+        signature = tuple(
+            (
+                int(event["id"]),
+                event["created_at"],
+                event["event_type"],
+                event["anime_title"],
+            )
+            for event in events
+        )
+        if signature == self.activity_signature:
+            return
+        self.activity_signature = signature
         self.activity_list.delete(0, tk.END)
-        for event in watch_events(self.conn, recent=12):
+        for event in events:
             title, _alt_title = split_display_title(event["anime_title"] or "-")
             self.activity_list.insert(tk.END, f"{local_time(event['created_at'])}  {event['event_type']}  {title}")
 
@@ -1859,10 +1921,37 @@ class WatchlistApp:
     def render_related_media(self) -> None:
         if not hasattr(self, "related_frame"):
             return
-        for child in self.related_frame.winfo_children():
-            child.destroy()
         width = max(self.detail_canvas.winfo_width(), DISCOVERY_GRID_W)
         columns = max(1, width // DISCOVERY_GRID_W)
+        item_signature = []
+        for item in self.related_media_items:
+            next_ep = item.get("next_airing_episode") if isinstance(item.get("next_airing_episode"), dict) else {}
+            item_signature.append(
+                (
+                    item.get("id"),
+                    item.get("display_title"),
+                    item.get("relation_label"),
+                    item.get("average_score"),
+                    item.get("trending"),
+                    item.get("status"),
+                    next_ep.get("episode") if isinstance(next_ep, dict) else None,
+                    self.cover_signature_marker(item.get("cover_path")),
+                )
+            )
+        signature = (
+            columns,
+            self.related_loading,
+            self.related_error,
+            self.related_anilist_id,
+            tuple(item_signature),
+        )
+        if signature == self.related_render_signature and self.related_frame.winfo_children():
+            self.related_columns = columns
+            self._update_detail_scroll_region()
+            return
+        self.related_render_signature = signature
+        for child in self.related_frame.winfo_children():
+            child.destroy()
         self.related_columns = columns
         if self.related_loading:
             self.related_status_label.configure(text="Loading related seasons from AniList...", fg=COLORS["muted"])
@@ -2114,6 +2203,16 @@ class WatchlistApp:
             self.render_related_media()
             return
         if self.related_anilist_id == media_id_int and (self.related_loading or self.related_loaded):
+            if hasattr(self, "related_frame") and not self.related_frame.winfo_children():
+                self.render_related_media()
+            return
+        cached_payload = self.related_media_cache.get(media_id_int)
+        if cached_payload is not None:
+            self.related_anilist_id = media_id_int
+            self.related_loading = False
+            self.related_loaded = True
+            self.related_error = str(cached_payload.get("error")) if cached_payload.get("error") else None
+            self.related_media_items = [item for item in list(cached_payload.get("items") or []) if isinstance(item, dict)]
             self.render_related_media()
             return
         self.related_anilist_id = media_id_int
@@ -2124,7 +2223,7 @@ class WatchlistApp:
         self.render_related_media()
 
         def worker() -> None:
-            payload = related_media(media_id_int, load_config(), cache_covers=True)
+            payload = related_media(media_id_int, load_config(), cache_covers=True, max_depth=3, max_items=16)
             self.run_on_ui(lambda: self.finish_related_media_refresh(media_id_int, payload))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -2136,6 +2235,7 @@ class WatchlistApp:
         self.related_loaded = True
         self.related_error = str(payload.get("error")) if payload.get("error") else None
         self.related_media_items = [item for item in list(payload.get("items") or []) if isinstance(item, dict)]
+        self.related_media_cache[media_id] = payload
         if self.current_page == "detail":
             self.render_related_media()
 
@@ -2191,19 +2291,33 @@ class WatchlistApp:
             self.notes.delete("1.0", tk.END)
             self.notes.insert("1.0", anime["notes"] or "")
         selected_episode = self.selected_episode_key()
-        self.episode_tree.delete(*self.episode_tree.get_children())
-        for episode in episodes:
-            self.episode_tree.insert(
-                "",
-                "end",
-                iid=episode["episode_key"],
-                values=(
-                    WATCHED_ICON if episode["watched"] else UNWATCHED_ICON,
+        episode_signature = (
+            int(anime["id"]),
+            tuple(
+                (
                     episode["episode_key"],
-                    local_time(episode["last_started_at"]),
-                    local_time(episode["watched_at"]),
-                ),
+                    int(episode["watched"] or 0),
+                    episode["last_started_at"],
+                    episode["watched_at"],
+                )
+                for episode in episodes
             )
+        )
+        if episode_signature != self.detail_episode_signature:
+            self.detail_episode_signature = episode_signature
+            self.episode_tree.delete(*self.episode_tree.get_children())
+            for episode in episodes:
+                self.episode_tree.insert(
+                    "",
+                    "end",
+                    iid=episode["episode_key"],
+                    values=(
+                        WATCHED_ICON if episode["watched"] else UNWATCHED_ICON,
+                        episode["episode_key"],
+                        local_time(episode["last_started_at"]),
+                        local_time(episode["watched_at"]),
+                    ),
+                )
         if selected_episode and self.episode_tree.exists(selected_episode):
             self.episode_tree.selection_set(selected_episode)
         self.refresh_activity()
@@ -2496,6 +2610,8 @@ class WatchlistApp:
                 mpv_ipc_path=ipc_path,
                 mpv_wid=self.party_embed_window_id(),
                 prefer_terminal=False,
+                detach_player=True,
+                quiet=True,
             )
         except LaunchError as exc:
             session.close()
@@ -2564,6 +2680,8 @@ class WatchlistApp:
             mpv_ipc_path=ipc_path,
             mpv_wid=embed_wid,
             prefer_terminal=False,
+            detach_player=True,
+            quiet=True,
         )
 
     def playback_state_target_position(self, playback_state: dict[str, object]) -> float:
@@ -3198,7 +3316,7 @@ class WatchlistApp:
             )
         self.build_party_activity_panel(side, row=1, column=0)
         self.build_party_participants_panel(side, row=2, column=0, host=True)
-        win.protocol("WM_DELETE_WINDOW", self.destroy_party_window)
+        win.protocol("WM_DELETE_WINDOW", lambda: self.end_host_party(show_message=False))
         self.configure_party_fullscreen_bindings()
         self.seed_party_activity_from_state(self.party_host_session.room.public_state())
         self.render_host_party_participants()
@@ -3268,6 +3386,55 @@ class WatchlistApp:
         self.party_participant_list = None
         self.party_activity_text = None
         self.party_fullscreen = False
+
+    def stop_party_playback(self) -> None:
+        self.party_force_sync_generation += 1
+        controller = self.party_playback_controller
+        self.party_playback_controller = None
+        if controller is None:
+            return
+        try:
+            controller.stop()
+        except Exception:
+            pass
+
+    def close_host_session_later(
+        self,
+        session,
+        *,
+        notify_guests: bool = True,
+        notify_grace_seconds: float = 0.0,
+    ) -> None:
+        def worker() -> None:
+            try:
+                session.close(notify_guests=notify_guests, notify_grace_seconds=notify_grace_seconds)
+            except Exception:
+                pass
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_joined_party(
+        self,
+        message: str,
+        *,
+        send_leave: bool = False,
+        show_message: bool = True,
+    ) -> None:
+        self.party_join_polling = False
+        client = self.party_client
+        self.party_client = None
+        self.party_current_media = None
+        self.stop_party_fullscreen_observer()
+        self.stop_party_playback()
+        if send_leave and client is not None:
+            try:
+                client.leave()
+            except WatchPartyError:
+                pass
+        self.destroy_party_window()
+        self.party_status_text.set(message)
+        if show_message:
+            messagebox.showinfo("Watch party", message)
 
     def copy_party_link(self) -> None:
         link = self.party_link_var.get()
@@ -3628,8 +3795,19 @@ class WatchlistApp:
         self.stop_host_party_mpv_observer()
         session = self.party_host_session
         self.party_host_session = None
+        self.party_join_polling = False
+        self.party_current_media = None
+        self.stop_party_playback()
         if session is not None:
-            session.close()
+            try:
+                session.room.end()
+            except Exception:
+                pass
+            self.close_host_session_later(
+                session,
+                notify_guests=False,
+                notify_grace_seconds=PARTY_HOST_END_NOTIFY_GRACE_SECONDS,
+            )
         self.destroy_party_window()
         if show_message:
             messagebox.showinfo("Watch party ended", "The watch party has ended.")
@@ -3651,8 +3829,7 @@ class WatchlistApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def party_poll_failed(self, error: str) -> None:
-        self.party_join_polling = False
-        self.party_status_text.set(f"Watch party connection lost: {error}")
+        self.finish_joined_party(f"Watch party connection lost: {error}", send_leave=False)
 
     def apply_party_events(self, payload: dict[str, object]) -> None:
         events = payload.get("events") if isinstance(payload.get("events"), list) else []
@@ -3667,16 +3844,10 @@ class WatchlistApp:
             if event_type == "participant_kicked":
                 participant = event_payload.get("participant") if isinstance(event_payload.get("participant"), dict) else {}
                 if self.party_client is not None and participant.get("participant_id") == self.party_client.participant_id:
-                    self.party_join_polling = False
-                    self.apply_local_party_control("stop", {})
-                    self.party_status_text.set("You were removed from the watch party.")
-                    messagebox.showinfo("Watch party", "You were removed from the watch party.")
+                    self.finish_joined_party("You were removed from the watch party.", send_leave=False)
                     return
             elif event_type == "party_ended":
-                self.party_join_polling = False
-                self.apply_local_party_control("stop", {})
-                self.party_status_text.set("The host ended the watch party.")
-                messagebox.showinfo("Watch party", "The host ended the watch party.")
+                self.finish_joined_party("The host ended the watch party.", send_leave=False)
                 return
             elif event_type in {"play", "pause", "seek", "relative_seek", "playback_state"}:
                 playback_state = event_payload.get("playback_state") if isinstance(event_payload.get("playback_state"), dict) else None
@@ -3726,16 +3897,7 @@ class WatchlistApp:
         self.party_status_text.set(f"Username changed to {username}.")
 
     def leave_joined_party(self) -> None:
-        self.party_join_polling = False
-        self.stop_party_fullscreen_observer()
-        client = self.party_client
-        self.party_client = None
-        if client is not None:
-            try:
-                client.leave()
-            except WatchPartyError:
-                pass
-        self.destroy_party_window()
+        self.finish_joined_party("Left the watch party.", send_leave=True, show_message=False)
 
     def reorder_selected(self, direction: int) -> None:
         if self.selected_anime_id is None:
