@@ -52,7 +52,7 @@ from .party import (
 )
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
-from .updater import UpdateInfo, check_for_update, launch_update
+from .updater import UpdateInfo, check_ani_cli_update, check_for_update, launch_update
 from .store import (
     STATUSES,
     clean_display_title,
@@ -1738,24 +1738,53 @@ class WatchlistApp:
 
         def worker() -> None:
             info: UpdateInfo | None = None
+            ani_cli_info: UpdateInfo | None = None
             try:
                 info = check_for_update()
             except Exception:
                 info = None
-            self.run_on_ui(lambda: self.finish_update_check(info))
+            try:
+                ani_cli_info = check_ani_cli_update()
+            except Exception:
+                ani_cli_info = None
+            self.run_on_ui(lambda app_info=info, bundled_info=ani_cli_info: self.finish_update_check(app_info, bundled_info))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def finish_update_check(self, info: UpdateInfo | None) -> None:
-        self.update_checking = False
-        if info is None or not info.update_available:
-            return
+    def update_details(self, label: str, info: UpdateInfo) -> str:
         local = info.local_commit[:7] if info.local_commit else info.local_version
         remote = info.remote_commit[:7] if info.remote_commit else info.remote_version or "latest"
-        details = f"Current: {info.local_version} ({local})\nLatest: {info.remote_version or 'unknown'} ({remote})"
+        details = f"{label}\nCurrent: {info.local_version} ({local})\nLatest: {info.remote_version or 'unknown'} ({remote})"
         if info.remote_message:
-            details += f"\n\nLatest commit: {info.remote_message}"
-        if not messagebox.askyesno("Update available", f"A newer AniAutoWatchList version is available.\n\n{details}\n\nUpdate now?"):
+            details += f"\nLatest commit: {info.remote_message}"
+        return details
+
+    def finish_update_check(self, info: UpdateInfo | None, ani_cli_info: UpdateInfo | None = None) -> None:
+        self.update_checking = False
+        app_update_available = info is not None and info.update_available
+        ani_cli_update_available = ani_cli_info is not None and ani_cli_info.update_available
+        if not app_update_available and not ani_cli_update_available:
+            return
+
+        sections: list[str] = []
+        if app_update_available and info is not None:
+            sections.append(self.update_details("AniAutoWatchList", info))
+        if ani_cli_update_available and ani_cli_info is not None:
+            sections.append(self.update_details("Bundled patched ani-cli", ani_cli_info))
+            sections.append(
+                "Use AniAutoWatchList updates for ani-cli changes. Direct ani-cli -U is disabled on the patched script so "
+                "watchlist hooks, embedded-player flags, and mp4 provider fixes stay installed."
+            )
+        details = "\n\n".join(sections)
+
+        if not app_update_available:
+            messagebox.showwarning(
+                "ani-cli update available",
+                f"Upstream ani-cli has newer changes than the bundled patched copy.\n\n{details}\n\n"
+                "A patched AniAutoWatchList update is needed before installing those upstream ani-cli changes safely.",
+            )
+            return
+        if not messagebox.askyesno("Update available", f"Updates are available.\n\n{details}\n\nUpdate AniAutoWatchList now?"):
             return
         try:
             result = launch_update()

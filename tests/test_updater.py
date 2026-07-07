@@ -11,11 +11,39 @@ def test_parse_version_from_package_source() -> None:
     assert updater.parse_version("no version here") is None
 
 
+def test_parse_ani_cli_version_and_upstream_commit() -> None:
+    source = 'version_number="4.14.1"\nani_watch_upstream_commit="b8032b72901721a1ce859ca2816e8e2c914bc616"\n'
+
+    assert updater.parse_ani_cli_version(source) == "4.14.1"
+    assert updater.parse_ani_cli_upstream_commit(source) == "b8032b72901721a1ce859ca2816e8e2c914bc616"
+
+
 def test_version_from_github_contents_payload() -> None:
     source = b'"""Package."""\n\n__version__ = "1.2.4"\n'
     payload = {"encoding": "base64", "content": base64.b64encode(source).decode("ascii")}
 
     assert updater.version_from_content_payload(payload) == "1.2.4"
+
+
+def test_ani_cli_version_from_github_contents_payload() -> None:
+    source = b'#!/bin/sh\nversion_number="4.14.1"\n'
+    payload = {"encoding": "base64", "content": base64.b64encode(source).decode("ascii")}
+
+    assert updater.ani_cli_version_from_content_payload(payload) == "4.14.1"
+
+
+def test_local_ani_cli_values_read_bundled_marker(tmp_path: Path) -> None:
+    script_dir = tmp_path / "ani-cli"
+    script_dir.mkdir()
+    (script_dir / "ani-cli").write_text(
+        'version_number="4.14.1"\nani_watch_upstream_commit="b8032b72901721a1ce859ca2816e8e2c914bc616"\n',
+        encoding="utf-8",
+    )
+
+    version, commit = updater.local_ani_cli_values(tmp_path)
+
+    assert version == "4.14.1"
+    assert commit == "b8032b72901721a1ce859ca2816e8e2c914bc616"
 
 
 def test_update_info_detects_remote_commit_change() -> None:
