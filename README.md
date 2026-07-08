@@ -55,6 +55,8 @@ The installer creates a virtual environment at:
 ~/.local/share/ani-watchlist/venv
 ```
 
+It installs the Python package dependencies used by the GUI and bundled `ani-cli` fixes into that virtual environment.
+
 It symlinks these commands into `~/.local/bin`:
 
 ```text
