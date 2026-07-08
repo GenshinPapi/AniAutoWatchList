@@ -32,6 +32,13 @@ def test_ani_cli_version_from_github_contents_payload() -> None:
     assert updater.ani_cli_version_from_content_payload(payload) == "4.14.1"
 
 
+def test_ani_cli_values_from_github_contents_payload() -> None:
+    source = b'#!/bin/sh\nversion_number="4.14.2"\nani_watch_upstream_commit="def4567"\n'
+    payload = {"encoding": "base64", "content": base64.b64encode(source).decode("ascii")}
+
+    assert updater.ani_cli_values_from_content_payload(payload) == ("4.14.2", "def4567")
+
+
 def test_local_ani_cli_values_read_bundled_marker(tmp_path: Path) -> None:
     script_dir = tmp_path / "ani-cli"
     script_dir.mkdir()
@@ -71,6 +78,39 @@ def test_update_info_falls_back_to_version_when_no_local_commit() -> None:
 
     assert info.update_available is True
     assert info.reason == "version"
+
+
+def test_check_ani_cli_update_uses_remote_bundled_patch(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(updater, "local_ani_cli_values", lambda root: ("4.14.1", "abc123"))
+    monkeypatch.setattr(updater, "remote_ani_cli_values", lambda *, timeout=8: ("4.14.2", "def456"))
+    monkeypatch.setattr(
+        updater,
+        "remote_git_commit",
+        lambda *, timeout=8: ("app456", "https://example.invalid/app456", "bundle ani-cli"),
+    )
+
+    info = updater.check_ani_cli_update(tmp_path)
+
+    assert info.update_available is True
+    assert info.local_commit == "abc123"
+    assert info.remote_commit == "def456"
+    assert info.remote_version == "4.14.2"
+    assert info.remote_message == "bundle ani-cli"
+
+
+def test_check_ani_cli_update_ignores_matching_bundled_patch(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(updater, "local_ani_cli_values", lambda root: ("4.14.1", "abc123"))
+    monkeypatch.setattr(updater, "remote_ani_cli_values", lambda *, timeout=8: ("4.14.1", "abc123"))
+    monkeypatch.setattr(
+        updater,
+        "remote_git_commit",
+        lambda *, timeout=8: ("app456", "https://example.invalid/app456", "unrelated app update"),
+    )
+
+    info = updater.check_ani_cli_update(tmp_path)
+
+    assert info.update_available is False
+    assert info.reason is None
 
 
 def test_build_update_command_runs_pull_then_installer(tmp_path: Path) -> None:

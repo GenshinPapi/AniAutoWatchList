@@ -19,10 +19,7 @@ GITHUB_REPO = "GenshinPapi/AniAutoWatchList"
 GITHUB_BRANCH = "main"
 GITHUB_API_COMMIT_URL = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{GITHUB_BRANCH}"
 GITHUB_CONTENT_INIT_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/src/ani_watchlist/__init__.py?ref={GITHUB_BRANCH}"
-ANI_CLI_REPO = "pystardust/ani-cli"
-ANI_CLI_BRANCH = "master"
-ANI_CLI_API_COMMIT_URL = f"https://api.github.com/repos/{ANI_CLI_REPO}/commits/{ANI_CLI_BRANCH}"
-ANI_CLI_CONTENT_SCRIPT_URL = f"https://api.github.com/repos/{ANI_CLI_REPO}/contents/ani-cli?ref={ANI_CLI_BRANCH}"
+GITHUB_CONTENT_ANI_CLI_URL = f"https://api.github.com/repos/{GITHUB_REPO}/contents/ani-cli/ani-cli?ref={GITHUB_BRANCH}"
 USER_AGENT = "ani-watchlist-update-check/0.1"
 VERSION_RE = re.compile(r"__version__\s*=\s*['\"]([^'\"]+)['\"]")
 ANI_CLI_VERSION_RE = re.compile(r"version_number\s*=\s*['\"]([^'\"]+)['\"]")
@@ -160,6 +157,13 @@ def ani_cli_version_from_content_payload(payload: dict[str, Any]) -> str | None:
     return parse_ani_cli_version(source) if source is not None else None
 
 
+def ani_cli_values_from_content_payload(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    source = source_from_content_payload(payload)
+    if source is None:
+        return None, None
+    return parse_ani_cli_version(source), parse_ani_cli_upstream_commit(source)
+
+
 def remote_version(*, timeout: int = 8) -> str | None:
     try:
         return version_from_content_payload(_request_json(GITHUB_CONTENT_INIT_URL, timeout=timeout))
@@ -169,9 +173,16 @@ def remote_version(*, timeout: int = 8) -> str | None:
 
 def remote_ani_cli_version(*, timeout: int = 8) -> str | None:
     try:
-        return ani_cli_version_from_content_payload(_request_json(ANI_CLI_CONTENT_SCRIPT_URL, timeout=timeout))
+        return ani_cli_version_from_content_payload(_request_json(GITHUB_CONTENT_ANI_CLI_URL, timeout=timeout))
     except UpdateError:
         return None
+
+
+def remote_ani_cli_values(*, timeout: int = 8) -> tuple[str | None, str | None]:
+    try:
+        return ani_cli_values_from_content_payload(_request_json(GITHUB_CONTENT_ANI_CLI_URL, timeout=timeout))
+    except UpdateError:
+        return None, None
 
 
 def version_key(value: str | None) -> tuple[int, ...]:
@@ -248,22 +259,14 @@ def local_ani_cli_values(root: Path | None = None) -> tuple[str, str | None]:
     return local_version, local_commit
 
 
-def remote_ani_cli_commit(*, timeout: int = 8) -> tuple[str, str | None, str | None]:
-    payload = _request_json(ANI_CLI_API_COMMIT_URL, timeout=timeout)
-    commit = str(payload.get("sha") or "").strip()
-    if not commit:
-        raise UpdateError("failed to check ani-cli updates: missing commit sha")
-    message = ((payload.get("commit") or {}).get("message") or "").splitlines()
-    return commit, str(payload.get("html_url") or "") or None, message[0] if message else None
-
-
 def check_ani_cli_update(root: Path | None = None, *, timeout: int = 8) -> UpdateInfo:
     repo_root = root or project_root()
     local_version, local_commit = local_ani_cli_values(repo_root)
-    remote_commit, remote_url, remote_message = remote_ani_cli_commit(timeout=timeout)
+    remote_version_value, remote_commit = remote_ani_cli_values(timeout=timeout)
+    _remote_app_commit, remote_url, remote_message = remote_git_commit(timeout=timeout)
     return update_info_from_values(
         local_version=local_version,
-        remote_version_value=remote_ani_cli_version(timeout=timeout),
+        remote_version_value=remote_version_value,
         local_commit=local_commit,
         remote_commit=remote_commit,
         remote_url=remote_url,

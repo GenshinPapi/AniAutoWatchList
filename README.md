@@ -222,7 +222,7 @@ When a watchlist entry has an AniList match, the detail page shows related anime
 
 When an anime is added from discovery/search or opened from the watchlist, the GUI checks AllAnime for currently released sub episodes and upserts those episode rows. This keeps the watchlist progress count and detail episode list populated before launching playback.
 
-Discovery and schedule data refresh from AniList at most once per local day on GUI startup, unless you press Refresh or use the CLI `--refresh` option. On startup, the GUI also checks GitHub for a newer `main` branch commit and checks whether upstream `pystardust/ani-cli` has moved beyond the bundled patched script. If an AniAutoWatchList update is available and you accept it, a terminal opens, pulls the latest code, reruns `scripts/install-user.sh`, and prompts you to relaunch the GUI.
+Discovery and schedule data refresh from AniList at most once per local day on GUI startup, unless you press Refresh or use the CLI `--refresh` option. On startup, the GUI also checks GitHub for a newer `main` branch commit and checks whether the AniAutoWatchList-bundled patched `ani-cli` has moved beyond the local installed copy. If an AniAutoWatchList update is available and you accept it, a terminal opens, pulls the latest code, reruns `scripts/install-user.sh`, and prompts you to relaunch the GUI.
 
 ## How ani-cli Is Patched
 

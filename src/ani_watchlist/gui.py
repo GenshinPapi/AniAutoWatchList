@@ -1780,7 +1780,7 @@ class WatchlistApp:
         if not app_update_available:
             if not messagebox.askyesno(
                 "ani-cli update available",
-                f"Upstream ani-cli has newer changes than the bundled patched copy.\n\n{details}\n\n"
+                f"A newer bundled patched ani-cli is available in AniAutoWatchList.\n\n{details}\n\n"
                 "Update AniAutoWatchList now? This pulls the latest patched AniAutoWatchList release, "
                 "which is how bundled ani-cli fixes are installed safely.",
             ):
