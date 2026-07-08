@@ -1778,14 +1778,20 @@ class WatchlistApp:
         details = "\n\n".join(sections)
 
         if not app_update_available:
-            messagebox.showwarning(
+            if not messagebox.askyesno(
                 "ani-cli update available",
                 f"Upstream ani-cli has newer changes than the bundled patched copy.\n\n{details}\n\n"
-                "A patched AniAutoWatchList update is needed before installing those upstream ani-cli changes safely.",
-            )
+                "Update AniAutoWatchList now? This pulls the latest patched AniAutoWatchList release, "
+                "which is how bundled ani-cli fixes are installed safely.",
+            ):
+                return
+            self.launch_managed_update()
             return
         if not messagebox.askyesno("Update available", f"Updates are available.\n\n{details}\n\nUpdate AniAutoWatchList now?"):
             return
+        self.launch_managed_update()
+
+    def launch_managed_update(self) -> None:
         try:
             result = launch_update()
         except Exception as exc:
