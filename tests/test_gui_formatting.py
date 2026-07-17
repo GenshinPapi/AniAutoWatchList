@@ -151,3 +151,30 @@ def test_ani_cli_only_update_prompt_can_launch_managed_update(monkeypatch) -> No
     assert "Update AniAutoWatchList now?" in prompts[0][1]
     assert "bundled ani-cli fixes are installed safely" in prompts[0][1]
     assert info_messages and info_messages[0][0] == "Update started"
+
+
+def test_manual_update_button_can_launch_managed_update(monkeypatch) -> None:
+    app = object.__new__(WatchlistApp)
+    prompts: list[tuple[str, str]] = []
+    info_messages: list[tuple[str, str]] = []
+    launches: list[bool] = []
+
+    def fake_askyesno(title: str, message: str) -> bool:
+        prompts.append((title, message))
+        return True
+
+    def fake_launch_update() -> UpdateLaunchResult:
+        launches.append(True)
+        return UpdateLaunchResult(command=["bash", "-lc", "true"], pid=123, used_terminal=True)
+
+    monkeypatch.setattr("ani_watchlist.gui.messagebox.askyesno", fake_askyesno)
+    monkeypatch.setattr("ani_watchlist.gui.messagebox.showinfo", lambda title, message: info_messages.append((title, message)))
+    monkeypatch.setattr("ani_watchlist.gui.messagebox.showwarning", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ani_watchlist.gui.launch_update", fake_launch_update)
+
+    app.prompt_managed_update()
+
+    assert launches == [True]
+    assert prompts and prompts[0][0] == "Update AniAutoWatchList"
+    assert "ani-cli -U" in prompts[0][1]
+    assert info_messages and info_messages[0][0] == "Update started"

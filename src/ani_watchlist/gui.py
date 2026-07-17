@@ -473,6 +473,20 @@ class WatchlistApp:
             button.grid(row=0, column=idx, padx=(0, 8), sticky="w")
             self.nav_buttons[page] = button
         self._build_global_search()
+        self.manual_update_button = tk.Button(
+            self.nav_bar,
+            text="Update App",
+            command=self.prompt_managed_update,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            activebackground=COLORS["accent"],
+            activeforeground="#111111",
+            relief="flat",
+            padx=14,
+            pady=8,
+            cursor="hand2",
+        )
+        self.manual_update_button.grid(row=0, column=6, padx=(8, 0), sticky="e")
         self.container = tk.Frame(self.root, bg=COLORS["bg"])
         self.container.grid(row=1, column=0, sticky="nsew")
         self.container.columnconfigure(0, weight=1)
@@ -1788,6 +1802,15 @@ class WatchlistApp:
             self.launch_managed_update()
             return
         if not messagebox.askyesno("Update available", f"Updates are available.\n\n{details}\n\nUpdate AniAutoWatchList now?"):
+            return
+        self.launch_managed_update()
+
+    def prompt_managed_update(self) -> None:
+        if not messagebox.askyesno(
+            "Update AniAutoWatchList",
+            "Pull the latest AniAutoWatchList changes from GitHub and rerun the user installer now?\n\n"
+            "Use this for bundled ani-cli fixes instead of running ani-cli -U directly.",
+        ):
             return
         self.launch_managed_update()
 
