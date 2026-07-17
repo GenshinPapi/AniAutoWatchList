@@ -402,13 +402,17 @@ save_allanime_crypto_cache() {
     _derived_key="$(derive_allanime_key_hex "$allanime_key_a" "$allanime_key_b" || true)"
     printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$' || return 0
     _tmp_file="${_cache_file}.$$"
-    {
+    if {
         printf 'key_a=%s\n' "$allanime_key_a"
         printf 'key_b=%s\n' "$allanime_key_b"
         printf 'epoch=%s\n' "$allanime_aa_epoch"
         printf 'build_id=%s\n' "$allanime_build_id"
         printf 'derived_key=%s\n' "$_derived_key"
-    } >"$_tmp_file" 2>/dev/null && mv "$_tmp_file" "$_cache_file" 2>/dev/null || rm -f "$_tmp_file"
+    } >"$_tmp_file" 2>/dev/null && mv "$_tmp_file" "$_cache_file" 2>/dev/null; then
+        :
+    else
+        rm -f "$_tmp_file"
+    fi
 }
 
 allanime_crypto_error_needs_refresh() {
