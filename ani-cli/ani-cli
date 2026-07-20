@@ -649,7 +649,9 @@ load_allanime_crypto_config() {
         _chunk_base="$(printf '%s' "$_app_url" | sed -nE 's|/entry/[^/]+\.js$|/chunks|p')"
         printf '%s' "$_app_js" | grep -Eo "\.\./chunks/[^\"',\\\\]+\.js" | sed 's|^\.\./chunks/||' | awk '!seen[$0]++' >"$_chunks_file"
         while IFS= read -r _chunk_path; do
-            [ -n "$_chunk_base" ] && [ -n "$_chunk_path" ] || continue
+            if [ -z "$_chunk_base" ] || [ -z "$_chunk_path" ]; then
+                continue
+            fi
             _candidate_url="$_chunk_base/$_chunk_path"
             _candidate_js="$(curl -L --connect-timeout 3 --max-time 8 -fsSL "$_candidate_url" 2>/dev/null || true)"
             _candidate_key_a="$(extract_allanime_key_a "$_candidate_js")"
@@ -922,7 +924,7 @@ make_aa_req_openssl() {
     else
         _ct_padded=$_ct_hex
     fi
-    _ct_bits=$((${#_ct_hex} / 2 * 8))
+    _ct_bits=$((${#_ct_hex} * 8 / 2))
     _len_block="$(printf '0000000000000000%016x' "$_ct_bits")"
     _tag_mask="$(hex_to_bin "${_iv_hex}00000001" | openssl enc -aes-256-ecb -K "$allanime_key" -nopad -e 2>/dev/null | od -An -tx1 | tr -d ' \n')"
     _tag="$(xor_hex16 "$(ghash "${_ct_padded}${_len_block}")" "$_tag_mask")"
