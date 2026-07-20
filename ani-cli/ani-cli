@@ -210,6 +210,113 @@ decode_provider_id() {
         tr -d '\n' | sed "s/\/clock/\/clock\.json/"
 }
 
+extract_links_from_provider_response() {
+    _provider_url=$1
+    _python_cmd="$(ani_watch_python || true)"
+    [ -n "$_python_cmd" ] || return 1
+
+    "$_python_cmd" -c '
+import html
+import re
+import sys
+
+provider_url = sys.argv[1]
+text = sys.stdin.read()
+seen = set()
+links = []
+
+
+def clean(value):
+    value = value or ""
+    for _ in range(3):
+        value = html.unescape(value)
+    replacements = {
+        "\\\\u0026": "&",
+        "\\\\u003D": "=",
+        "\\\\u003d": "=",
+        "\\\\u002F": "/",
+        "\\\\/": "/",
+        "\\\\&quot;": "\"",
+        "\\\\\"": "\"",
+    }
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    return value.replace("\\", "").strip()
+
+
+def normalized(value):
+    value = clean(value)
+    for _ in range(2):
+        value = html.unescape(value)
+        value = value.replace("\\\\u0026", "&").replace("\\\\u003D", "=").replace("\\\\u003d", "=")
+        value = value.replace("\\\\u002F", "/").replace("\\\\/", "/").replace("\\\\\"", "\"")
+    return value
+
+
+def quality_for_name(name, url=""):
+    label = (name or "").strip().lower()
+    if label in {"hls", "mp4", "direct", "iframe"}:
+        return name or ""
+    match = re.search(r"([1-9][0-9]{2,3})\s*p?", label)
+    if not match and not label:
+        match = re.search(r"([1-9][0-9]{2,3})\s*p?", url)
+    if match:
+        return match.group(1)
+    return {
+        "mobile": "144",
+        "lowest": "240",
+        "low": "360",
+        "sd": "480",
+        "hd": "720",
+        "full": "1080",
+        "quad": "1440",
+        "ultra": "2160",
+    }.get(label, name or "")
+
+
+def add(label, url):
+    url = clean(url)
+    if not url or not re.match(r"https?://", url):
+        return
+    if str(label or "").strip().lower().startswith("dash") or "/apiak/" in url:
+        return
+    label = quality_for_name(label, url) or ("Hls" if ".m3u8" in url else "Mp4" if ".mp4" in url else "Direct")
+    item = (label, url)
+    if item in seen:
+        return
+    seen.add(item)
+    links.append(item)
+
+
+body = normalized(text)
+if re.search(r"\.(?:m3u8|mp4)(?:[?#]|$)", provider_url, re.IGNORECASE):
+    add("Hls" if ".m3u8" in provider_url.lower() else "Mp4", provider_url)
+
+for name, url in re.findall(r"\"name\"\s*:\s*\"([^\"]+)\"\s*,\s*\"url\"\s*:\s*\"([^\"]+)\"", body):
+    add(name, url)
+
+for url in re.findall(r"\"hlsManifestUrl\"\s*:\s*\"([^\"]+)\"", body):
+    add("Hls", url)
+
+patterns = [
+    r"\"(?:resolutionStr|resolution|quality)\"\s*:\s*\"([^\"]+)\".{0,600}?\"(?:link|url|file|src|source)\"\s*:\s*\"([^\"]+)\"",
+    r"\"(?:link|url|file|src|source)\"\s*:\s*\"([^\"]+)\".{0,600}?\"(?:resolutionStr|resolution|quality)\"\s*:\s*\"([^\"]+)\"",
+]
+for pattern in patterns:
+    for first, second in re.findall(pattern, body, flags=re.IGNORECASE | re.DOTALL):
+        if first.startswith("http"):
+            add(second, first)
+        else:
+            add(first, second)
+
+for url in re.findall(r"https?://[^\"'\''<>\s]+(?:\.m3u8|\.mp4)(?:[^\"'\''<>\s]*)?", body, flags=re.IGNORECASE):
+    add("Hls" if ".m3u8" in url.lower() else "Mp4", url)
+
+for label, url in links:
+    print(f"{label} >{url}")
+' "$_provider_url" 2>/dev/null
+}
+
 # extract the video links from response of embed urls, extract mp4 links form m3u8 lists
 get_links() {
     case "$*" in
@@ -227,9 +334,29 @@ get_links() {
             ;;
     esac
 
-    response="$(curl --connect-timeout 10 --max-time 25 -e "$allanime_refr" -s "https://${allanime_base}$*" -A "$agent")"
+    if printf '%s' "$*" | grep -Eq '^https?://'; then
+        if printf '%s' "$*" | grep -q 'ok\.ru/videoembed/'; then
+            printf "%s >%s\n" "$provider_name" "$*"
+            printf "\033[1;32m%s\033[0m Links Fetched\n" "$provider_name" 1>&2
+            return 0
+        fi
+        response="$(curl -L --connect-timeout 10 --max-time 25 -e "$allanime_api_refr" -s "$*" -A "$agent")"
+        provider_links="$(printf '%s' "$response" | extract_links_from_provider_response "$*" || true)"
+        if [ -n "$provider_links" ]; then
+            printf "%s\n" "$provider_links"
+        else
+            printf "%s >%s\n" "$provider_name" "$*"
+        fi
+        printf "\033[1;32m%s\033[0m Links Fetched\n" "$provider_name" 1>&2
+        return 0
+    fi
+
+    response="$(curl -L --connect-timeout 10 --max-time 25 -e "$allanime_refr" -s "https://${allanime_base}$*" -A "$agent")"
     episode_link="$(printf '%s' "$response" | sed 's|},{|\
 |g' | sed -nE 's|.*link":"([^"]*)".*"resolutionStr":"([^"]*)".*|\2 >\1|p;s|.*"resolutionStr":"([^"]*)".*"link":"([^"]*)".*|\1 >\2|p;s|.*hls","url":"([^"]*)".*"hardsub_lang":"en-US".*|\1|p' | sed '/^Dash[[:space:]]/d')"
+    if [ -z "$episode_link" ]; then
+        episode_link="$(printf '%s' "$response" | extract_links_from_provider_response "https://${allanime_base}$*" || true)"
+    fi
 
     case "$episode_link" in
         *repackager.wixmp.com*)
@@ -302,10 +429,42 @@ select_quality() {
     printf '%s' "$result" | grep -q "cc>" && m3u8_refr="$(printf '%s' "$links" | sed -nE 's|m3u8_refr >(.*)|\1|p')" && refr_flag="--referrer=$m3u8_refr"
     printf "%s" "$result" | grep -q "tools.fast4speed.rsvp" && refr_flag="--referrer=$allanime_refr"
     printf "%s" "$result" | grep -q "mp4upload.com" && refr_flag="--referrer=https://www.mp4upload.com/"
+    printf "%s" "$result" | grep -q "ok.ru/videoembed" && refr_flag="--referrer=${allanime_api_refr}/"
+    printf "%s" "$result" | grep -q "okcdn.ru" && refr_flag="--referrer=https://ok.ru/"
 
-    ! (printf '%s' "$result" | grep -qE "(cc>|tools.fast4speed.rsvp|mp4upload.com)") && unset refr_flag
+    ! (printf '%s' "$result" | grep -qE "(cc>|tools.fast4speed.rsvp|mp4upload.com|ok\.ru/videoembed|okcdn\.ru)") && unset refr_flag
     ! (printf '%s' "$result" | grep -q "cc>") && unset subs_flag
     episode=$(printf "%s" "$result" | cut -d'>' -f2)
+}
+
+prefer_playable_links() {
+    _preferred_links="$(printf '%s\n' "$1" | awk '
+{
+    line = $0
+    lower = tolower(line)
+    if (lower ~ /^(subtitle|m3u8_refr)[[:space:]]*>/) {
+        print line
+        next
+    }
+    if (lower ~ /cc>/) {
+        print line
+        next
+    }
+    if (lower ~ /tools\.fast4speed\.rsvp/) {
+        print line
+        next
+    }
+    if (lower ~ /ok\.ru\/videoembed\//) {
+        print line
+        next
+    }
+    if (lower ~ />https?:\/\/[^[:space:]]+\.(mp4|m3u8)([?#][^[:space:]]*)?$/) {
+        print line
+    }
+}
+')"
+    [ -n "$_preferred_links" ] && printf '%s\n' "$_preferred_links" && return 0
+    printf '%s\n' "$1"
 }
 
 ani_watch_python() {
@@ -353,7 +512,20 @@ sys.stdout.write(bytes(a ^ b for a, b in zip(key_a, key_b)).hex())
 ' "$_key_a" "$_key_b" 2>/dev/null && return 0
     fi
 
-    return 1
+    _key_b_hex="$(printf '%s' "$_key_b" | base64 -d 2>/dev/null | od -A n -t x1 | tr -d ' \n' || true)"
+    _key_a_len=$(printf '%s' "$_key_a" | wc -c | tr -d ' ')
+    _key_b_len=$(printf '%s' "$_key_b_hex" | wc -c | tr -d ' ')
+    [ "$_key_a_len" -ge 64 ] && [ "$_key_b_len" -ge 64 ] || return 1
+
+    _xor_out=""
+    _xor_i=1
+    while [ "$_xor_i" -le 64 ]; do
+        _xor_a="$(printf '%s' "$_key_a" | cut -c"$_xor_i-$((_xor_i + 1))")"
+        _xor_b="$(printf '%s' "$_key_b_hex" | cut -c"$_xor_i-$((_xor_i + 1))")"
+        _xor_out="${_xor_out}$(printf '%02x' "$((0x$_xor_a ^ 0x$_xor_b))")"
+        _xor_i=$((_xor_i + 2))
+    done
+    printf '%s' "$_xor_out"
 }
 
 allanime_crypto_cache_file() {
@@ -391,7 +563,10 @@ load_allanime_crypto_cache() {
     done <"$_cache_file"
 
     _derived_key="$(derive_allanime_key_hex "$allanime_key_a" "$allanime_key_b" || true)"
-    printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$' && allanime_key=$_derived_key
+    if printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$'; then
+        allanime_key=$_derived_key
+        allanime_crypto_cache_loaded=1
+    fi
 }
 
 save_allanime_crypto_cache() {
@@ -422,6 +597,32 @@ allanime_crypto_error_needs_refresh() {
     esac
 }
 
+extract_allanime_key_a() {
+    _source_js=$1
+    _key_a="$(printf '%s' "$_source_js" | grep -Eo '[0-9a-fA-F]{64}' | head -n 1 | tr '[:upper:]' '[:lower:]')"
+    printf '%s' "$_key_a"
+}
+
+extract_allanime_build_id() {
+    _source_js=$1
+    _build_segment="$(printf '%s' "$_source_js" | grep -Eo 'const [A-Za-z_$][A-Za-z0-9_$]*="[0-9a-fA-F]{64}",[A-Za-z_$][A-Za-z0-9_$]*="[0-9]+";function' | head -n 1)"
+    _build_id="$(printf '%s' "$_build_segment" | sed -nE 's/.*="([0-9]+)";function/\1/p')"
+    if [ -z "$_build_id" ]; then
+        _build_segment="$(printf '%s' "$_source_js" | grep -Eo '[0-9a-fA-F]{64}.{0,400}"[0-9]+"' | head -n 1)"
+        _build_id="$(printf '%s' "$_build_segment" | sed -nE 's/.*"([0-9]+)"$/\1/p')"
+    fi
+    if [ -z "$_build_id" ]; then
+        _build_segment="$(printf '%s' "$_source_js" | grep -Eo '[A-Za-z_$][A-Za-z0-9_$]*=1,[A-Za-z_$][A-Za-z0-9_$]*="[^"]+";function [A-Za-z_$][A-Za-z0-9_$]*\(\)\{return\{"x-build-id":[A-Za-z_$][A-Za-z0-9_$]*\}\}' | head -n 1)"
+        _build_id="$(printf '%s' "$_build_segment" | sed -nE 's/.*="([^"]+)";function.*/\1/p')"
+    fi
+    [ -z "$_build_id" ] && _build_id="$(printf '%s' "$_source_js" | grep -Eo 'Ph="[^"]+"' | head -n 1 | sed -nE 's/Ph="([^"]+)"/\1/p')"
+    printf '%s' "$_build_id"
+}
+
+allanime_bootstrap_origin() {
+    printf '%s' "$allanime_api" | sed -nE 's|^(https?://[^/]+).*|\1|p'
+}
+
 load_allanime_crypto_config() {
     [ "$allanime_crypto_loaded" = "1" ] && [ "${1:-}" != "force" ] && return 0
     allanime_crypto_loaded=1
@@ -429,44 +630,50 @@ load_allanime_crypto_config() {
     _crypto_html="$(curl -L --connect-timeout 3 --max-time 8 -fsSL https://mkissa.to 2>/dev/null || true)"
     [ -n "$_crypto_html" ] || return 0
 
-    _epoch="$(printf '%s' "$_crypto_html" | sed -nE 's/.*"epoch":([0-9]+).*/\1/p' | head -n 1)"
-    _part_b="$(printf '%s' "$_crypto_html" | sed -nE 's/.*"partB":"([^"]+)".*/\1/p' | head -n 1)"
-    _app_url="$(printf '%s' "$_crypto_html" | grep -Eo 'https://cdn\.allanime\.day/all/mk/_app/immutable/entry/app[^"]+\.js' | head -n 1)"
+    _crypto_config="$(printf '%s' "$_crypto_html" | sed -nE 's/.*window\.__aaCrypto=(\{[^;]+\});.*/\1/p' | head -n 1)"
+    _epoch="$(printf '%s\n%s' "$_crypto_config" "$_crypto_html" | sed -nE 's/.*"epoch":([0-9]+).*/\1/p' | head -n 1)"
+    _part_b="$(printf '%s\n%s' "$_crypto_config" "$_crypto_html" | sed -nE 's/.*"partB":"([^"]+)".*/\1/p' | head -n 1)"
+    _app_url="$(printf '%s' "$_crypto_html" | grep -Eo 'https://cdn\.(mkissa\.net|allanime\.day)/all/mk/_app/immutable/entry/app\.[^"]+\.js' | head -n 1)"
     if [ -z "$_app_url" ]; then
-        _app_path="$(printf '%s' "$_crypto_html" | grep -Eo '/all/mk/_app/immutable/entry/app[^"]+\.js' | head -n 1)"
-        [ -n "$_app_path" ] && _app_url="https://cdn.allanime.day$_app_path"
+        _app_path="$(printf '%s' "$_crypto_html" | grep -Eo '/all/mk/_app/immutable/entry/app\.[^"]+\.js' | head -n 1)"
+        [ -n "$_app_path" ] && _app_url="https://cdn.mkissa.net$_app_path"
     fi
 
     _chunk_url=""
     _chunk_js=""
+    _key_a=""
+    _build_id=""
     if [ -n "$_app_url" ]; then
         _app_js="$(curl -L --connect-timeout 3 --max-time 8 -fsSL "$_app_url" 2>/dev/null || true)"
         _chunks_file="$(mktemp)"
-        printf '%s' "$_app_js" | grep -Eo '\.\./chunks/[A-Za-z0-9_.-]+\.js' | sed 's|^\.\./chunks/||' | awk '!seen[$0]++' >"$_chunks_file"
+        _chunk_base="$(printf '%s' "$_app_url" | sed -nE 's|/entry/[^/]+\.js$|/chunks|p')"
+        printf '%s' "$_app_js" | grep -Eo "\.\./chunks/[^\"',\\\\]+\.js" | sed 's|^\.\./chunks/||' | awk '!seen[$0]++' >"$_chunks_file"
         while IFS= read -r _chunk_path; do
-            [ -n "$_chunk_path" ] || continue
-            _candidate_url="https://cdn.allanime.day/all/mk/_app/immutable/chunks/$_chunk_path"
+            [ -n "$_chunk_base" ] && [ -n "$_chunk_path" ] || continue
+            _candidate_url="$_chunk_base/$_chunk_path"
             _candidate_js="$(curl -L --connect-timeout 3 --max-time 8 -fsSL "$_candidate_url" 2>/dev/null || true)"
-            if printf '%s' "$_candidate_js" | grep -q 'aaReq\|x-build-id'; then
+            _candidate_key_a="$(extract_allanime_key_a "$_candidate_js")"
+            printf '%s' "$_candidate_key_a" | grep -Eq '^[0-9a-f]{64}$' || continue
+            _candidate_build_id="$(extract_allanime_build_id "$_candidate_js")"
+            if [ -n "$_candidate_build_id" ]; then
                 _chunk_url=$_candidate_url
                 _chunk_js=$_candidate_js
+                _key_a=$_candidate_key_a
+                _build_id=$_candidate_build_id
                 break
             fi
         done <"$_chunks_file"
         if [ -z "$_chunk_js" ]; then
             _chunk_path="$(head -n 1 "$_chunks_file")"
-            [ -n "$_chunk_path" ] && _chunk_url="https://cdn.allanime.day/all/mk/_app/immutable/chunks/$_chunk_path"
+            [ -n "$_chunk_base" ] && [ -n "$_chunk_path" ] && _chunk_url="$_chunk_base/$_chunk_path"
         fi
         rm -f "$_chunks_file"
     fi
     [ -z "$_chunk_url" ] && _chunk_url="https://cdn.allanime.day/all/mk/_app/immutable/chunks/DNe1e6Xy.js"
     [ -z "$_chunk_js" ] && _chunk_js="$(curl -L --connect-timeout 3 --max-time 8 -fsSL "$_chunk_url" 2>/dev/null || true)"
 
-    _key_a="$(printf '%s' "$_chunk_js" | sed -nE 's/.*const [A-Za-z_$][A-Za-z0-9_$]*="([0-9a-f]{64})",[A-Za-z_$][A-Za-z0-9_$]*="[0-9]+";function.*/\1/p' | head -n 1)"
-    _build_id="$(printf '%s' "$_chunk_js" | sed -nE 's/.*const [A-Za-z_$][A-Za-z0-9_$]*="[0-9a-f]{64}",[A-Za-z_$][A-Za-z0-9_$]*="([0-9]+)";function.*/\1/p' | head -n 1)"
-    [ -z "$_build_id" ] && _build_id="$(printf '%s' "$_chunk_js" | sed -nE 's/.*[A-Za-z_$][A-Za-z0-9_$]*=1,([A-Za-z_$][A-Za-z0-9_$]*)="([^"]+)";function [A-Za-z_$][A-Za-z0-9_$]*\(\)\{return\{"x-build-id":\1\}\}.*/\2/p' | head -n 1)"
-    [ -z "$_build_id" ] && _build_id="$(printf '%s' "$_chunk_js" | sed -nE 's/.*Ph="([^"]+)".*/\1/p' | head -n 1)"
-    [ -z "$_key_a" ] && _key_a="$(printf '%s' "$_chunk_js" | grep -Eo '[0-9a-f]{64}' | head -n 1)"
+    [ -z "$_key_a" ] && _key_a="$(extract_allanime_key_a "$_chunk_js")"
+    [ -z "$_build_id" ] && _build_id="$(extract_allanime_build_id "$_chunk_js")"
 
     case "$_epoch" in
         '' | *[!0-9]*) ;;
@@ -476,8 +683,24 @@ load_allanime_crypto_config() {
     [ -n "$_build_id" ] && allanime_build_id=$_build_id
     printf '%s' "$_key_a" | grep -Eq '^[0-9a-f]{64}$' && allanime_key_a=$_key_a
 
+    if [ -n "$allanime_build_id" ]; then
+        _bootstrap_origin="$(allanime_bootstrap_origin)"
+        _bootstrap_json="$(curl -L --connect-timeout 3 --max-time 8 -fsSL -A "$agent" -e "$allanime_api_refr" -H "Origin: ${allanime_api_refr}" -H "x-build-id: ${allanime_build_id}" "${_bootstrap_origin}/client-crypto/v1/bootstrap?buildId=${allanime_build_id}" 2>/dev/null || true)"
+        _bootstrap_epoch="$(printf '%s' "$_bootstrap_json" | sed -nE 's/.*"epoch":([0-9]+).*/\1/p' | head -n 1)"
+        _bootstrap_part_b="$(printf '%s' "$_bootstrap_json" | sed -nE 's/.*"partB":"([^"]+)".*/\1/p' | head -n 1)"
+        case "$_bootstrap_epoch" in
+            '' | *[!0-9]*) ;;
+            *) allanime_aa_epoch=$_bootstrap_epoch ;;
+        esac
+        [ -n "$_bootstrap_part_b" ] && allanime_key_b=$_bootstrap_part_b
+    fi
+
     _derived_key="$(derive_allanime_key_hex "$allanime_key_a" "$allanime_key_b" || true)"
-    printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$' && allanime_key=$_derived_key
+    if printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$'; then
+        allanime_key=$_derived_key
+        allanime_crypto_cache_loaded=1
+        save_allanime_crypto_cache
+    fi
 }
 
 decode_tobeparsed_legacy_plain() {
@@ -555,6 +778,163 @@ sys.stdout.write(AESGCM(key).decrypt(raw[1:13], raw[13:], None).decode())
     printf '%s' "$plain"
 }
 
+hex_to_bin() {
+    _hex=$1
+    _hex_len=${#_hex}
+    _hex_i=0
+    _hex_oct=""
+    while [ "$_hex_i" -lt "$_hex_len" ]; do
+        _hex_pair="$(printf '%s' "$_hex" | cut -c"$((_hex_i + 1))-$((_hex_i + 2))")"
+        _hex_dec="$(printf '%d' "0x$_hex_pair")"
+        _hex_oct="${_hex_oct}\\$(printf '%03o' "$_hex_dec")"
+        _hex_i=$((_hex_i + 2))
+    done
+    printf '%b' "$_hex_oct"
+}
+
+# shellcheck disable=SC2034
+hex_to_bytes16() {
+    _bytes_hex=$1
+    _bytes_i=0
+    while [ "$_bytes_i" -lt 16 ]; do
+        _bytes_pair="$(printf '%s' "$_bytes_hex" | cut -c"$((_bytes_i * 2 + 1))-$((_bytes_i * 2 + 2))")"
+        eval "b$_bytes_i=\$(printf '%d' \"0x$_bytes_pair\")"
+        _bytes_i=$((_bytes_i + 1))
+    done
+}
+
+# shellcheck disable=SC2154
+bytes16_to_hex() {
+    _bytes_out=""
+    _bytes_i=0
+    while [ "$_bytes_i" -lt 16 ]; do
+        eval "_bytes_v=\$b$_bytes_i"
+        _bytes_out="${_bytes_out}$(printf '%02x' "$_bytes_v")"
+        _bytes_i=$((_bytes_i + 1))
+    done
+    printf '%s' "$_bytes_out"
+}
+
+# shellcheck disable=SC2034,SC2154
+xor_hex16() {
+    hex_to_bytes16 "$1"
+    _xor_i=0
+    while [ "$_xor_i" -lt 16 ]; do
+        eval "xa$_xor_i=\$b$_xor_i"
+        _xor_i=$((_xor_i + 1))
+    done
+    hex_to_bytes16 "$2"
+    _xor_i=0
+    while [ "$_xor_i" -lt 16 ]; do
+        eval "b$_xor_i=\$((b$_xor_i ^ xa$_xor_i))"
+        _xor_i=$((_xor_i + 1))
+    done
+    bytes16_to_hex
+}
+
+# shellcheck disable=SC2034,SC2154
+gf_mult() {
+    hex_to_bytes16 "$2"
+    _gf_i=0
+    while [ "$_gf_i" -lt 16 ]; do
+        eval "v$_gf_i=\$b$_gf_i"
+        eval "z$_gf_i=0"
+        _gf_i=$((_gf_i + 1))
+    done
+    hex_to_bytes16 "$1"
+    _gf_i=0
+    while [ "$_gf_i" -lt 16 ]; do
+        eval "xb$_gf_i=\$b$_gf_i"
+        _gf_i=$((_gf_i + 1))
+    done
+
+    _gf_byte_i=0
+    while [ "$_gf_byte_i" -lt 16 ]; do
+        eval "_gf_xb=\$xb$_gf_byte_i"
+        _gf_bit=7
+        while [ "$_gf_bit" -ge 0 ]; do
+            if [ "$(((_gf_xb >> _gf_bit) & 1))" -eq 1 ]; then
+                _gf_i=0
+                while [ "$_gf_i" -lt 16 ]; do
+                    eval "z$_gf_i=\$((z$_gf_i ^ v$_gf_i))"
+                    _gf_i=$((_gf_i + 1))
+                done
+            fi
+
+            _gf_lsb=$((v15 & 1))
+            _gf_prev=0
+            _gf_i=0
+            while [ "$_gf_i" -le 15 ]; do
+                eval "_gf_cur=\$v$_gf_i"
+                eval "v$_gf_i=\$(((_gf_cur >> 1) | (_gf_prev << 7)))"
+                _gf_prev=$((_gf_cur & 1))
+                _gf_i=$((_gf_i + 1))
+            done
+            [ "$_gf_lsb" -eq 1 ] && v0=$((v0 ^ 225))
+            _gf_bit=$((_gf_bit - 1))
+        done
+        _gf_byte_i=$((_gf_byte_i + 1))
+    done
+
+    _gf_i=0
+    while [ "$_gf_i" -lt 16 ]; do
+        eval "b$_gf_i=\$z$_gf_i"
+        _gf_i=$((_gf_i + 1))
+    done
+    bytes16_to_hex
+}
+
+# shellcheck disable=SC2154
+ghash() {
+    _ghash_data=$1
+    _ghash_y="00000000000000000000000000000000"
+    _ghash_blocks=$((${#_ghash_data} / 32))
+    _ghash_idx=0
+    while [ "$_ghash_idx" -lt "$_ghash_blocks" ]; do
+        _ghash_off=$((_ghash_idx * 32 + 1))
+        _ghash_block="$(printf '%s' "$_ghash_data" | cut -c"${_ghash_off}-$((_ghash_off + 31))")"
+        _ghash_y="$(gf_mult "$(xor_hex16 "$_ghash_y" "$_ghash_block")" "$h_hex")"
+        _ghash_idx=$((_ghash_idx + 1))
+    done
+    printf '%s' "$_ghash_y"
+}
+
+make_aa_req_openssl() {
+    command -v openssl >/dev/null 2>&1 || return 1
+    printf '%s' "$allanime_key" | grep -Eq '^[0-9a-f]{64}$' || return 1
+
+    _query_hash=$1
+    _ts="$(($(date +%s) / 300 * 300 * 1000))"
+    _payload_iv="${allanime_aa_epoch}:${allanime_build_id}:${_query_hash}:${_ts}"
+    _payload="{\"v\":1,\"ts\":$_ts,\"epoch\":$allanime_aa_epoch,\"buildId\":\"$allanime_build_id\",\"qh\":\"$_query_hash\"}"
+
+    _iv_hex="$(printf '%s' "$_payload_iv" | openssl dgst -sha256 -binary | dd bs=1 count=12 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    _payload_hex="$(printf '%s' "$_payload" | od -An -tx1 | tr -d ' \n')"
+    h_hex="$(dd if=/dev/zero bs=16 count=1 2>/dev/null | openssl enc -aes-256-ecb -K "$allanime_key" -nopad -e 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    _ct_hex="$(hex_to_bin "$_payload_hex" | openssl enc -aes-256-ctr -K "$allanime_key" -iv "${_iv_hex}00000002" -e 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    printf '%s' "$_iv_hex$_ct_hex$h_hex" | grep -Eq '^[0-9a-f]+$' || return 1
+
+    _ct_rem=$((${#_ct_hex} % 32))
+    if [ "$_ct_rem" -ne 0 ]; then
+        _ct_pad=$((32 - _ct_rem))
+        _ct_zeros="$(printf '%*s' "$_ct_pad" '' | tr ' ' '0')"
+        _ct_padded="${_ct_hex}${_ct_zeros}"
+    else
+        _ct_padded=$_ct_hex
+    fi
+    _ct_bits=$((${#_ct_hex} / 2 * 8))
+    _len_block="$(printf '0000000000000000%016x' "$_ct_bits")"
+    _tag_mask="$(hex_to_bin "${_iv_hex}00000001" | openssl enc -aes-256-ecb -K "$allanime_key" -nopad -e 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    _tag="$(xor_hex16 "$(ghash "${_ct_padded}${_len_block}")" "$_tag_mask")"
+
+    {
+        printf '\001'
+        hex_to_bin "$_iv_hex"
+        hex_to_bin "$_ct_hex"
+        hex_to_bin "$_tag"
+    } | base64 | tr -d '\n'
+}
+
 make_aa_req() {
     _query_hash=$1
     if command -v node >/dev/null 2>&1; then
@@ -604,7 +984,7 @@ sys.stdout.write(base64.b64encode(b"\x01" + iv + AESGCM(key).encrypt(iv, payload
 ' "$_query_hash" "$allanime_aa_epoch" "$allanime_build_id" "$allanime_key_a" "$allanime_key_b" 2>/dev/null && return 0
     fi
 
-    return 1
+    make_aa_req_openssl "$_query_hash"
 }
 
 decode_tobeparsed() {
@@ -681,50 +1061,53 @@ get_episode_url() {
 
     query_hash="d405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec"
     query_vars="{\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"}"
-    query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"}}"
 
-    api_resp="$(curl -e "$allanime_refr" -sG -A "$agent" -H "Origin: ${allanime_refr}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
-    resp="$(episode_sources_from_api_response "$api_resp" || true)"
-    api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
-    retry_after="$(printf "%s" "$api_error" | sed -nE 's|.*try again in ([0-9]+) seconds?.*|\1|p')"
-
-    if [ -z "$resp" ] && [ -z "$retry_after" ] && [ "$api_error" != "AA_CRYPTO_MISSING" ]; then
-        api_resp="$(curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"},\"query\":\"$episode_embed_gql\"}" -A "$agent")"
+    [ "$allanime_crypto_cache_loaded" = "1" ] || load_allanime_crypto_config force
+    aa_req="$(make_aa_req "$query_hash" || true)"
+    if [ -n "$aa_req" ]; then
+        query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"aaReq\":\"$aa_req\"}"
+        api_resp="$(curl -e "$allanime_api_refr" -sG -A "$agent" -H "Origin: ${allanime_api_refr}" -H "x-build-id: ${allanime_build_id}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
         resp="$(episode_sources_from_api_response "$api_resp" || true)"
         api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
         retry_after="$(printf "%s" "$api_error" | sed -nE 's|.*try again in ([0-9]+) seconds?.*|\1|p')"
-    fi
-
-    if [ -z "$resp" ] && [ -z "$retry_after" ]; then
-        aa_req="$(make_aa_req "$query_hash" || true)"
-        [ -n "$aa_req" ] && query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"aaReq\":\"$aa_req\"}"
-        api_resp="$(curl -e "$allanime_refr" -sG -A "$agent" -H "Origin: ${allanime_refr}" -H "x-build-id: ${allanime_build_id}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
-        resp="$(episode_sources_from_api_response "$api_resp" || true)"
-        api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
-        retry_after="$(printf "%s" "$api_error" | sed -nE 's|.*try again in ([0-9]+) seconds?.*|\1|p')"
+    else
+        api_resp=""
+        resp=""
+        api_error="AA_CRYPTO_MISSING"
+        retry_after=""
     fi
 
     if [ -z "$resp" ] && [ -z "$retry_after" ] && { allanime_crypto_error_needs_refresh "$api_error" || printf "%s" "$api_resp" | grep -q '"tobeparsed"'; }; then
         load_allanime_crypto_config force
         aa_req="$(make_aa_req "$query_hash" || true)"
-        [ -n "$aa_req" ] && query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"aaReq\":\"$aa_req\"}"
-        api_resp="$(curl -e "$allanime_refr" -sG -A "$agent" -H "Origin: ${allanime_refr}" -H "x-build-id: ${allanime_build_id}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
+        if [ -n "$aa_req" ]; then
+            query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"aaReq\":\"$aa_req\"}"
+            api_resp="$(curl -e "$allanime_api_refr" -sG -A "$agent" -H "Origin: ${allanime_api_refr}" -H "x-build-id: ${allanime_build_id}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
+            resp="$(episode_sources_from_api_response "$api_resp" || true)"
+            api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
+            retry_after="$(printf "%s" "$api_error" | sed -nE 's|.*try again in ([0-9]+) seconds?.*|\1|p')"
+            [ -n "$resp" ] && save_allanime_crypto_cache
+        fi
+    fi
+
+    [ -z "$resp" ] && [ -n "$retry_after" ] && die "AllAnime rate-limited episode source requests. Wait about ${retry_after}s before trying again."
+
+    if [ -z "$resp" ] && [ -z "$retry_after" ] && ! allanime_crypto_error_needs_refresh "$api_error"; then
+        query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"}}"
+        api_resp="$(curl -e "$allanime_api_refr" -sG -A "$agent" -H "Origin: ${allanime_api_refr}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
         resp="$(episode_sources_from_api_response "$api_resp" || true)"
         api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
         retry_after="$(printf "%s" "$api_error" | sed -nE 's|.*try again in ([0-9]+) seconds?.*|\1|p')"
-        [ -n "$resp" ] && save_allanime_crypto_cache
     fi
 
-    if [ -z "$resp" ] && [ -n "$retry_after" ]; then
-        [ "$retry_after" -lt 1 ] && retry_after=1
-        [ "$retry_after" -gt 10 ] && retry_after=10
-        sleep "$retry_after"
-        api_resp="$(curl -e "$allanime_refr" -sG -A "$agent" -H "Origin: ${allanime_refr}" -H "x-build-id: ${allanime_build_id}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
+    if [ -z "$resp" ] && [ -z "$retry_after" ] && [ "$api_error" != "AA_CRYPTO_MISSING" ]; then
+        api_resp="$(curl -e "$allanime_api_refr" -s -H "Content-Type: application/json" -H "Origin: ${allanime_api_refr}" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"},\"query\":\"$episode_embed_gql\"}" -A "$agent")"
         resp="$(episode_sources_from_api_response "$api_resp" || true)"
         api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
-        [ -n "$resp" ] && save_allanime_crypto_cache
+        retry_after="$(printf "%s" "$api_error" | sed -nE 's|.*try again in ([0-9]+) seconds?.*|\1|p')"
     fi
-    [ -z "$resp" ] && [ "$api_error" = "AA_CRYPTO_MISSING" ] && die "AllAnime rejected the episode source request (AA_CRYPTO_MISSING). Tried the upstream ani-cli request path first, then the aaReq fallback."
+    [ -z "$resp" ] && [ -n "$retry_after" ] && die "AllAnime rate-limited episode source requests. Wait about ${retry_after}s before trying again."
+    [ -z "$resp" ] && [ "$api_error" = "AA_CRYPTO_MISSING" ] && die "AllAnime rejected the episode source request (AA_CRYPTO_MISSING). Refreshed crypto material and retried the aaReq path."
     [ -z "$resp" ] && printf "%s" "$api_resp" | grep -q '"tobeparsed"' && die "AllAnime returned encrypted episode sources, but neither the upstream decoder nor the aaReq fallback decoded them."
     [ -z "$resp" ] && [ -n "$api_error" ] && die "AllAnime source request failed: $api_error"
 
@@ -740,6 +1123,7 @@ get_episode_url() {
     # select the link with matching quality
     links=$(cat "$cache_dir"/* | sort -g -r -s)
     rm -r "$cache_dir"
+    links="$(prefer_playable_links "$links")"
     select_quality "$quality"
     if printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
         [ -z "$episode" ] && die "Episode is released, but AllAnime returned no valid playable sources for this episode."
@@ -753,7 +1137,7 @@ search_anime() {
     #shellcheck disable=SC2016
     search_gql='query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name englishName nativeName availableEpisodes __typename } }}'
 
-    search_resp=$(curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"search\":{\"allowAdult\":true,\"allowUnknown\":true,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"},\"query\":\"$search_gql\"}" -A "$agent")
+    search_resp=$(curl -e "$allanime_api_refr" -s -H "Content-Type: application/json" -H "Origin: ${allanime_api_refr}" -X POST "${allanime_api}/api" --data "{\"variables\":{\"search\":{\"allowAdult\":true,\"allowUnknown\":true,\"query\":\"$1\"},\"limit\":40,\"page\":1,\"translationType\":\"$mode\",\"countryOrigin\":\"ALL\"},\"query\":\"$search_gql\"}" -A "$agent")
     if command -v python3 >/dev/null 2>&1; then
         printf '%s' "$search_resp" | python3 -c '
 import json
@@ -855,7 +1239,7 @@ episodes_list() {
     #shellcheck disable=SC2016
     episodes_list_gql='query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}'
 
-    curl -e "$allanime_refr" -s -H "Content-Type: application/json" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$*\"},\"query\":\"$episodes_list_gql\"}" -A "$agent" | sed -nE "s|.*$mode\":\[([0-9.\",]*)\].*|\1|p" | sed 's|,|\
+    curl -e "$allanime_api_refr" -s -H "Content-Type: application/json" -H "Origin: ${allanime_api_refr}" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$*\"},\"query\":\"$episodes_list_gql\"}" -A "$agent" | sed -nE "s|.*$mode\":\[([0-9.\",]*)\].*|\1|p" | sed 's|,|\
 |g; s|"||g' | sort -n -k 1
 }
 
@@ -993,14 +1377,16 @@ play() {
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
 allanime_refr="https://youtu-chan.com"
 allanime_base="allanime.day"
-allanime_api="https://api.${allanime_base}"
+allanime_api_refr="https://mkissa.to"
+allanime_api="https://api.mkissa.net"
 allanime_key_a="955b760823fc0dbfd0356bd81e132c1ef4141dbf33297e117352a8d8e1cf05d2"
 allanime_key_b="WhwBvVR252NEfIr/d/l4Q/TQIWfMTKqTRRcuFQPL9os="
 allanime_aa_epoch="4130"
-allanime_build_id="12"
+allanime_build_id="41"
 allanime_legacy_key="a254aa27c410f297bd04ba33a0c0df7ff4e706bf3ae27271c6703f84e750f552"
 allanime_key="cf4777b5778aeadc9449e12769ea545d00c43cd8ff65d482364586cde204f359"
 allanime_crypto_loaded=0
+allanime_crypto_cache_loaded=0
 load_allanime_crypto_cache
 mode="${ANI_CLI_MODE:-sub}"
 download_dir="${ANI_CLI_DOWNLOAD_DIR:-.}"

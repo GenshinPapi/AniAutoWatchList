@@ -35,6 +35,7 @@ from .discovery import (
     search_media,
 )
 from .launcher import (
+    AllAnimeRateLimitError,
     LaunchError,
     allanime_episode_available,
     choose_ani_cli_search_title,
@@ -2487,12 +2488,19 @@ class WatchlistApp:
                     total_episodes=total_episodes,
                     mode=target_mode,
                 )
+            except AllAnimeRateLimitError as exc:
+                self.launch_label.configure(text=str(exc), fg=COLORS["danger"])
+                messagebox.showwarning("AllAnime rate limit", str(exc))
+                raise
             except LaunchError:
                 return None
 
-        target = resolve_target(launch_mode)
-        if launch_mode == "dub" and target is None:
-            target = resolve_target("sub")
+        try:
+            target = resolve_target(launch_mode)
+            if launch_mode == "dub" and target is None:
+                target = resolve_target("sub")
+        except AllAnimeRateLimitError:
+            return
         if target is None and (metadata_payload_is_adult(metadata_payload) or title_has_adult_label(anime["display_title"])):
             message = (
                 f"AllAnime did not return a playable result for {title_for_message}. "
@@ -2621,6 +2629,10 @@ class WatchlistApp:
                 total_episodes=total_episodes,
                 mode=mode,
             )
+        except AllAnimeRateLimitError as exc:
+            self.launch_label.configure(text=str(exc), fg=COLORS["danger"])
+            messagebox.showwarning("AllAnime rate limit", str(exc))
+            return
         except LaunchError:
             target = None
         if target is None and (metadata_payload_is_adult(metadata_payload) or title_has_adult_label(anime["display_title"])):

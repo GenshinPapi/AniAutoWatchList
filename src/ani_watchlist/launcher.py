@@ -42,8 +42,9 @@ exit "$code"
 EPISODE_COUNT_SUFFIX_RE = re.compile(r"\s*\(\s*\d+(?:\.\d+)?\s+episodes?\s*\)\s*$", re.IGNORECASE)
 SHORT_SOURCE_SUFFIX_RE = re.compile(r"\s*\((?=[A-Za-z0-9_-]{1,8}\))(?=[A-Za-z0-9_-]*[A-Za-z])(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]+\)\s*$")
 CONTENT_LABEL_SUFFIX_RE = re.compile(r"\s*\[[^\]]+\]\s*$")
-ALLANIME_API = "https://api.allanime.day/api"
-ALLANIME_REFERER = "https://youtu-chan.com"
+ALLANIME_API = "https://api.mkissa.net/api"
+ALLANIME_REFERER = "https://mkissa.to/"
+ALLANIME_ORIGIN = "https://mkissa.to"
 ALLANIME_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
 ALLANIME_SEARCH_GQL = "query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name englishName nativeName availableEpisodes __typename } }}"
 ALLANIME_EPISODES_GQL = "query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}"
@@ -73,6 +74,10 @@ class AllAnimeEpisodeAvailability:
 
 
 class LaunchError(RuntimeError):
+    pass
+
+
+class AllAnimeRateLimitError(LaunchError):
     pass
 
 
@@ -224,6 +229,7 @@ def _allanime_api_request(variables: dict[str, object], query: str, *, timeout: 
         data=data,
         headers={
             "Content-Type": "application/json",
+            "Origin": ALLANIME_ORIGIN,
             "Referer": ALLANIME_REFERER,
             "User-Agent": ALLANIME_AGENT,
         },
@@ -235,8 +241,40 @@ def _allanime_api_request(variables: dict[str, object], query: str, *, timeout: 
     except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
         raise LaunchError(f"failed to check AllAnime availability: {exc}") from exc
     if isinstance(payload, dict):
+        error_message = _allanime_payload_error_message(payload)
+        if error_message:
+            retry_after = _allanime_retry_after_seconds(error_message)
+            if retry_after is not None or re.search(r"\btoo many\b|\brate.?limit", error_message, re.IGNORECASE):
+                wait = f" Wait about {retry_after}s before trying again." if retry_after is not None else ""
+                raise AllAnimeRateLimitError(f"AllAnime rate-limited requests.{wait}")
+            raise LaunchError(f"AllAnime API error: {error_message}")
         return payload
     raise LaunchError("failed to check AllAnime availability: unexpected response")
+
+
+def _allanime_payload_error_message(payload: dict[str, object]) -> str:
+    errors = payload.get("errors")
+    messages: list[str] = []
+    if isinstance(errors, list):
+        for error in errors:
+            if isinstance(error, dict) and error.get("message") is not None:
+                messages.append(str(error["message"]))
+            elif error is not None:
+                messages.append(str(error))
+    elif errors is not None:
+        messages.append(str(errors))
+    if payload.get("message") is not None:
+        messages.append(str(payload["message"]))
+    if payload.get("error") is not None:
+        messages.append(str(payload["error"]))
+    return "; ".join(message.strip() for message in messages if message and message.strip())
+
+
+def _allanime_retry_after_seconds(message: str) -> int | None:
+    match = re.search(r"try again in\s+(\d+)\s+seconds?", message, re.IGNORECASE)
+    if not match:
+        return None
+    return int(match.group(1))
 
 
 def _episode_sort_value(episode: str) -> float | None:

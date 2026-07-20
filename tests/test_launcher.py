@@ -17,6 +17,27 @@ def test_build_ani_cli_command_uses_episode_option() -> None:
     ]
 
 
+def test_allanime_api_request_raises_rate_limit(monkeypatch) -> None:
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return b'{"errors":[{"message":"too many requests, try again in 17 seconds"}]}'
+
+    monkeypatch.setattr(launcher.urllib.request, "urlopen", lambda *args, **kwargs: FakeResponse())
+
+    try:
+        launcher._allanime_api_request({}, "query")
+    except launcher.AllAnimeRateLimitError as exc:
+        assert "Wait about 17s" in str(exc)
+    else:
+        raise AssertionError("expected AllAnimeRateLimitError")
+
+
 def test_build_ani_cli_command_adds_dub_option() -> None:
     command = launcher.build_ani_cli_command("Frieren", "12", ani_cli="/home/me/.local/bin/ani-cli", mode="dub")
 
