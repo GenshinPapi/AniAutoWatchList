@@ -11,7 +11,7 @@ from math import ceil
 from time import monotonic, sleep
 from textwrap import wrap
 import tkinter as tk
-from tkinter import messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
 try:
     from PIL import Image, ImageDraw, ImageTk
@@ -53,6 +53,14 @@ from .party import (
 )
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
+from .transfer import (
+    JSON_FILETYPES,
+    XML_FILETYPES,
+    WatchlistTransferError,
+    anilist_mal_id_resolver,
+    export_watchlist_text,
+    import_watchlist_file,
+)
 from .updater import UpdateInfo, check_ani_cli_update, check_for_update, launch_update
 from .store import (
     STATUSES,
@@ -572,8 +580,36 @@ class WatchlistApp:
         header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Watchlist", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="Add", style="Accent.TButton", command=self.add_anime).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(header, text="Refresh", style="Dark.TButton", command=self.refresh_library).grid(row=0, column=2, padx=(8, 0))
+        export_button = ttk.Menubutton(header, text="Export", style="Dark.TMenubutton")
+        export_menu = tk.Menu(
+            export_button,
+            tearoff=False,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            activebackground=COLORS["accent"],
+            activeforeground="#111111",
+            relief="flat",
+        )
+        export_menu.add_command(label="Export JSON", command=lambda: self.export_watchlist("json"))
+        export_menu.add_command(label="Export XML", command=lambda: self.export_watchlist("xml"))
+        export_button.configure(menu=export_menu)
+        export_button.grid(row=0, column=1, padx=(8, 0))
+        import_button = ttk.Menubutton(header, text="Import", style="Dark.TMenubutton")
+        import_menu = tk.Menu(
+            import_button,
+            tearoff=False,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            activebackground=COLORS["accent"],
+            activeforeground="#111111",
+            relief="flat",
+        )
+        import_menu.add_command(label="Import JSON", command=lambda: self.import_watchlist("json"))
+        import_menu.add_command(label="Import XML", command=lambda: self.import_watchlist("xml"))
+        import_button.configure(menu=import_menu)
+        import_button.grid(row=0, column=2, padx=(8, 0))
+        ttk.Button(header, text="Add", style="Accent.TButton", command=self.add_anime).grid(row=0, column=3, padx=(8, 0))
+        ttk.Button(header, text="Refresh", style="Dark.TButton", command=self.refresh_library).grid(row=0, column=4, padx=(8, 0))
 
         tabs = tk.Frame(page, bg=COLORS["bg"])
         tabs.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
@@ -1826,6 +1862,107 @@ class WatchlistApp:
             "Update started",
             f"The update is running in {location}. When it finishes, close this GUI and relaunch ani-watch-gui.",
         )
+
+    def export_watchlist(self, export_format: str) -> None:
+        extension = ".xml" if export_format == "xml" else ".json"
+        filetypes = XML_FILETYPES if export_format == "xml" else JSON_FILETYPES
+        target = filedialog.asksaveasfilename(
+            parent=self.root,
+            title=f"Export watchlist {export_format.upper()}",
+            defaultextension=extension,
+            filetypes=filetypes,
+            initialfile=f"ani-watchlist-{datetime.now().strftime('%Y%m%d-%H%M%S')}{extension}",
+        )
+        if not target:
+            return
+        refresh_mal_ids = False
+        skip_missing_mal_ids = False
+        if export_format == "xml":
+            refresh_mal_ids = messagebox.askyesno(
+                "MAL-compatible XML",
+                "MAL import requires update_on_import=1 and a real MAL AnimeDB ID for each entry.\n\n"
+                "Look up missing MAL IDs from AniList and omit entries MAL cannot identify? "
+                "This is recommended for MAL import. Use JSON for a full AniAutoWatchList backup.",
+            )
+            skip_missing_mal_ids = refresh_mal_ids
+        self.start_watchlist_export(
+            target,
+            export_format,
+            refresh_mal_ids=refresh_mal_ids,
+            skip_missing_mal_ids=skip_missing_mal_ids,
+        )
+
+    def start_watchlist_export(
+        self,
+        target: str,
+        export_format: str,
+        *,
+        refresh_mal_ids: bool = False,
+        skip_missing_mal_ids: bool = False,
+    ) -> None:
+        self.dashboard_label.configure(text="Exporting watchlist...")
+
+        def worker() -> None:
+            try:
+                with initialize() as conn:
+                    resolver = anilist_mal_id_resolver(conn) if export_format == "xml" and refresh_mal_ids else None
+                    text = export_watchlist_text(
+                        conn,
+                        "xml" if export_format == "xml" else "json",
+                        mal_id_resolver=resolver,
+                        skip_missing_mal_ids=skip_missing_mal_ids,
+                    )
+                with open(target, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+            except (OSError, WatchlistTransferError) as exc:
+                self.run_on_ui(lambda error=str(exc): self.finish_watchlist_export(target, error=error))
+                return
+            self.run_on_ui(lambda: self.finish_watchlist_export(target, error=None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_watchlist_export(self, target: str, *, error: str | None) -> None:
+        self.refresh_dashboard()
+        if error:
+            messagebox.showwarning("Watchlist export failed", error)
+            return
+        messagebox.showinfo("Watchlist exported", f"Exported watchlist to:\n{target}")
+
+    def import_watchlist(self, import_format: str) -> None:
+        filetypes = XML_FILETYPES if import_format == "xml" else JSON_FILETYPES
+        source = filedialog.askopenfilename(
+            parent=self.root,
+            title=f"Import watchlist {import_format.upper()}",
+            filetypes=filetypes,
+        )
+        if not source:
+            return
+        replace = messagebox.askyesnocancel(
+            "Import watchlist",
+            "Replace the current watchlist with this file?\n\n"
+            "Yes: replace the current watchlist first.\n"
+            "No: sync by adding only missing anime and leaving current entries unchanged.\n"
+            "Cancel: do not import.",
+        )
+        if replace is None:
+            return
+        mode = "replace" if replace else "sync"
+        try:
+            result = import_watchlist_file(self.conn, source, import_format=import_format, mode=mode)
+            merge_safe_duplicates(self.conn)
+        except WatchlistTransferError as exc:
+            messagebox.showwarning("Watchlist import failed", str(exc))
+            return
+        self.selected_anime_id = None
+        self.library_render_signature = None
+        self.activity_signature = None
+        self.show_library()
+        imported = result["anime"] + result.get("updated_anime", 0)
+        skipped = result.get("skipped_anime", 0)
+        summary = f"Imported {imported} anime and {result['episodes']} episode row(s)."
+        if skipped:
+            summary += f"\nSkipped {skipped} existing anime."
+        messagebox.showinfo("Watchlist imported", summary)
 
     def start_discovery_refresh(self, *, force: bool = False, page_name: str | None = None) -> None:
         if self.discovery_refreshing:

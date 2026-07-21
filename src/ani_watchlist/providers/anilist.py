@@ -20,6 +20,7 @@ query ($search: String) {
   Page(page: 1, perPage: 8) {
     media(search: $search, type: ANIME, sort: SEARCH_MATCH) {
       id
+      idMal
       title { romaji english native userPreferred }
       synonyms
       episodes
@@ -41,6 +42,7 @@ query ($page: Int, $perPage: Int, $search: String) {
     pageInfo { hasNextPage currentPage }
     media(type: ANIME, search: $search, sort: SEARCH_MATCH) {
       id
+      idMal
       title { romaji english native userPreferred }
       synonyms
       episodes
@@ -70,6 +72,7 @@ query ($id: Int) {
         relationType(version: 2)
         node {
           id
+          idMal
           type
           title { romaji english native userPreferred }
           synonyms
@@ -98,6 +101,7 @@ MEDIA_QUERY = """
 query ($id: Int) {
   Media(id: $id, type: ANIME) {
     id
+    idMal
     title { romaji english native userPreferred }
     synonyms
     episodes
@@ -113,6 +117,20 @@ query ($id: Int) {
 }
 """
 
+MEDIA_BATCH_QUERY = """
+query ($ids: [Int], $page: Int, $perPage: Int) {
+  Page(page: $page, perPage: $perPage) {
+    media(id_in: $ids, type: ANIME) {
+      id
+      idMal
+      episodes
+      format
+      externalLinks { id site url type language }
+    }
+  }
+}
+"""
+
 
 TRENDING_QUERY = """
 query ($page: Int, $perPage: Int) {
@@ -120,6 +138,7 @@ query ($page: Int, $perPage: Int) {
     pageInfo { hasNextPage currentPage }
     media(type: ANIME, sort: TRENDING_DESC) {
       id
+      idMal
       title { romaji english native userPreferred }
       synonyms
       episodes
@@ -147,6 +166,7 @@ query ($page: Int, $perPage: Int, $genreIn: [String], $tagIn: [String]) {
     pageInfo { hasNextPage currentPage }
     media(type: ANIME, sort: POPULARITY_DESC, genre_in: $genreIn, tag_in: $tagIn) {
       id
+      idMal
       title { romaji english native userPreferred }
       synonyms
       episodes
@@ -174,6 +194,7 @@ query ($page: Int, $perPage: Int) {
     pageInfo { hasNextPage currentPage }
     media(type: ANIME, sort: POPULARITY_DESC, status: RELEASING) {
       id
+      idMal
       title { romaji english native userPreferred }
       synonyms
       episodes
@@ -211,6 +232,7 @@ query ($page: Int, $perPage: Int, $start: Int, $end: Int) {
       mediaId
       media {
         id
+        idMal
         title { romaji english native userPreferred }
         synonyms
         episodes
@@ -460,6 +482,19 @@ class AniListProvider:
         if not media:
             raise RuntimeError(f"AniList media not found: {media_id}")
         return media
+
+    def get_media_batch(self, media_ids: list[int] | tuple[int, ...] | set[int]) -> list[dict[str, Any]]:
+        ids = [int(media_id) for media_id in media_ids if str(media_id).strip()]
+        if not ids:
+            return []
+        results: list[dict[str, Any]] = []
+        for index in range(0, len(ids), 50):
+            chunk = ids[index : index + 50]
+            data = self._request(MEDIA_BATCH_QUERY, {"ids": chunk, "page": 1, "perPage": len(chunk)})
+            media = (data.get("Page") or {}).get("media")
+            if isinstance(media, list):
+                results.extend(item for item in media if isinstance(item, dict))
+        return results
 
     def get_cover(self, media_id: str) -> str | None:
         media = self.get_media(media_id)

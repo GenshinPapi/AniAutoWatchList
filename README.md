@@ -24,7 +24,7 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 - AniList metadata search and cover caching
 - English-first display titles when metadata is available
 - Notes per anime
-- JSON and CSV export
+- JSON, XML, and CSV export
 - SQLite backups and restore
 - Duplicate detection and merge command
 - Activity log and repair checks
@@ -165,8 +165,11 @@ Import, export, and backups:
 
 ```sh
 ani-watch export --format json --output watchlist.json
+ani-watch export --format xml --refresh-mal-ids --skip-missing-mal-ids --output watchlist.xml
 ani-watch export --format csv --output watchlist.csv
 ani-watch import watchlist.json
+ani-watch import watchlist.xml --mode sync
+ani-watch import watchlist.json --mode replace
 ani-watch backup
 ani-watch restore PATH
 ani-watch import-history --search "Anime Title"
@@ -207,6 +210,7 @@ The GUI includes:
 - Status tabs
 - Cover grid
 - Search/filter box
+- Watchlist JSON/XML import and export
 - Anime detail page
 - Related seasons and side stories on detail pages
 - Episode checklist

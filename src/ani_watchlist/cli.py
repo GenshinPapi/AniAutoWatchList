@@ -23,16 +23,15 @@ from .party import MpvIpcController, WatchPartyError, WatchPartyMedia, WatchPart
 from .paths import get_paths
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
+from .transfer import WatchlistTransferError, anilist_mal_id_resolver, export_watchlist_text, import_watchlist_file
 from .store import (
     STATUSES,
     backup_database,
     clean_display_title,
     delete_anime,
     episodes_for_anime,
-    export_data,
     get_anime,
     get_or_create_anime,
-    import_data,
     likely_duplicates,
     list_anime,
     mark_episode,
@@ -449,8 +448,14 @@ def _csv_export(rows) -> str:
 
 def cmd_export(args: argparse.Namespace) -> int:
     with initialize() as conn:
-        if args.format == "json":
-            text = json.dumps(export_data(conn), indent=2, sort_keys=True)
+        mal_id_resolver = anilist_mal_id_resolver(conn) if args.format == "xml" and args.refresh_mal_ids else None
+        if args.format in {"json", "xml"}:
+            text = export_watchlist_text(
+                conn,
+                args.format,
+                mal_id_resolver=mal_id_resolver,
+                skip_missing_mal_ids=args.format == "xml" and args.skip_missing_mal_ids,
+            )
         elif args.format == "csv":
             text = _csv_export(list_anime(conn))
         else:
@@ -470,13 +475,18 @@ def cmd_import(args: argparse.Namespace) -> int:
         print(f"import file not found: {source}", file=sys.stderr)
         return 1
     try:
-        data = json.loads(source.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        print(f"invalid JSON: {exc}", file=sys.stderr)
+        with initialize() as conn:
+            result = import_watchlist_file(conn, source, import_format=args.format, mode=args.mode)
+    except WatchlistTransferError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
-    with initialize() as conn:
-        result = import_data(conn, data)
-    print(f"imported/updated {result['anime']} anime and {result['episodes']} episode rows")
+    print(
+        "imported/updated "
+        f"{result['anime'] + result.get('updated_anime', 0)} anime, "
+        f"{result['episodes']} episode rows"
+    )
+    if result.get("skipped_anime"):
+        print(f"skipped {result['skipped_anime']} existing anime")
     return 0
 
 
@@ -872,12 +882,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_doctor)
 
     p = sub.add_parser("export")
-    p.add_argument("--format", choices=("json", "csv"), default="json")
+    p.add_argument("--format", choices=("json", "xml", "csv"), default="json")
     p.add_argument("--output")
+    p.add_argument(
+        "--refresh-mal-ids",
+        action="store_true",
+        help="for XML export, look up missing MAL AnimeDB IDs from AniList before writing the file",
+    )
+    p.add_argument(
+        "--skip-missing-mal-ids",
+        action="store_true",
+        help="for XML export, omit entries without a MAL AnimeDB ID so MAL can import the remaining entries",
+    )
     p.set_defaults(func=cmd_export)
 
     p = sub.add_parser("import")
     p.add_argument("path")
+    p.add_argument("--format", choices=("json", "xml"), help="override import format detection")
+    p.add_argument(
+        "--mode",
+        choices=("merge", "sync", "replace"),
+        default="merge",
+        help="merge updates existing rows, sync only adds missing titles, replace clears the watchlist first",
+    )
     p.set_defaults(func=cmd_import)
 
     p = sub.add_parser("import-history")

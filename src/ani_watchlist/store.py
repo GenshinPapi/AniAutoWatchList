@@ -785,15 +785,22 @@ def merge_anime(conn: sqlite3.Connection, target_id: int, source_id: int) -> dic
     return {"target_id": target_id, "source_id": source_id, "episode_count": len(episode_map)}
 
 
-def import_data(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, int]:
+def import_data(conn: sqlite3.Connection, data: dict[str, Any], *, update_existing: bool = True) -> dict[str, int]:
     anime_id_map: dict[int, int] = {}
+    episode_id_map: dict[int, int] = {}
+    imported_source_anime_ids: set[int] = set()
     imported_anime = 0
+    updated_anime = 0
+    skipped_anime = 0
     imported_episodes = 0
+    imported_metadata = 0
+    imported_events = 0
     with conn:
-        for item in data.get("anime", []):
+        for fallback_id, item in enumerate(data.get("anime", []), start=1):
             title = item.get("display_title") or item.get("source_title") or item.get("canonical_title")
             if not title:
                 continue
+            source_anime_id = _import_row_id(item, fallback_id)
             existing = None
             if item.get("anilist_id") is not None:
                 existing = conn.execute("SELECT * FROM anime WHERE anilist_id = ?", (item["anilist_id"],)).fetchone()
@@ -807,9 +814,16 @@ def import_data(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, int
                     status=item.get("status") if item.get("status") in STATUSES else "watching",
                 )
                 imported_anime += 1 if created else 0
+                imported_source_anime_ids.add(source_anime_id)
             else:
                 anime = existing
-            anime_id_map[int(item["id"])] = int(anime["id"])
+                if not update_existing:
+                    skipped_anime += 1
+                    anime_id_map[source_anime_id] = int(anime["id"])
+                    continue
+                updated_anime += 1
+                imported_source_anime_ids.add(source_anime_id)
+            anime_id_map[source_anime_id] = int(anime["id"])
             update_anime_fields(
                 conn,
                 anime["id"],
@@ -822,11 +836,16 @@ def import_data(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, int
                 last_watched_at=item.get("last_watched_at") or anime["last_watched_at"],
             )
 
-        for item in data.get("episodes", []):
-            anime_id = anime_id_map.get(int(item["anime_id"]))
+        for fallback_id, item in enumerate(data.get("episodes", []), start=1):
+            source_anime_id = _import_row_id({"id": item.get("anime_id")}, -1)
+            if source_anime_id not in imported_source_anime_ids:
+                continue
+            anime_id = anime_id_map.get(source_anime_id)
             if anime_id is None:
                 continue
             episode, _created = get_or_create_episode(conn, anime_id, str(item["episode_key"]))
+            source_episode_id = _import_row_id(item, fallback_id)
+            episode_id_map[source_episode_id] = int(episode["id"])
             conn.execute(
                 """
                 UPDATE episodes
@@ -853,7 +872,103 @@ def import_data(conn: sqlite3.Connection, data: dict[str, Any]) -> dict[str, int
                 ),
             )
             imported_episodes += 1
-    return {"anime": imported_anime, "episodes": imported_episodes}
+
+        for item in data.get("metadata_matches", []):
+            source_anime_id = _import_row_id({"id": item.get("anime_id")}, -1)
+            if source_anime_id not in imported_source_anime_ids:
+                continue
+            anime_id = anime_id_map.get(source_anime_id)
+            if anime_id is None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO metadata_matches(
+                    anime_id, provider, provider_media_id, confidence_score, selected, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(anime_id, provider, provider_media_id) DO UPDATE SET
+                    confidence_score = CASE
+                        WHEN excluded.confidence_score > metadata_matches.confidence_score
+                            THEN excluded.confidence_score
+                        ELSE metadata_matches.confidence_score
+                    END,
+                    selected = CASE
+                        WHEN excluded.selected > metadata_matches.selected THEN excluded.selected
+                        ELSE metadata_matches.selected
+                    END,
+                    payload_json = CASE
+                        WHEN excluded.selected >= metadata_matches.selected THEN excluded.payload_json
+                        ELSE metadata_matches.payload_json
+                    END
+                """,
+                (
+                    anime_id,
+                    item.get("provider") or "anilist",
+                    str(item.get("provider_media_id") or ""),
+                    float(item.get("confidence_score") or 0.0),
+                    1 if item.get("selected") else 0,
+                    item.get("payload_json") or "{}",
+                    item.get("created_at") or now_iso(),
+                ),
+            )
+            imported_metadata += 1
+
+        for item in data.get("watch_events", []):
+            source_anime_id = _import_row_id({"id": item.get("anime_id")}, -1)
+            if source_anime_id not in imported_source_anime_ids:
+                continue
+            anime_id = anime_id_map.get(source_anime_id)
+            if anime_id is None:
+                continue
+            source_episode_id = _import_row_id({"id": item.get("episode_id")}, -1)
+            episode_id = episode_id_map.get(source_episode_id)
+            event_type = item.get("event_type")
+            payload_json = item.get("payload_json") or "{}"
+            created_at = item.get("created_at") or now_iso()
+            if event_type not in {
+                "launch",
+                "title_selected",
+                "episodes_listed",
+                "playback_started",
+                "playback_finished",
+                "playback_failed",
+            }:
+                continue
+            duplicate = conn.execute(
+                """
+                SELECT 1 FROM watch_events
+                WHERE anime_id IS ? AND episode_id IS ? AND event_type = ? AND payload_json = ? AND created_at = ?
+                LIMIT 1
+                """,
+                (anime_id, episode_id, event_type, payload_json, created_at),
+            ).fetchone()
+            if duplicate is not None:
+                continue
+            conn.execute(
+                """
+                INSERT INTO watch_events(anime_id, episode_id, event_type, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (anime_id, episode_id, event_type, payload_json, created_at),
+            )
+            imported_events += 1
+    return {
+        "anime": imported_anime,
+        "updated_anime": updated_anime,
+        "skipped_anime": skipped_anime,
+        "episodes": imported_episodes,
+        "metadata": imported_metadata,
+        "events": imported_events,
+    }
+
+
+def _import_row_id(item: dict[str, Any], fallback: int) -> int:
+    try:
+        value = item.get("id")
+        if value is None:
+            return fallback
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 def repair_database(conn: sqlite3.Connection, fix: bool = False) -> dict[str, Any]:
