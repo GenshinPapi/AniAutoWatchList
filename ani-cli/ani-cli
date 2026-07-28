@@ -538,6 +538,7 @@ allanime_crypto_cache_file() {
 load_allanime_crypto_cache() {
     _cache_file="$(allanime_crypto_cache_file || true)"
     [ -n "$_cache_file" ] && [ -r "$_cache_file" ] || return 0
+    _cache_lane=""
 
     while IFS='=' read -r _cache_key _cache_value; do
         case "$_cache_key" in
@@ -556,14 +557,18 @@ load_allanime_crypto_cache() {
             build_id)
                 [ -n "$_cache_value" ] && allanime_build_id=$_cache_value
                 ;;
+            lane)
+                [ -n "$_cache_value" ] && _cache_lane=$_cache_value
+                ;;
             derived_key)
                 printf '%s' "$_cache_value" | grep -Eq '^[0-9a-f]{64}$' && allanime_key=$_cache_value
                 ;;
         esac
     done <"$_cache_file"
+    [ -n "$_cache_lane" ] && allanime_lane=$_cache_lane
 
     _derived_key="$(derive_allanime_key_hex "$allanime_key_a" "$allanime_key_b" || true)"
-    if printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$'; then
+    if [ -n "$_cache_lane" ] && printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$'; then
         allanime_key=$_derived_key
         allanime_crypto_cache_loaded=1
     fi
@@ -582,6 +587,7 @@ save_allanime_crypto_cache() {
         printf 'key_b=%s\n' "$allanime_key_b"
         printf 'epoch=%s\n' "$allanime_aa_epoch"
         printf 'build_id=%s\n' "$allanime_build_id"
+        printf 'lane=%s\n' "$allanime_lane"
         printf 'derived_key=%s\n' "$_derived_key"
     } >"$_tmp_file" 2>/dev/null && mv "$_tmp_file" "$_cache_file" 2>/dev/null; then
         :
@@ -605,6 +611,8 @@ extract_allanime_key_a() {
 
 extract_allanime_build_id() {
     _source_js=$1
+    _build_id="$(printf '%s' "$_source_js" | sed -nE 's/.*!=="string"[?]"([0-9]+)".*/\1/p' | head -n 1)"
+    [ -n "$_build_id" ] && printf '%s' "$_build_id" && return 0
     _build_segment="$(printf '%s' "$_source_js" | grep -Eo 'const [A-Za-z_$][A-Za-z0-9_$]*="[0-9a-fA-F]{64}",[A-Za-z_$][A-Za-z0-9_$]*="[0-9]+";function' | head -n 1)"
     _build_id="$(printf '%s' "$_build_segment" | sed -nE 's/.*="([0-9]+)";function/\1/p')"
     if [ -z "$_build_id" ]; then
@@ -619,6 +627,67 @@ extract_allanime_build_id() {
     printf '%s' "$_build_id"
 }
 
+extract_allanime_lane() {
+    _source_js=$1
+    _lane="$(printf '%s' "$_source_js" | sed -nE 's/.*const [A-Za-z_$][A-Za-z0-9_$]*="(k[0-9]+)".*/\1/p' | head -n 1)"
+    if [ -z "$_lane" ]; then
+        _lane="$(printf '%s' "$_source_js" | grep -Eo '"k[0-9]+"' | tr -d '"' | head -n 1)"
+    fi
+    printf '%s' "$_lane"
+}
+
+generate_allanime_epoch() {
+    _now_ms=$(($(date +%s) * 1000))
+    _epoch=$((_now_ms / 259200000))
+    if [ "$((_now_ms - _epoch * 259200000))" -lt 86400000 ] && [ "$_epoch" -gt 0 ]; then
+        _epoch=$((_epoch - 1))
+    fi
+    printf '%s' "$_epoch"
+}
+
+generate_allanime_mask() {
+    [ -n "$allanime_build_id" ] || return 1
+    _mask_hex=""
+    _mask_block=0
+    for _mask_part in 10d13/213hI= XdTA6FaAQSo= KRCUT9lZh1o= Aj3ASCIDMnw=; do
+        _mask_byte=0
+        for _embedded_byte in $(printf '%s' "$_mask_part" | base64 -d 2>/dev/null | od -An -tu1 -v); do
+            _mask_index=$((_mask_block * 8 + _mask_byte))
+            _char_pos=$((_mask_index % ${#allanime_build_id} + 1))
+            _build_char="$(printf '%s' "$allanime_build_id" | cut -c"$_char_pos")"
+            _ascii="$(LC_CTYPE=C printf '%s' "$_build_char" | od -An -tu1 | tr -d '[:space:]')"
+            [ -n "$_ascii" ] || return 1
+            _build_mask_byte=$((_ascii ^ (((_mask_index * 17) + 31) & 255)))
+            _tweak=$((((_mask_block * 41) + (_mask_byte * 7)) & 255))
+            _value=$((_embedded_byte ^ _build_mask_byte ^ _tweak))
+            _mask_hex="${_mask_hex}$(printf '%02x' "$_value")"
+            _mask_byte=$((_mask_byte + 1))
+        done
+        _mask_block=$((_mask_block + 1))
+    done
+    printf '%s' "$_mask_hex" | grep -Eq '^[0-9a-f]{64}$' || return 1
+    printf '%s' "$_mask_hex"
+}
+
+generate_allanime_aa_boot() {
+    command -v openssl >/dev/null 2>&1 || return 1
+    [ -n "$allanime_build_id" ] || return 1
+    printf '%s' "$allanime_key_a" | grep -Eq '^[0-9a-f]{64}$' || return 1
+
+    _hmac_key_hex="$(
+        printf 'aa-boot:%s' "$allanime_build_id" |
+            openssl dgst -sha256 -mac HMAC -macopt "hexkey:$allanime_key_a" -binary 2>/dev/null |
+            od -An -tx1 -v |
+            tr -d ' \n'
+    )"
+    printf '%s' "$_hmac_key_hex" | grep -Eq '^[0-9a-f]{64}$' || return 1
+    _boot_payload="${allanime_build_id}:mkissa:mkissa.to:${allanime_aa_epoch}"
+    [ -n "$allanime_lane" ] && _boot_payload="${_boot_payload}:${allanime_lane}"
+    printf '%s' "$_boot_payload" |
+        openssl dgst -sha256 -mac HMAC -macopt "hexkey:$_hmac_key_hex" 2>/dev/null |
+        sed 's/^.*= //'
+}
+
 allanime_bootstrap_origin() {
     printf '%s' "$allanime_api" | sed -nE 's|^(https?://[^/]+).*|\1|p'
 }
@@ -631,7 +700,6 @@ load_allanime_crypto_config() {
     [ -n "$_crypto_html" ] || return 0
 
     _crypto_config="$(printf '%s' "$_crypto_html" | sed -nE 's/.*window\.__aaCrypto=(\{[^;]+\});.*/\1/p' | head -n 1)"
-    _epoch="$(printf '%s\n%s' "$_crypto_config" "$_crypto_html" | sed -nE 's/.*"epoch":([0-9]+).*/\1/p' | head -n 1)"
     _part_b="$(printf '%s\n%s' "$_crypto_config" "$_crypto_html" | sed -nE 's/.*"partB":"([^"]+)".*/\1/p' | head -n 1)"
     _app_url="$(printf '%s' "$_crypto_html" | grep -Eo 'https://cdn\.(mkissa\.net|allanime\.day)/all/mk/_app/immutable/entry/app\.[^"]+\.js' | head -n 1)"
     if [ -z "$_app_url" ]; then
@@ -643,6 +711,7 @@ load_allanime_crypto_config() {
     _chunk_js=""
     _key_a=""
     _build_id=""
+    _lane=""
     if [ -n "$_app_url" ]; then
         _app_js="$(curl -L --connect-timeout 3 --max-time 8 -fsSL "$_app_url" 2>/dev/null || true)"
         _chunks_file="$(mktemp)"
@@ -655,19 +724,28 @@ load_allanime_crypto_config() {
             _candidate_url="$_chunk_base/$_chunk_path"
             _candidate_js="$(curl -L --connect-timeout 3 --max-time 8 -fsSL "$_candidate_url" 2>/dev/null || true)"
             _candidate_key_a="$(extract_allanime_key_a "$_candidate_js")"
-            printf '%s' "$_candidate_key_a" | grep -Eq '^[0-9a-f]{64}$' || continue
             _candidate_build_id="$(extract_allanime_build_id "$_candidate_js")"
-            if [ -n "$_candidate_build_id" ]; then
+            _candidate_lane="$(extract_allanime_lane "$_candidate_js")"
+            if [ -n "$_candidate_build_id" ] && [ -n "$_candidate_lane" ]; then
                 _chunk_url=$_candidate_url
                 _chunk_js=$_candidate_js
                 _key_a=$_candidate_key_a
                 _build_id=$_candidate_build_id
+                _lane=$_candidate_lane
                 break
+            elif [ -z "$_chunk_js" ] && { [ -n "$_candidate_build_id" ] || [ -n "$_candidate_lane" ] || printf '%s' "$_candidate_key_a" | grep -Eq '^[0-9a-f]{64}$'; }; then
+                _chunk_url=$_candidate_url
+                _chunk_js=$_candidate_js
+                _key_a=$_candidate_key_a
+                _build_id=$_candidate_build_id
+                _lane=$_candidate_lane
             fi
         done <"$_chunks_file"
         if [ -z "$_chunk_js" ]; then
             _chunk_path="$(head -n 1 "$_chunks_file")"
-            [ -n "$_chunk_base" ] && [ -n "$_chunk_path" ] && _chunk_url="$_chunk_base/$_chunk_path"
+            if [ -n "$_chunk_base" ] && [ -n "$_chunk_path" ]; then
+                _chunk_url="$_chunk_base/$_chunk_path"
+            fi
         fi
         rm -f "$_chunks_file"
     fi
@@ -676,20 +754,37 @@ load_allanime_crypto_config() {
 
     [ -z "$_key_a" ] && _key_a="$(extract_allanime_key_a "$_chunk_js")"
     [ -z "$_build_id" ] && _build_id="$(extract_allanime_build_id "$_chunk_js")"
+    [ -z "$_lane" ] && _lane="$(extract_allanime_lane "$_chunk_js")"
 
-    case "$_epoch" in
+    _generated_epoch="$(generate_allanime_epoch || true)"
+    case "$_generated_epoch" in
         '' | *[!0-9]*) ;;
-        *) allanime_aa_epoch=$_epoch ;;
+        *) allanime_aa_epoch=$_generated_epoch ;;
     esac
     [ -n "$_part_b" ] && allanime_key_b=$_part_b
     [ -n "$_build_id" ] && allanime_build_id=$_build_id
-    printf '%s' "$_key_a" | grep -Eq '^[0-9a-f]{64}$' && allanime_key_a=$_key_a
+    [ -n "$_lane" ] && allanime_lane=$_lane
+    _generated_mask="$(generate_allanime_mask || true)"
+    if printf '%s' "$_generated_mask" | grep -Eq '^[0-9a-f]{64}$'; then
+        allanime_key_a=$_generated_mask
+    elif printf '%s' "$_key_a" | grep -Eq '^[0-9a-f]{64}$'; then
+        allanime_key_a=$_key_a
+    fi
 
     if [ -n "$allanime_build_id" ]; then
         _bootstrap_origin="$(allanime_bootstrap_origin)"
-        _bootstrap_json="$(curl -L --connect-timeout 3 --max-time 8 -fsSL -A "$agent" -e "$allanime_api_refr" -H "Origin: ${allanime_api_refr}" -H "x-build-id: ${allanime_build_id}" "${_bootstrap_origin}/client-crypto/v1/bootstrap?buildId=${allanime_build_id}" 2>/dev/null || true)"
+        _bootstrap_url="${_bootstrap_origin}/client-crypto/v1/bootstrap?buildId=${allanime_build_id}"
+        [ -n "$allanime_lane" ] && _bootstrap_url="${_bootstrap_url}&k=${allanime_lane}"
+        _aa_boot="$(generate_allanime_aa_boot || true)"
+        _bootstrap_json=""
+        if [ -n "$_aa_boot" ]; then
+            _bootstrap_json="$(curl -L --connect-timeout 3 --max-time 8 -fsSL -A "$agent" -e "$allanime_api_refr" -H "Origin: ${allanime_api_refr}" -H "Referer: ${allanime_api_refr}/" -H "x-build-id: ${allanime_build_id}" -H "x-aa-boot: ${_aa_boot}" "$_bootstrap_url" 2>/dev/null || true)"
+        fi
         _bootstrap_epoch="$(printf '%s' "$_bootstrap_json" | sed -nE 's/.*"epoch":([0-9]+).*/\1/p' | head -n 1)"
         _bootstrap_part_b="$(printf '%s' "$_bootstrap_json" | sed -nE 's/.*"partB":"([^"]+)".*/\1/p' | head -n 1)"
+        if [ -z "$_bootstrap_part_b" ]; then
+            _bootstrap_part_b="$(printf '%s' "$_bootstrap_json" | sed -nE 's/.*partB[^A-Za-z0-9+/=]*([A-Za-z0-9+/=]{20,}).*/\1/p' | head -n 1)"
+        fi
         case "$_bootstrap_epoch" in
             '' | *[!0-9]*) ;;
             *) allanime_aa_epoch=$_bootstrap_epoch ;;
@@ -904,11 +999,12 @@ ghash() {
 make_aa_req_openssl() {
     command -v openssl >/dev/null 2>&1 || return 1
     printf '%s' "$allanime_key" | grep -Eq '^[0-9a-f]{64}$' || return 1
+    [ -n "$allanime_lane" ] || return 1
 
     _query_hash=$1
     _ts="$(($(date +%s) / 300 * 300 * 1000))"
-    _payload_iv="${allanime_aa_epoch}:${allanime_build_id}:${_query_hash}:${_ts}"
-    _payload="{\"v\":1,\"ts\":$_ts,\"epoch\":$allanime_aa_epoch,\"buildId\":\"$allanime_build_id\",\"qh\":\"$_query_hash\"}"
+    _payload_iv="${allanime_aa_epoch}:${_query_hash}:${_ts}"
+    _payload="{\"v\":1,\"ts\":$_ts,\"epoch\":$allanime_aa_epoch,\"buildId\":\"$allanime_build_id\",\"qh\":\"$_query_hash\",\"k\":\"$allanime_lane\"}"
 
     _iv_hex="$(printf '%s' "$_payload_iv" | openssl dgst -sha256 -binary | dd bs=1 count=12 2>/dev/null | od -An -tx1 | tr -d ' \n')"
     _payload_hex="$(printf '%s' "$_payload" | od -An -tx1 | tr -d ' \n')"
@@ -939,6 +1035,7 @@ make_aa_req_openssl() {
 
 make_aa_req() {
     _query_hash=$1
+    [ -n "$allanime_lane" ] || return 1
     if command -v node >/dev/null 2>&1; then
         # shellcheck disable=SC2016
         node -e '
@@ -948,15 +1045,16 @@ const epoch = process.argv[2] || "";
 const buildId = process.argv[3] || "";
 const keyA = Buffer.from(process.argv[4] || "", "hex");
 const keyB = Buffer.from(process.argv[5] || "", "base64");
+const lane = process.argv[6] || "";
 const key = Buffer.alloc(Math.min(keyA.length, keyB.length));
 for (let i = 0; i < key.length; i += 1) key[i] = keyA[i] ^ keyB[i];
 const ts = Math.floor(Date.now() / 300000) * 300000;
-const iv = crypto.createHash("sha256").update(`${epoch}:${buildId}:${qh}:${ts}`).digest().subarray(0, 12);
-const payload = JSON.stringify({v: 1, ts, epoch: Number(epoch), buildId, qh});
+const iv = crypto.createHash("sha256").update(`${epoch}:${qh}:${ts}`).digest().subarray(0, 12);
+const payload = JSON.stringify({v: 1, ts, epoch: Number(epoch), buildId, qh, k: lane});
 const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
 const encrypted = Buffer.concat([cipher.update(payload, "utf8"), cipher.final()]);
 process.stdout.write(Buffer.concat([Buffer.from([1]), iv, encrypted, cipher.getAuthTag()]).toString("base64"));
-' "$_query_hash" "$allanime_aa_epoch" "$allanime_build_id" "$allanime_key_a" "$allanime_key_b" 2>/dev/null && return 0
+' "$_query_hash" "$allanime_aa_epoch" "$allanime_build_id" "$allanime_key_a" "$allanime_key_b" "$allanime_lane" 2>/dev/null && return 0
     fi
 
     _python_cmd="$(ani_watch_python || true)"
@@ -978,12 +1076,13 @@ epoch = sys.argv[2]
 build_id = sys.argv[3]
 key_a = bytes.fromhex(sys.argv[4])
 key_b = base64.b64decode(sys.argv[5])
+lane = sys.argv[6]
 key = bytes(a ^ b for a, b in zip(key_a, key_b))
 ts = (int(time.time() * 1000) // 300000) * 300000
-iv = hashlib.sha256(f"{epoch}:{build_id}:{qh}:{ts}".encode()).digest()[:12]
-payload = json.dumps({"v": 1, "ts": ts, "epoch": int(epoch), "buildId": build_id, "qh": qh}, separators=(",", ":")).encode()
+iv = hashlib.sha256(f"{epoch}:{qh}:{ts}".encode()).digest()[:12]
+payload = json.dumps({"v": 1, "ts": ts, "epoch": int(epoch), "buildId": build_id, "qh": qh, "k": lane}, separators=(",", ":")).encode()
 sys.stdout.write(base64.b64encode(b"\x01" + iv + AESGCM(key).encrypt(iv, payload, None)).decode())
-' "$_query_hash" "$allanime_aa_epoch" "$allanime_build_id" "$allanime_key_a" "$allanime_key_b" 2>/dev/null && return 0
+' "$_query_hash" "$allanime_aa_epoch" "$allanime_build_id" "$allanime_key_a" "$allanime_key_b" "$allanime_lane" 2>/dev/null && return 0
     fi
 
     make_aa_req_openssl "$_query_hash"
@@ -1067,7 +1166,7 @@ get_episode_url() {
     [ "$allanime_crypto_cache_loaded" = "1" ] || load_allanime_crypto_config force
     aa_req="$(make_aa_req "$query_hash" || true)"
     if [ -n "$aa_req" ]; then
-        query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"aaReq\":\"$aa_req\"}"
+        query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"k\":\"$allanime_lane\",\"aaReq\":\"$aa_req\"}"
         api_resp="$(curl -e "$allanime_api_refr" -sG -A "$agent" -H "Origin: ${allanime_api_refr}" -H "x-build-id: ${allanime_build_id}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
         resp="$(episode_sources_from_api_response "$api_resp" || true)"
         api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
@@ -1083,7 +1182,7 @@ get_episode_url() {
         load_allanime_crypto_config force
         aa_req="$(make_aa_req "$query_hash" || true)"
         if [ -n "$aa_req" ]; then
-            query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"aaReq\":\"$aa_req\"}"
+            query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"k\":\"$allanime_lane\",\"aaReq\":\"$aa_req\"}"
             api_resp="$(curl -e "$allanime_api_refr" -sG -A "$agent" -H "Origin: ${allanime_api_refr}" -H "x-build-id: ${allanime_build_id}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
             resp="$(episode_sources_from_api_response "$api_resp" || true)"
             api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
@@ -1095,8 +1194,8 @@ get_episode_url() {
     [ -z "$resp" ] && [ -n "$retry_after" ] && die "AllAnime rate-limited episode source requests. Wait about ${retry_after}s before trying again."
 
     if [ -z "$resp" ] && [ -z "$retry_after" ] && ! allanime_crypto_error_needs_refresh "$api_error"; then
-        query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"}}"
-        api_resp="$(curl -e "$allanime_api_refr" -sG -A "$agent" -H "Origin: ${allanime_api_refr}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
+        query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"k\":\"$allanime_lane\"}"
+        api_resp="$(curl -e "$allanime_api_refr" -sG -A "$agent" -H "Origin: ${allanime_api_refr}" -H "x-build-id: ${allanime_build_id}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
         resp="$(episode_sources_from_api_response "$api_resp" || true)"
         api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
         retry_after="$(printf "%s" "$api_error" | sed -nE 's|.*try again in ([0-9]+) seconds?.*|\1|p')"
@@ -1385,6 +1484,7 @@ allanime_key_a="955b760823fc0dbfd0356bd81e132c1ef4141dbf33297e117352a8d8e1cf05d2
 allanime_key_b="WhwBvVR252NEfIr/d/l4Q/TQIWfMTKqTRRcuFQPL9os="
 allanime_aa_epoch="4130"
 allanime_build_id="41"
+allanime_lane="k7"
 allanime_legacy_key="a254aa27c410f297bd04ba33a0c0df7ff4e706bf3ae27271c6703f84e750f552"
 allanime_key="cf4777b5778aeadc9449e12769ea545d00c43cd8ff65d482364586cde204f359"
 allanime_crypto_loaded=0
