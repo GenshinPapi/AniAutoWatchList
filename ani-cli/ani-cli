@@ -467,6 +467,382 @@ prefer_playable_links() {
     printf '%s\n' "$1"
 }
 
+anidb_curl_python() {
+    _anidb_python="$(ani_watch_python || true)"
+    [ -n "$_anidb_python" ] || return 127
+
+    "$_anidb_python" - "$@" <<'PY'
+import sys
+
+try:
+    from curl_cffi import requests
+except Exception:
+    raise SystemExit(127)
+
+args = sys.argv[1:]
+url = ""
+timeout = 15.0
+headers = {}
+i = 0
+while i < len(args):
+    arg = args[i]
+    if arg in ("-A", "--user-agent") and i + 1 < len(args):
+        headers["User-Agent"] = args[i + 1]
+        i += 2
+    elif arg in ("-H", "--header") and i + 1 < len(args):
+        name, sep, value = args[i + 1].partition(":")
+        if sep:
+            headers[name.strip()] = value.strip()
+        i += 2
+    elif arg == "--max-time" and i + 1 < len(args):
+        try:
+            timeout = float(args[i + 1])
+        except ValueError:
+            timeout = 15.0
+        i += 2
+    elif arg.startswith("--max-time="):
+        try:
+            timeout = float(arg.split("=", 1)[1])
+        except ValueError:
+            timeout = 15.0
+        i += 1
+    elif arg == "--connect-timeout" and i + 1 < len(args):
+        i += 2
+    elif not arg.startswith("-") and not url:
+        url = arg
+        i += 1
+    else:
+        i += 1
+
+if not url:
+    raise SystemExit(1)
+
+headers.setdefault(
+    "User-Agent",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+)
+
+try:
+    response = requests.get(url, headers=headers, timeout=timeout, impersonate="chrome124", allow_redirects=True)
+except Exception:
+    raise SystemExit(1)
+
+text = response.text.replace("\r", "")
+challenge_markers = (
+    "Just a moment",
+    "challenges.cloudflare.com",
+    "cf_chl",
+    "Enable JavaScript and cookies",
+)
+if any(marker.lower() in text.lower() for marker in challenge_markers):
+    raise SystemExit(2)
+if response.status_code >= 400 and not text:
+    raise SystemExit(1)
+
+sys.stdout.write(text)
+PY
+}
+
+anidb_curl() {
+    anidb_last_error=""
+    _anidb_result="$(anidb_curl_python "$@")"
+    _anidb_status=$?
+    if [ "$_anidb_status" -eq 0 ] && [ -n "$_anidb_result" ]; then
+        printf '%s' "$_anidb_result"
+        return 0
+    fi
+    if [ "$_anidb_status" -eq 2 ]; then
+        anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+        return 2
+    fi
+
+    _anidb_retries=2
+    _anidb_result=""
+    while [ "$_anidb_retries" -gt 0 ]; do
+        _anidb_result="$(curl -sL --connect-timeout 5 --max-time 15 "$@" 2>/dev/null | tr -d '\r')"
+        if printf '%s' "$_anidb_result" | grep -qiE 'Just a moment|challenges\.cloudflare\.com|cf_chl|Enable JavaScript and cookies'; then
+            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+            return 2
+        fi
+        if [ -n "$_anidb_result" ]; then
+            printf '%s' "$_anidb_result"
+            return 0
+        fi
+        _anidb_retries=$((_anidb_retries - 1))
+        [ "$_anidb_retries" -gt 0 ] && sleep 1
+    done
+    anidb_last_error="anidb.app returned an empty response"
+    return 1
+}
+
+anidb_query_string() {
+    printf '%s' "$1" |
+        sed 's/([^)]*)//g;s/[^[:alnum:] ]/ /g;s/[[:space:]][[:space:]]*/ /g;s/^ //;s/ $//;s/ /+/g'
+}
+
+anidb_normalize_title() {
+    printf '%s' "$1" |
+        tr '[:upper:]' '[:lower:]' |
+        sed 's/([^)]*)//g;s/[^[:alnum:]]/ /g;s/[[:space:]][[:space:]]*/ /g;s/^ //;s/ $//'
+}
+
+search_anidb() {
+    _anidb_query="$(anidb_query_string "$1")"
+    [ -n "$_anidb_query" ] || return 1
+
+    _anidb_page="$(anidb_curl "https://anidb.app/search/suggestions?q=${_anidb_query}" -A "$anidb_agent" --max-time 15)"
+    _anidb_status=$?
+    if [ -z "$_anidb_page" ]; then
+        _anidb_page="$(anidb_curl "https://anidb.app/browse?q=${_anidb_query}" -A "$anidb_agent" --max-time 15)"
+        _anidb_status=$?
+    fi
+    if [ -z "$_anidb_page" ]; then
+        [ "$_anidb_status" -eq 2 ] && return 2
+        return 1
+    fi
+
+    printf '%s' "$_anidb_page" |
+        tr '\n' ' ' |
+        sed 's/<a href/\n<a href/g' |
+        sed -nE 's|.*anime/[a-z0-9-]+-([0-9]+)".*alt="([^"]+)".*|\1	\2|p;s|.*href="/anime/[^"]*-([0-9]+)".*>([^<]+)</a>.*|\1	\2|p' |
+        sed 's/&amp;/\&/g;s/&#39;/'"'"'/g;s/&quot;/"/g' |
+        awk -F '\t' 'NF >= 2 && !seen[$1]++ { print $1 "\t" $2 }'
+}
+
+anidb_resolve_id() {
+    _anidb_title="$1"
+    [ -n "$_anidb_title" ] || _anidb_title="$allanime_title"
+    [ -n "$_anidb_title" ] || return 1
+
+    _anidb_results="$(search_anidb "$_anidb_title")"
+    _anidb_status=$?
+    if [ -z "$_anidb_results" ]; then
+        if [ "$_anidb_status" -eq 2 ]; then
+            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+            return 2
+        else
+            anidb_last_error="anidb.app did not return a matching anime"
+            return 1
+        fi
+    fi
+
+    _anidb_want="$(anidb_normalize_title "$_anidb_title")"
+    _anidb_first="$(printf '%s\n' "$_anidb_results" | head -n 1 | cut -f1)"
+    while IFS='	' read -r _anidb_id _anidb_name; do
+        [ -n "$_anidb_id" ] || continue
+        _anidb_have="$(anidb_normalize_title "$_anidb_name")"
+        [ "$_anidb_have" = "$_anidb_want" ] && printf '%s' "$_anidb_id" && return 0
+    done <<EOF
+$_anidb_results
+EOF
+    [ -n "$_anidb_first" ] && printf '%s' "$_anidb_first"
+}
+
+anidb_episode_id() {
+    _anidb_ep_json="$1"
+    _anidb_ep_no="$2"
+    _anidb_python="$(ani_watch_python || true)"
+    if [ -n "$_anidb_python" ]; then
+        printf '%s' "$_anidb_ep_json" | "$_anidb_python" -c '
+import json
+import sys
+
+episode_no = sys.argv[1]
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+
+episodes = payload if isinstance(payload, list) else payload.get("episodes", [])
+if not isinstance(episodes, list):
+    raise SystemExit(1)
+
+def same_number(value, wanted):
+    return value is not None and str(value) == wanted
+
+for episode in episodes:
+    if not isinstance(episode, dict):
+        continue
+    if same_number(episode.get("number"), episode_no) or same_number(episode.get("number2"), episode_no):
+        episode_id = episode.get("id")
+        if episode_id is not None:
+            print(episode_id)
+            raise SystemExit(0)
+
+try:
+    relative_index = int(episode_no)
+except ValueError:
+    raise SystemExit(1)
+
+if relative_index < 1 or relative_index > len(episodes):
+    raise SystemExit(1)
+
+episode = episodes[relative_index - 1]
+if isinstance(episode, dict) and episode.get("id") is not None:
+    print(episode["id"])
+    raise SystemExit(0)
+
+raise SystemExit(1)
+' "$_anidb_ep_no" 2>/dev/null && return 0
+    fi
+
+    _anidb_ep_re="$(printf '%s' "$_anidb_ep_no" | sed "s/[.[\\*^\$()+?{}|]/\\\\&/g")"
+    printf '%s' "$_anidb_ep_json" |
+        tr '\n' ' ' |
+        sed 's/},{/}\n{/g' |
+        sed -nE "s|.*\"id\":([0-9]+).*\"number\":${_anidb_ep_re}([,}].*)|\1|p;s|.*\"number\":${_anidb_ep_re}([,}].*).*\"id\":([0-9]+).*|\2|p" |
+        head -n 1
+}
+
+anidb_embed_url() {
+    _anidb_lang_json="$1"
+    _anidb_lang="jpn"
+    [ "$mode" = "dub" ] && _anidb_lang="eng"
+
+    if command -v python3 >/dev/null 2>&1; then
+        printf '%s' "$_anidb_lang_json" | python3 -c '
+import json
+import sys
+
+preferred = sys.argv[1]
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+
+items = payload if isinstance(payload, list) else payload.get("languages", [])
+if not isinstance(items, list):
+    raise SystemExit(1)
+
+fallback = ""
+for item in items:
+    if not isinstance(item, dict):
+        continue
+    url = item.get("embed_url") or item.get("embedUrl") or item.get("url") or ""
+    if not url:
+        continue
+    if not fallback:
+        fallback = url
+    if item.get("code") == preferred:
+        print(url)
+        raise SystemExit(0)
+
+if fallback:
+    print(fallback)
+' "$_anidb_lang" 2>/dev/null && return 0
+    fi
+
+    _anidb_embed="$(printf '%s' "$_anidb_lang_json" | sed -nE "s|.*\"code\":\"${_anidb_lang}\".*\"embed_url\":\"([^\"]*)\".*|\1|p;s|.*\"embed_url\":\"([^\"]*)\".*\"code\":\"${_anidb_lang}\".*|\1|p" | head -n 1)"
+    [ -z "$_anidb_embed" ] && _anidb_embed="$(printf '%s' "$_anidb_lang_json" | sed -nE 's|.*"embed_url":"([^"]*)".*|\1|p' | head -n 1)"
+    printf '%s' "$_anidb_embed" | sed 's|\\/|/|g'
+}
+
+anidb_playlist_links() {
+    _anidb_playlist_url="$1"
+    _anidb_playlist="$2"
+    _anidb_base_url="${_anidb_playlist_url%/*}/"
+
+    printf '%s' "$_anidb_playlist" | awk -v base="$_anidb_base_url" '
+/^#EXT-X-STREAM/ {
+    q = $0
+    sub(/^.*RESOLUTION=[0-9]+x/, "", q)
+    sub(/,.*/, "p", q)
+    if (q !~ /^[0-9]+p$/) q = "Hls"
+    next
+}
+/^#/ || /^$/ { next }
+{
+    u = $0
+    if (u !~ /^https?:\/\//) u = base u
+    if (q == "") q = "Hls"
+    print q " >" u
+    q = ""
+}
+' | sort -rn
+}
+
+anidb_fetch_episode_links() {
+    _anidb_title="${1:-$title}"
+    [ -n "$_anidb_title" ] || _anidb_title="$allanime_title"
+    [ -n "$_anidb_title" ] || return 1
+
+    _anidb_id="$(anidb_resolve_id "$_anidb_title")"
+    _anidb_status=$?
+    if [ -z "$_anidb_id" ]; then
+        if [ "$_anidb_status" -eq 2 ]; then
+            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+        else
+            anidb_last_error="anidb.app did not return a matching anime"
+        fi
+        return 1
+    fi
+
+    _anidb_ep_json="$(anidb_curl "https://anidb.app/api/frontend/anime/${_anidb_id}/episodes" -A "$anidb_agent" -H "Accept: application/json" --max-time 15)"
+    _anidb_status=$?
+    if [ -z "$_anidb_ep_json" ]; then
+        if [ "$_anidb_status" -eq 2 ]; then
+            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+        else
+            anidb_last_error="anidb.app did not return episodes for ${_anidb_title}"
+        fi
+        return 1
+    fi
+
+    _anidb_ep_id="$(anidb_episode_id "$_anidb_ep_json" "$ep_no" || true)"
+    if [ -z "$_anidb_ep_id" ]; then
+        anidb_last_error="anidb.app did not expose episode ${ep_no} for ${_anidb_title}"
+        return 1
+    fi
+
+    _anidb_lang_json="$(anidb_curl "https://anidb.app/api/frontend/episode/${_anidb_ep_id}/languages" -A "$anidb_agent" -H "Accept: application/json" --max-time 15)"
+    _anidb_status=$?
+    if [ -z "$_anidb_lang_json" ]; then
+        if [ "$_anidb_status" -eq 2 ]; then
+            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+        else
+            anidb_last_error="anidb.app did not return streams for episode ${ep_no}"
+        fi
+        return 1
+    fi
+
+    _anidb_embed_url="$(anidb_embed_url "$_anidb_lang_json" || true)"
+    if [ -z "$_anidb_embed_url" ]; then
+        anidb_last_error="anidb.app returned no ${mode} embed for episode ${ep_no}"
+        return 1
+    fi
+
+    _anidb_embed_page="$(anidb_curl "$_anidb_embed_url" -A "$anidb_agent" --max-time 15)"
+    _anidb_status=$?
+    if [ -z "$_anidb_embed_page" ]; then
+        if [ "$_anidb_status" -eq 2 ]; then
+            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+        else
+            anidb_last_error="anidb.app embed returned an empty response"
+        fi
+        return 1
+    fi
+
+    _anidb_m3u8="$(printf '%s' "$_anidb_embed_page" | sed -nE "s|.*file:[[:space:]]*'([^']*)'.*|\1|p;s|.*file:[[:space:]]*\"([^\"]*)\".*|\1|p" | head -n 1)"
+    _anidb_m3u8="$(printf '%s' "$_anidb_m3u8" | sed 's|\\/|/|g')"
+    if [ -z "$_anidb_m3u8" ]; then
+        anidb_last_error="anidb.app embed did not expose an HLS playlist"
+        return 1
+    fi
+
+    _anidb_m3u8_content="$(anidb_curl "$_anidb_m3u8" -A "$anidb_agent" --max-time 15)"
+    _anidb_status=$?
+    if ! printf '%s' "$_anidb_m3u8_content" | grep -q "EXTM3U"; then
+        if [ "$_anidb_status" -eq 2 ]; then
+            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+        else
+            anidb_last_error="anidb.app playlist was not valid HLS"
+        fi
+        return 1
+    fi
+
+    anidb_playlist_links "$_anidb_m3u8" "$_anidb_m3u8_content"
+}
+
 ani_watch_python() {
     if [ -n "${ANI_CLI_PYTHON:-}" ] && [ -x "$ANI_CLI_PYTHON" ]; then
         printf '%s' "$ANI_CLI_PYTHON"
@@ -539,6 +915,7 @@ load_allanime_crypto_cache() {
     _cache_file="$(allanime_crypto_cache_file || true)"
     [ -n "$_cache_file" ] && [ -r "$_cache_file" ] || return 0
     _cache_lane=""
+    _cache_derived_key=""
 
     while IFS='=' read -r _cache_key _cache_value; do
         case "$_cache_key" in
@@ -561,14 +938,17 @@ load_allanime_crypto_cache() {
                 [ -n "$_cache_value" ] && _cache_lane=$_cache_value
                 ;;
             derived_key)
-                printf '%s' "$_cache_value" | grep -Eq '^[0-9a-f]{64}$' && allanime_key=$_cache_value
+                printf '%s' "$_cache_value" | grep -Eq '^[0-9a-f]{64}$' && _cache_derived_key=$_cache_value
                 ;;
         esac
     done <"$_cache_file"
     [ -n "$_cache_lane" ] && allanime_lane=$_cache_lane
 
     _derived_key="$(derive_allanime_key_hex "$allanime_key_a" "$allanime_key_b" || true)"
-    if [ -n "$_cache_lane" ] && printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$'; then
+    if [ -n "$_cache_lane" ] && printf '%s' "$_cache_derived_key" | grep -Eq '^[0-9a-f]{64}$'; then
+        allanime_key=$_cache_derived_key
+        allanime_crypto_cache_loaded=1
+    elif [ -n "$_cache_lane" ] && printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$'; then
         allanime_key=$_derived_key
         allanime_crypto_cache_loaded=1
     fi
@@ -579,7 +959,10 @@ save_allanime_crypto_cache() {
     [ -n "$_cache_file" ] || return 0
     _cache_dir=${_cache_file%/*}
     mkdir -p "$_cache_dir" 2>/dev/null || return 0
-    _derived_key="$(derive_allanime_key_hex "$allanime_key_a" "$allanime_key_b" || true)"
+    _derived_key=$allanime_key
+    if ! printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$'; then
+        _derived_key="$(derive_allanime_key_hex "$allanime_key_a" "$allanime_key_b" || true)"
+    fi
     printf '%s' "$_derived_key" | grep -Eq '^[0-9a-f]{64}$' || return 0
     _tmp_file="${_cache_file}.$$"
     if {
@@ -598,7 +981,7 @@ save_allanime_crypto_cache() {
 
 allanime_crypto_error_needs_refresh() {
     case "$1" in
-        AA_CRYPTO_MISSING | AA_CRYPTO_STALE | AA_CRYPTO_QUERY_MISMATCH | AA_CRYPTO_INVALID | AA_CRYPTO_EXPIRED) return 0 ;;
+        AA_CRYPTO_MISSING | AA_CRYPTO_MISSING_BUILD | AA_CRYPTO_STALE | AA_CRYPTO_QUERY_MISMATCH | AA_CRYPTO_INVALID | AA_CRYPTO_EXPIRED) return 0 ;;
         *) return 1 ;;
     esac
 }
@@ -688,6 +1071,176 @@ generate_allanime_aa_boot() {
         sed 's/^.*= //'
 }
 
+allanime_js_runtime() {
+    if command -v deno >/dev/null 2>&1; then
+        printf '%s' "deno"
+        return 0
+    fi
+    if command -v node >/dev/null 2>&1; then
+        printf '%s' "node"
+        return 0
+    fi
+    return 1
+}
+
+load_allanime_runtime_crypto_config() {
+    _runtime="$(allanime_js_runtime || true)"
+    [ -n "$_runtime" ] || return 1
+    _keygen="$(mktemp)" || return 1
+    if ! cat >"$_keygen" <<'ANICLI_KEYGEN_JS'
+'use strict';
+var IS_DENO = typeof Deno !== 'undefined';
+var ARGV = IS_DENO ? Deno.args : process.argv.slice(2);
+var refr = ARGV[0];
+var UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0';
+var ENC = new TextEncoder();
+
+if (!IS_DENO && (typeof globalThis.crypto === 'undefined' || !globalThis.crypto.subtle)) {
+  try { globalThis.crypto = require('crypto').webcrypto; } catch (_) {}
+}
+if (typeof globalThis.atob === 'undefined') {
+  globalThis.atob = function(s) { return Buffer.from(s, 'base64').toString('binary'); };
+}
+if (typeof globalThis.btoa === 'undefined') {
+  globalThis.btoa = function(s) { return Buffer.from(s, 'binary').toString('base64'); };
+}
+
+function OUT(s) {
+  if (IS_DENO) Deno.stdout.writeSync(ENC.encode(s));
+  else process.stdout.write(s);
+}
+function EXIT(c) {
+  if (IS_DENO) Deno.exit(c);
+  else process.exit(c);
+}
+function die(m) {
+  var e = 'aa-keygen: ' + m + '\n';
+  if (IS_DENO) Deno.stderr.writeSync(ENC.encode(e));
+  else process.stderr.write(e);
+  EXIT(1);
+}
+async function get(url) {
+  var r = await fetch(url, { headers: { 'User-Agent': UA, 'Referer': refr, 'Accept': '*/*' } });
+  if (!r.ok) throw new Error('HTTP ' + r.status + ' for ' + url);
+  return await r.text();
+}
+async function findCryptoChunk() {
+  var landing = await get(refr);
+  var appUrl = (landing.match(/https:\/\/cdn\.(?:mkissa\.net|allanime\.day)\/all\/mk\/_app\/immutable\/entry\/app\.[^"'<]+\.js/) || [])[0];
+  if (!appUrl) {
+    var appPath = (landing.match(/\/all\/mk\/_app\/immutable\/entry\/app\.[^"'<]+\.js/) || [])[0];
+    if (appPath) appUrl = 'https://cdn.mkissa.net' + appPath;
+  }
+  if (!appUrl) throw new Error('app.js not found on landing page');
+  var cdn = appUrl.replace(/\/entry\/[^/]+\.js$/, '');
+  var app = await get(appUrl);
+  var seen = {}, chunks = [], m, cr = /["'][.][.]\/chunks\/([^"',\\]+\.js)["']/g;
+  while ((m = cr.exec(app))) {
+    if (!seen[m[1]]) {
+      seen[m[1]] = 1;
+      chunks.push(m[1]);
+    }
+  }
+  for (var i = 0; i < chunks.length; i += 1) {
+    var url = cdn + '/chunks/' + chunks[i];
+    var js = await get(url);
+    if (js.indexOf('client-crypto/v1/bootstrap') !== -1) return js;
+  }
+  throw new Error('crypto chunk not found');
+}
+function loadModule(src) {
+  var importNames = {}, m, ir = /import\{([^}]*)\}from"[^"]*";?/g;
+  while ((m = ir.exec(src))) {
+    var parts = m[1].split(',');
+    for (var i = 0; i < parts.length; i += 1) {
+      var seg = parts[i].trim(), as = / as (\w+)$/.exec(seg);
+      if (as) importNames[as[1]] = 1;
+      else if (/^\w+$/.test(seg)) importNames[seg] = 1;
+    }
+  }
+  src = src.replace(/import\{[^}]*\}from"[^"]*";?/g, '')
+           .replace(/export\{[^}]*\};?\s*$/g, '')
+           .replace(/import\.meta/g, '({url:"x",env:{}})');
+  var importDecls = Object.keys(importNames).map(function(n) { return 'let ' + n + '=__mk();'; }).join('');
+  var host = new URL(refr).host, origin = new URL(refr).origin;
+  var store = '{_d:{},getItem(k){return this._d[k]??null},setItem(k,v){this._d[k]=String(v)},removeItem(k){delete this._d[k]},clear(){this._d={}},key(){return null},get length(){return 0}}';
+  var harness = '"use strict";\n'
+    + 'const __mk=()=>new Proxy(function(){return __mk()},{get(t,p){if(p===Symbol.iterator)return function*(){};if(p===\'then\')return undefined;return __mk()},apply(){return __mk()},construct(){return __mk()}});\n'
+    + 'const localStorage=(' + store + '),sessionStorage=(' + store + ');\n'
+    + 'const location={host:' + JSON.stringify(host) + ',hostname:' + JSON.stringify(host) + ',origin:' + JSON.stringify(origin) + ',href:' + JSON.stringify(refr + '/') + ',protocol:"https:",pathname:"/",search:""};\n'
+    + 'const navigator={userAgent:' + JSON.stringify(UA) + ',language:"en",languages:["en"]};\n'
+    + 'const document={currentScript:null,cookie:"",addEventListener(){},removeEventListener(){},createElement(){return{style:{},setAttribute(){},appendChild(){}}},documentElement:{style:{}},head:{appendChild(){}},body:{appendChild(){}},querySelector(){return null},getElementById(){return null}};\n'
+    + 'const window=new Proxy({location,navigator,document,localStorage,sessionStorage,addEventListener(){},removeEventListener(){},matchMedia(){return{matches:false,addEventListener(){}}},setTimeout,clearTimeout,setInterval,clearInterval,fetch:globalThis.fetch,crypto:globalThis.crypto,atob:globalThis.atob,btoa:globalThis.btoa},{get(t,p){return p in t?t[p]:__mk()}});\n'
+    + 'const self=window;\n'
+    + importDecls + '\n' + src + '\n'
+    + ';return { QS:(typeof QS!=="undefined"?QS:undefined), If:(typeof If!=="undefined"?If:undefined), Uh:(typeof Uh!=="undefined"?Uh:undefined), Bh:(typeof Bh!=="undefined"?Bh:undefined), sr:(typeof sr!=="undefined"?sr:undefined), getEpoch:()=>(typeof Zn!=="undefined"?Zn:null) };';
+  return new Function(harness)();
+}
+(async function() {
+  if (!refr) die('usage: <refr_url>');
+  var src;
+  try { src = await findCryptoChunk(); } catch (e) { die(e.message); }
+  var M;
+  try { M = loadModule(src); } catch (e) { die('module load failed: ' + e.message); }
+  if (typeof M.QS !== 'function') die('QS entrypoint missing');
+  var lanes = [M.If, M.Uh, M.Bh].filter(Boolean), keyBytes = null, usedLane = null, lastErr = null;
+  for (var i = 0; i < lanes.length; i += 1) {
+    try {
+      keyBytes = await M.QS(1, lanes[i]);
+      if (keyBytes) {
+        usedLane = lanes[i];
+        break;
+      }
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  if (!keyBytes) die('bootstrap failed: ' + (lastErr && lastErr.message || 'no key'));
+  var hex = Array.from(new Uint8Array(keyBytes)).map(function(x) { return x.toString(16).padStart(2, '0'); }).join('');
+  if (hex.length !== 64) die('derived key wrong length: ' + hex.length);
+  var epoch = M.getEpoch();
+  if (epoch == null) die('epoch not resolved');
+  if (!M.sr) die('build id not resolved');
+  if (!usedLane) die('lane not resolved');
+  OUT('KEY=' + hex + '\nEPOCH=' + epoch + '\nBUILDID=' + M.sr + '\nLANE=' + usedLane + '\n');
+  EXIT(0);
+})().catch(function(e) { die('unexpected: ' + (e && e.message || e)); });
+ANICLI_KEYGEN_JS
+    then
+        rm -f "$_keygen"
+        return 1
+    fi
+
+    case "$_runtime" in
+        deno) _key_out="$(deno run --allow-net --no-prompt "$_keygen" "$allanime_api_refr" 2>/dev/null)" ;;
+        node) _key_out="$(node "$_keygen" "$allanime_api_refr" 2>/dev/null)" ;;
+        *) _key_out="" ;;
+    esac
+    _key_status=$?
+    rm -f "$_keygen"
+    [ "$_key_status" -eq 0 ] || return 1
+
+    _runtime_key="$(printf '%s\n' "$_key_out" | sed -n 's/^KEY=//p' | head -n 1 | tr '[:upper:]' '[:lower:]')"
+    _runtime_epoch="$(printf '%s\n' "$_key_out" | sed -n 's/^EPOCH=//p' | head -n 1)"
+    _runtime_build_id="$(printf '%s\n' "$_key_out" | sed -n 's/^BUILDID=//p' | head -n 1)"
+    _runtime_lane="$(printf '%s\n' "$_key_out" | sed -n 's/^LANE=//p' | head -n 1)"
+
+    printf '%s' "$_runtime_key" | grep -Eq '^[0-9a-f]{64}$' || return 1
+    case "$_runtime_epoch" in
+        '' | *[!0-9]*) return 1 ;;
+    esac
+    [ -n "$_runtime_build_id" ] || return 1
+    [ -n "$_runtime_lane" ] || return 1
+
+    allanime_key=$_runtime_key
+    allanime_aa_epoch=$_runtime_epoch
+    allanime_build_id=$_runtime_build_id
+    allanime_lane=$_runtime_lane
+    allanime_crypto_cache_loaded=1
+    save_allanime_crypto_cache
+    return 0
+}
+
 allanime_bootstrap_origin() {
     printf '%s' "$allanime_api" | sed -nE 's|^(https?://[^/]+).*|\1|p'
 }
@@ -695,6 +1248,10 @@ allanime_bootstrap_origin() {
 load_allanime_crypto_config() {
     [ "$allanime_crypto_loaded" = "1" ] && [ "${1:-}" != "force" ] && return 0
     allanime_crypto_loaded=1
+
+    if load_allanime_runtime_crypto_config; then
+        return 0
+    fi
 
     _crypto_html="$(curl -L --connect-timeout 3 --max-time 8 -fsSL https://mkissa.to 2>/dev/null || true)"
     [ -n "$_crypto_html" ] || return 0
@@ -828,17 +1385,21 @@ const crypto = require("crypto");
 const raw = Buffer.from(process.argv[1] || "", "base64");
 const version = raw[0];
 if (version !== 1) process.exit(2);
-const keyA = Buffer.from(process.argv[2] || "", "hex");
-const keyB = Buffer.from(process.argv[3] || "", "base64");
-const key = Buffer.alloc(Math.min(keyA.length, keyB.length));
-for (let i = 0; i < key.length; i += 1) key[i] = keyA[i] ^ keyB[i];
+let key = Buffer.from(process.argv[2] || "", "hex");
+if (key.length !== 32) {
+  const keyA = Buffer.from(process.argv[3] || "", "hex");
+  const keyB = Buffer.from(process.argv[4] || "", "base64");
+  key = Buffer.alloc(Math.min(keyA.length, keyB.length));
+  for (let i = 0; i < key.length; i += 1) key[i] = keyA[i] ^ keyB[i];
+}
+if (key.length !== 32) process.exit(2);
 const iv = raw.subarray(1, 13);
 const ciphertext = raw.subarray(13, raw.length - 16);
 const tag = raw.subarray(raw.length - 16);
 const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
 decipher.setAuthTag(tag);
 process.stdout.write(Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString("utf8"));
-' "$1" "$allanime_key_a" "$allanime_key_b" 2>/dev/null && return 0
+' "$1" "$allanime_key" "$allanime_key_a" "$allanime_key_b" 2>/dev/null && return 0
     fi
 
     _python_cmd="$(ani_watch_python || true)"
@@ -856,11 +1417,15 @@ raw = base64.b64decode(sys.argv[1])
 version = raw[0]
 if version != 1:
     raise SystemExit(2)
-key_a = bytes.fromhex(sys.argv[2])
-key_b = base64.b64decode(sys.argv[3])
-key = bytes(a ^ b for a, b in zip(key_a, key_b))
+direct_key = bytes.fromhex(sys.argv[2]) if len(sys.argv[2]) == 64 else b""
+if len(direct_key) == 32:
+    key = direct_key
+else:
+    key_a = bytes.fromhex(sys.argv[3])
+    key_b = base64.b64decode(sys.argv[4])
+    key = bytes(a ^ b for a, b in zip(key_a, key_b))
 sys.stdout.write(AESGCM(key).decrypt(raw[1:13], raw[13:], None).decode())
-' "$1" "$allanime_key_a" "$allanime_key_b" 2>/dev/null && return 0
+' "$1" "$allanime_key" "$allanime_key_a" "$allanime_key_b" 2>/dev/null && return 0
     fi
 
     tmp="$(mktemp)"
@@ -1003,7 +1568,7 @@ make_aa_req_openssl() {
 
     _query_hash=$1
     _ts="$(($(date +%s) / 300 * 300 * 1000))"
-    _payload_iv="${allanime_aa_epoch}:${_query_hash}:${_ts}"
+    _payload_iv="${allanime_aa_epoch}:${allanime_build_id}:${_query_hash}:${_ts}:${allanime_lane}"
     _payload="{\"v\":1,\"ts\":$_ts,\"epoch\":$allanime_aa_epoch,\"buildId\":\"$allanime_build_id\",\"qh\":\"$_query_hash\",\"k\":\"$allanime_lane\"}"
 
     _iv_hex="$(printf '%s' "$_payload_iv" | openssl dgst -sha256 -binary | dd bs=1 count=12 2>/dev/null | od -An -tx1 | tr -d ' \n')"
@@ -1043,18 +1608,16 @@ const crypto = require("crypto");
 const qh = process.argv[1] || "";
 const epoch = process.argv[2] || "";
 const buildId = process.argv[3] || "";
-const keyA = Buffer.from(process.argv[4] || "", "hex");
-const keyB = Buffer.from(process.argv[5] || "", "base64");
-const lane = process.argv[6] || "";
-const key = Buffer.alloc(Math.min(keyA.length, keyB.length));
-for (let i = 0; i < key.length; i += 1) key[i] = keyA[i] ^ keyB[i];
+const key = Buffer.from(process.argv[4] || "", "hex");
+const lane = process.argv[5] || "";
+if (key.length !== 32) process.exit(2);
 const ts = Math.floor(Date.now() / 300000) * 300000;
-const iv = crypto.createHash("sha256").update(`${epoch}:${qh}:${ts}`).digest().subarray(0, 12);
+const iv = crypto.createHash("sha256").update(`${epoch}:${buildId}:${qh}:${ts}:${lane}`).digest().subarray(0, 12);
 const payload = JSON.stringify({v: 1, ts, epoch: Number(epoch), buildId, qh, k: lane});
 const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
 const encrypted = Buffer.concat([cipher.update(payload, "utf8"), cipher.final()]);
 process.stdout.write(Buffer.concat([Buffer.from([1]), iv, encrypted, cipher.getAuthTag()]).toString("base64"));
-' "$_query_hash" "$allanime_aa_epoch" "$allanime_build_id" "$allanime_key_a" "$allanime_key_b" "$allanime_lane" 2>/dev/null && return 0
+' "$_query_hash" "$allanime_aa_epoch" "$allanime_build_id" "$allanime_key" "$allanime_lane" 2>/dev/null && return 0
     fi
 
     _python_cmd="$(ani_watch_python || true)"
@@ -1074,15 +1637,15 @@ except Exception:
 qh = sys.argv[1]
 epoch = sys.argv[2]
 build_id = sys.argv[3]
-key_a = bytes.fromhex(sys.argv[4])
-key_b = base64.b64decode(sys.argv[5])
-lane = sys.argv[6]
-key = bytes(a ^ b for a, b in zip(key_a, key_b))
+key = bytes.fromhex(sys.argv[4])
+lane = sys.argv[5]
+if len(key) != 32:
+    raise SystemExit(2)
 ts = (int(time.time() * 1000) // 300000) * 300000
-iv = hashlib.sha256(f"{epoch}:{qh}:{ts}".encode()).digest()[:12]
+iv = hashlib.sha256(f"{epoch}:{build_id}:{qh}:{ts}:{lane}".encode()).digest()[:12]
 payload = json.dumps({"v": 1, "ts": ts, "epoch": int(epoch), "buildId": build_id, "qh": qh, "k": lane}, separators=(",", ":")).encode()
 sys.stdout.write(base64.b64encode(b"\x01" + iv + AESGCM(key).encrypt(iv, payload, None)).decode())
-' "$_query_hash" "$allanime_aa_epoch" "$allanime_build_id" "$allanime_key_a" "$allanime_key_b" "$allanime_lane" 2>/dev/null && return 0
+' "$_query_hash" "$allanime_aa_epoch" "$allanime_build_id" "$allanime_key" "$allanime_lane" 2>/dev/null && return 0
     fi
 
     make_aa_req_openssl "$_query_hash"
@@ -1157,10 +1720,13 @@ get_filemoon_links() {
 
 # gets embed urls, collects direct links into provider files, selects one with desired quality into $episode
 get_episode_url() {
+    unset episode links subtitle subs_flag refr_flag m3u8_refr result
+    allanime_failure=""
+
     #shellcheck disable=SC2016
     episode_embed_gql='query ($showId: String!, $translationType: VaildTranslationTypeEnumType!, $episodeString: String!) { episode( showId: $showId translationType: $translationType episodeString: $episodeString ) { episodeString sourceUrls }}'
 
-    query_hash="d405d0edd690624b66baba3068e0edc3ac90f1597d898a1ec8db4e5c43c00fec"
+    query_hash="f4662f4b7510b26795dd53ef824a0bf1740fbbc5d1273fab18222ac831bca8d0"
     query_vars="{\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"}"
 
     [ "$allanime_crypto_cache_loaded" = "1" ] || load_allanime_crypto_config force
@@ -1191,9 +1757,9 @@ get_episode_url() {
         fi
     fi
 
-    [ -z "$resp" ] && [ -n "$retry_after" ] && die "AllAnime rate-limited episode source requests. Wait about ${retry_after}s before trying again."
+    [ -z "$resp" ] && [ -n "$retry_after" ] && allanime_failure="AllAnime rate-limited episode source requests. Wait about ${retry_after}s before trying again."
 
-    if [ -z "$resp" ] && [ -z "$retry_after" ] && ! allanime_crypto_error_needs_refresh "$api_error"; then
+    if [ -z "$resp" ] && [ -z "$retry_after" ] && [ -z "$allanime_failure" ] && ! allanime_crypto_error_needs_refresh "$api_error"; then
         query_ext="{\"persistedQuery\":{\"version\":1,\"sha256Hash\":\"$query_hash\"},\"k\":\"$allanime_lane\"}"
         api_resp="$(curl -e "$allanime_api_refr" -sG -A "$agent" -H "Origin: ${allanime_api_refr}" -H "x-build-id: ${allanime_build_id}" "${allanime_api}/api" --data-urlencode "variables=${query_vars}" --data-urlencode "extensions=${query_ext}")"
         resp="$(episode_sources_from_api_response "$api_resp" || true)"
@@ -1201,36 +1767,67 @@ get_episode_url() {
         retry_after="$(printf "%s" "$api_error" | sed -nE 's|.*try again in ([0-9]+) seconds?.*|\1|p')"
     fi
 
-    if [ -z "$resp" ] && [ -z "$retry_after" ] && [ "$api_error" != "AA_CRYPTO_MISSING" ]; then
+    if [ -z "$resp" ] && [ -z "$retry_after" ] && [ -z "$allanime_failure" ] && [ "$api_error" != "AA_CRYPTO_MISSING" ]; then
         api_resp="$(curl -e "$allanime_api_refr" -s -H "Content-Type: application/json" -H "Origin: ${allanime_api_refr}" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$id\",\"translationType\":\"$mode\",\"episodeString\":\"$ep_no\"},\"query\":\"$episode_embed_gql\"}" -A "$agent")"
         resp="$(episode_sources_from_api_response "$api_resp" || true)"
         api_error="$(printf "%s" "$api_resp" | sed -nE 's|.*"message":"([^"]+)".*|\1|p' | head -1)"
         retry_after="$(printf "%s" "$api_error" | sed -nE 's|.*try again in ([0-9]+) seconds?.*|\1|p')"
     fi
-    [ -z "$resp" ] && [ -n "$retry_after" ] && die "AllAnime rate-limited episode source requests. Wait about ${retry_after}s before trying again."
-    [ -z "$resp" ] && [ "$api_error" = "AA_CRYPTO_MISSING" ] && die "AllAnime rejected the episode source request (AA_CRYPTO_MISSING). Refreshed crypto material and retried the aaReq path."
-    [ -z "$resp" ] && printf "%s" "$api_resp" | grep -q '"tobeparsed"' && die "AllAnime returned encrypted episode sources, but neither the upstream decoder nor the aaReq fallback decoded them."
-    [ -z "$resp" ] && [ -n "$api_error" ] && die "AllAnime source request failed: $api_error"
 
-    # generate links into sequential files
-    cache_dir="$(mktemp -d)"
-    providers="$(printf "%s\n" "$resp" | sed -nE 's|^([^[:space:]][^:]*) :.*|\1|p')"
-    [ -z "$providers" ] && providers="Default Mp4 Yt-mp4 S-mp4 Luf-Mp4 Fm-mp4 Ak Uv-mp4"
-    for provider in $providers; do
-        cache_file="$(printf "%s" "$provider" | tr -c '[:alnum:]_-' '_')"
-        generate_link "$provider" >"$cache_dir"/"$cache_file" &
-    done
-    wait
-    # select the link with matching quality
-    links=$(cat "$cache_dir"/* | sort -g -r -s)
-    rm -r "$cache_dir"
-    links="$(prefer_playable_links "$links")"
-    select_quality "$quality"
-    if printf "%s" "$ep_list" | grep -q "^$ep_no$"; then
-        [ -z "$episode" ] && die "Episode is released, but AllAnime returned no valid playable sources for this episode."
-    else
-        [ -z "$episode" ] && die "Episode not released!"
+    if [ -z "$resp" ] && [ -z "$allanime_failure" ]; then
+        if [ -n "$retry_after" ]; then
+            allanime_failure="AllAnime rate-limited episode source requests. Wait about ${retry_after}s before trying again."
+        elif [ "$api_error" = "AA_CRYPTO_MISSING" ]; then
+            allanime_failure="AllAnime rejected the episode source request (AA_CRYPTO_MISSING) after refreshing crypto material."
+        elif [ "$api_error" = "AA_CRYPTO_MISSING_BUILD" ]; then
+            allanime_failure="AllAnime rejected the episode source request (AA_CRYPTO_MISSING_BUILD) after refreshing runtime crypto material."
+        elif printf "%s" "$api_resp" | grep -q '"tobeparsed"'; then
+            allanime_failure="AllAnime returned encrypted episode sources, but neither the upstream decoder nor the aaReq fallback decoded them."
+        elif [ -n "$api_error" ]; then
+            allanime_failure="AllAnime source request failed: $api_error."
+        else
+            allanime_failure="AllAnime returned no episode sources."
+        fi
     fi
+
+    if [ -n "$resp" ]; then
+        cache_dir="$(mktemp -d)"
+        providers="$(printf "%s\n" "$resp" | sed -nE 's|^([^[:space:]][^:]*) :.*|\1|p')"
+        [ -z "$providers" ] && providers="Default Mp4 Yt-mp4 S-mp4 Luf-Mp4 Fm-mp4 Ak Uv-mp4"
+        for provider in $providers; do
+            cache_file="$(printf "%s" "$provider" | tr -c '[:alnum:]_-' '_')"
+            generate_link "$provider" >"$cache_dir"/"$cache_file" &
+        done
+        wait
+        links=$(cat "$cache_dir"/* 2>/dev/null | sort -g -r -s)
+        rm -r "$cache_dir"
+        links="$(prefer_playable_links "$links")"
+        select_quality "$quality"
+        [ -n "$episode" ] && return 0
+        allanime_failure="Episode is released, but AllAnime returned no valid playable sources for this episode."
+    fi
+
+    printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Episode not released!"
+
+    printf "\033[1;33m%s\033[0m\n" "${allanime_failure} Trying anidb.app fallback..." 1>&2
+    anidb_links_file="$(mktemp)"
+    anidb_fetch_episode_links "$title" >"$anidb_links_file" || true
+    links="$(cat "$anidb_links_file")"
+    rm -f "$anidb_links_file"
+    if [ -n "$links" ]; then
+        links="$(prefer_playable_links "$links")"
+        select_quality "$quality"
+        if [ -n "$episode" ]; then
+            refr_flag="--referrer=https://anidb.app"
+            m3u8_refr="https://anidb.app"
+            printf "\033[1;32m%s\033[0m Links Fetched\n" "anidb.app" 1>&2
+            return 0
+        fi
+        anidb_last_error="anidb.app returned streams, but no playable quality matched"
+    fi
+
+    [ -n "$anidb_last_error" ] && die "${allanime_failure} anidb.app fallback also failed: ${anidb_last_error}."
+    die "$allanime_failure"
 }
 
 # search the query and give results
@@ -1476,6 +2073,7 @@ play() {
 
 # setup
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
+anidb_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 allanime_refr="https://youtu-chan.com"
 allanime_base="allanime.day"
 allanime_api_refr="https://mkissa.to"

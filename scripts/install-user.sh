@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+ROOT_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 VENV_DIR=${ANI_WATCHLIST_VENV:-"$HOME/.local/share/ani-watchlist/venv"}
 BIN_DIR="$HOME/.local/bin"
 ANI_CLI_SCRIPT="$ROOT_DIR/ani-cli/ani-cli"
