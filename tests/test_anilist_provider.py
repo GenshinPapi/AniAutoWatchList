@@ -1,6 +1,18 @@
 from __future__ import annotations
 
-from ani_watchlist.providers.anilist import AniListProvider, display_title_from_media, search_title_variants
+import io
+import urllib.error
+
+import pytest
+
+from ani_watchlist.config import AniListConfig
+from ani_watchlist.providers.anilist import (
+    AniListProvider,
+    _AniListCircuitBreaker,
+    _AniListRateLimiter,
+    display_title_from_media,
+    search_title_variants,
+)
 
 
 def test_search_title_variants_split_parenthetical_titles() -> None:
@@ -47,6 +59,72 @@ def test_trending_query_returns_media_payloads(app_env) -> None:
             return {"Page": {"media": [{"id": 1}, {"id": 2}, {"id": 3}]}}
 
     assert FakeAniListProvider().get_trending_anime(limit=2) == [{"id": 1}, {"id": 2}]
+
+
+def test_request_includes_anilist_http_error_body(app_env, monkeypatch) -> None:
+    body = (
+        b'{"errors":[{"message":"The AniList API has been temporarily disabled due to severe stability issues.",'
+        b'"status":403}]}'
+    )
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", None, io.BytesIO(body))
+
+    monkeypatch.setattr("ani_watchlist.providers.anilist.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("ani_watchlist.providers.anilist._ANILIST_CIRCUIT_BREAKER", _AniListCircuitBreaker())
+
+    with pytest.raises(RuntimeError, match="temporarily disabled"):
+        AniListProvider().get_trending_anime(limit=1)
+
+
+def test_temporary_403_opens_anilist_circuit_breaker(app_env, monkeypatch) -> None:
+    now = 100.0
+    breaker = _AniListCircuitBreaker(clock=lambda: now)
+    limiter = _AniListRateLimiter(clock=lambda: now, sleeper=lambda seconds: None, safety_seconds=0)
+    calls = 0
+    body = (
+        b'{"errors":[{"message":"The AniList API has been temporarily disabled due to severe stability issues.",'
+        b'"status":403}]}'
+    )
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001
+        nonlocal calls
+        calls += 1
+        raise urllib.error.HTTPError(request.full_url, 403, "Forbidden", None, io.BytesIO(body))
+
+    monkeypatch.setattr("ani_watchlist.providers.anilist.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("ani_watchlist.providers.anilist._ANILIST_CIRCUIT_BREAKER", breaker)
+    monkeypatch.setattr("ani_watchlist.providers.anilist._ANILIST_RATE_LIMITER", limiter)
+    provider = AniListProvider(AniListConfig(temporary_block_cooldown_seconds=300))
+
+    with pytest.raises(RuntimeError, match="temporarily disabled"):
+        provider.get_trending_anime(limit=1)
+    assert breaker.remaining_seconds() == pytest.approx(300)
+
+    with pytest.raises(RuntimeError, match="request skipped"):
+        provider.get_trending_anime(limit=1)
+    assert calls == 1
+
+
+def test_rate_limiter_spaces_anilist_requests_below_30_per_minute() -> None:
+    now = 100.0
+    sleeps: list[float] = []
+
+    def clock() -> float:
+        return now
+
+    def sleeper(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    limiter = _AniListRateLimiter(clock=clock, sleeper=sleeper, safety_seconds=0.05)
+
+    limiter.wait(30)
+    limiter.wait(30)
+    limiter.wait(30)
+
+    assert sleeps == pytest.approx([2.05, 2.05])
 
 
 def test_search_anime_media_uses_search_match_query(app_env) -> None:

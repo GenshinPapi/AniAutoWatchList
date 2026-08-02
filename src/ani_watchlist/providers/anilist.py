@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -373,6 +375,126 @@ def _popular_filter_variables(genre: str | None = None, tag: str | None = None) 
     return variables
 
 
+def _http_error_detail(exc: urllib.error.HTTPError) -> str:
+    try:
+        raw = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        raw = ""
+    if raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            payload = None
+        errors = payload.get("errors") if isinstance(payload, dict) else None
+        if isinstance(errors, list):
+            messages = [
+                str(error.get("message")).strip()
+                for error in errors
+                if isinstance(error, dict) and str(error.get("message") or "").strip()
+            ]
+            if messages:
+                return f"HTTP Error {exc.code}: {'; '.join(messages)}"
+        cleaned = re.sub(r"\s+", " ", raw).strip()
+        if cleaned:
+            return f"HTTP Error {exc.code}: {cleaned[:300]}"
+    return str(exc)
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    if headers is None:
+        return None
+    try:
+        value = headers.get("Retry-After")
+    except AttributeError:
+        return None
+    try:
+        seconds = float(str(value or "").strip())
+    except ValueError:
+        return None
+    return seconds if seconds > 0 else None
+
+
+def _is_temporary_unavailable_error(status_code: int, detail: str) -> bool:
+    if status_code != 403:
+        return False
+    return bool(
+        re.search(
+            r"temporar(?:ily|y).*(disabled|unavailable|blocked)|severe stability|ongoing attack",
+            detail,
+            flags=re.IGNORECASE,
+        )
+    )
+
+
+class _AniListRateLimiter:
+    def __init__(
+        self,
+        *,
+        clock=time.monotonic,
+        sleeper=time.sleep,
+        safety_seconds: float = 0.05,
+    ) -> None:
+        self._clock = clock
+        self._sleeper = sleeper
+        self._safety_seconds = max(0.0, float(safety_seconds))
+        self._lock = threading.Lock()
+        self._next_request_at = 0.0
+
+    def wait(self, requests_per_minute: int) -> None:
+        limit = max(1, int(requests_per_minute or 30))
+        interval = (60.0 / limit) + self._safety_seconds
+        with self._lock:
+            now = self._clock()
+            wait_for = max(0.0, self._next_request_at - now)
+            scheduled_at = max(now, self._next_request_at)
+            self._next_request_at = scheduled_at + interval
+        if wait_for > 0:
+            self._sleeper(wait_for)
+
+    def defer(self, seconds: float) -> None:
+        if seconds <= 0:
+            return
+        with self._lock:
+            self._next_request_at = max(self._next_request_at, self._clock() + seconds + self._safety_seconds)
+
+
+_ANILIST_RATE_LIMITER = _AniListRateLimiter()
+
+
+class _AniListCircuitBreaker:
+    def __init__(self, *, clock=time.monotonic) -> None:
+        self._clock = clock
+        self._lock = threading.Lock()
+        self._open_until = 0.0
+        self._reason = ""
+
+    def raise_if_open(self) -> None:
+        with self._lock:
+            remaining = self._open_until - self._clock()
+            reason = self._reason
+        if remaining > 0:
+            seconds = max(1, int(remaining + 0.999))
+            raise RuntimeError(
+                "AniList request skipped: AniList recently returned a temporary availability block. "
+                f"Retrying in about {seconds}s. Last error: {reason}"
+            )
+
+    def open(self, seconds: int, reason: str) -> None:
+        cooldown = max(0, int(seconds or 0))
+        if cooldown <= 0:
+            return
+        with self._lock:
+            self._open_until = max(self._open_until, self._clock() + cooldown)
+            self._reason = reason
+
+    def remaining_seconds(self) -> float:
+        with self._lock:
+            return max(0.0, self._open_until - self._clock())
+
+
+_ANILIST_CIRCUIT_BREAKER = _AniListCircuitBreaker()
+
+
 class AniListProvider:
     name = "anilist"
 
@@ -392,9 +514,19 @@ class AniListProvider:
             },
             method="POST",
         )
+        _ANILIST_CIRCUIT_BREAKER.raise_if_open()
+        _ANILIST_RATE_LIMITER.wait(self.config.requests_per_minute)
         try:
             with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            detail = _http_error_detail(exc)
+            retry_after = _retry_after_seconds(exc.headers)
+            if retry_after is not None:
+                _ANILIST_RATE_LIMITER.defer(retry_after)
+            if _is_temporary_unavailable_error(exc.code, detail):
+                _ANILIST_CIRCUIT_BREAKER.open(self.config.temporary_block_cooldown_seconds, detail)
+            raise RuntimeError(f"AniList request failed: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"AniList request failed: {exc}") from exc
         payload = json.loads(raw)

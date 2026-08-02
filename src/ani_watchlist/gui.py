@@ -1824,7 +1824,7 @@ class WatchlistApp:
             sections.append(self.update_details("Bundled patched ani-cli", ani_cli_info))
             sections.append(
                 "Use AniAutoWatchList updates for ani-cli changes. Direct ani-cli -U is disabled on the patched script so "
-                "watchlist hooks, embedded-player flags, and mp4 provider fixes stay installed."
+                "watchlist hooks, embedded-player flags, and bundled playback fixes stay installed."
             )
         details = "\n\n".join(sections)
 
@@ -2640,8 +2640,8 @@ class WatchlistApp:
             return
         if target is None and (metadata_payload_is_adult(metadata_payload) or title_has_adult_label(anime["display_title"])):
             message = (
-                f"AllAnime did not return a playable result for {title_for_message}. "
-                "ani-cli can only launch titles available from AllAnime."
+                f"AllAnime did not return a launchable listing for {title_for_message}. "
+                "ani-cli still needs an AllAnime listing before resolving playback."
             )
             self.launch_label.configure(text=message, fg=COLORS["danger"])
             messagebox.showwarning("AllAnime result not found", message)
@@ -2774,8 +2774,8 @@ class WatchlistApp:
             target = None
         if target is None and (metadata_payload_is_adult(metadata_payload) or title_has_adult_label(anime["display_title"])):
             message = (
-                f"AllAnime did not return a playable result for {title_for_message}. "
-                "Watch parties can only launch titles available from AllAnime."
+                f"AllAnime did not return a launchable listing for {title_for_message}. "
+                "Watch parties still need an AllAnime listing before resolving playback."
             )
             self.launch_label.configure(text=message, fg=COLORS["danger"])
             messagebox.showwarning("AllAnime result not found", message)

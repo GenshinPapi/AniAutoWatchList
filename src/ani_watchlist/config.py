@@ -23,6 +23,8 @@ auto_link_confidence = 0.86
 enabled = true
 endpoint = "https://graphql.anilist.co"
 timeout_seconds = 8
+requests_per_minute = 30
+temporary_block_cooldown_seconds = 600
 """
 
 
@@ -42,6 +44,8 @@ class AniListConfig:
     enabled: bool = True
     endpoint: str = "https://graphql.anilist.co"
     timeout_seconds: int = 8
+    requests_per_minute: int = 30
+    temporary_block_cooldown_seconds: int = 600
 
 
 @dataclass(frozen=True)
@@ -85,6 +89,8 @@ def load_config(path: Path | None = None) -> AppConfig:
             enabled=bool(anilist.get("enabled", True)),
             endpoint=str(anilist.get("endpoint", "https://graphql.anilist.co")),
             timeout_seconds=int(anilist.get("timeout_seconds", 8)),
+            requests_per_minute=int(anilist.get("requests_per_minute", 30)),
+            temporary_block_cooldown_seconds=int(anilist.get("temporary_block_cooldown_seconds", 600)),
         ),
     )
 
