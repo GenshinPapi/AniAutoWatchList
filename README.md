@@ -216,6 +216,7 @@ The GUI includes:
 - Cover grid
 - Search/filter box
 - Watchlist JSON/XML import and export
+- One-click background metadata and cover refresh for every watchlist entry
 - Anime detail page
 - Related seasons and side stories on detail pages
 - Episode checklist
@@ -228,6 +229,8 @@ The GUI includes:
 - Recent activity panel
 
 Type in the top search box to fetch AniList title suggestions. Press Enter to show matching titles as discovery-style cards with the same Plan and AniList actions.
+
+Use **Refresh Metadata** on the Watchlist page after a JSON/XML import to update AniList details and cover art for every entry. The refresh runs in the background, displays progress, and reports titles that could not be linked confidently so they can be handled with the detail page's match selector.
 
 When a watchlist entry has an AniList match, the detail page shows related anime from AniList below the episode and activity panels. Sequels, prequels, parent entries, side stories, and spin-offs appear as discovery-style cards. Prequel, sequel, and parent links are followed across the relation chain so later seasons can appear even when AniList links them through an intermediate entry.
 

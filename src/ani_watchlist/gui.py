@@ -42,7 +42,14 @@ from .launcher import (
     launch_episode,
     resolve_allanime_launch_target,
 )
-from .metadata import refresh_metadata_for_anime, select_match, selected_metadata_payload, store_selected_metadata_payload
+from .metadata import (
+    BulkMetadataRefreshResult,
+    refresh_all_metadata,
+    refresh_metadata_for_anime,
+    select_match,
+    selected_metadata_payload,
+    store_selected_metadata_payload,
+)
 from .paths import get_paths
 from .party import (
     MpvIpcController,
@@ -280,6 +287,7 @@ class WatchlistApp:
         self.discovery_loading_more: set[str] = set()
         self.discovery_error: str | None = None
         self.update_checking = False
+        self.metadata_refreshing = False
         self.search_loading = False
         self.search_results: list[dict[str, object]] = []
         self.search_result_query = ""
@@ -611,7 +619,16 @@ class WatchlistApp:
         import_button.configure(menu=import_menu)
         import_button.grid(row=0, column=2, padx=(8, 0))
         ttk.Button(header, text="Add", style="Accent.TButton", command=self.add_anime).grid(row=0, column=3, padx=(8, 0))
-        ttk.Button(header, text="Refresh", style="Dark.TButton", command=self.refresh_library).grid(row=0, column=4, padx=(8, 0))
+        self.refresh_all_metadata_button = ttk.Button(
+            header,
+            text="Refresh Metadata",
+            style="Dark.TButton",
+            command=self.start_all_metadata_refresh,
+        )
+        self.refresh_all_metadata_button.grid(row=0, column=4, padx=(8, 0))
+        ttk.Button(header, text="Refresh List", style="Dark.TButton", command=self.refresh_library).grid(
+            row=0, column=5, padx=(8, 0)
+        )
 
         tabs = tk.Frame(page, bg=COLORS["bg"])
         tabs.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
@@ -4156,6 +4173,76 @@ class WatchlistApp:
             return
         messagebox.showinfo("Metadata refreshed", f"Stored {count} AniList candidate(s).")
         self.load_detail()
+
+    def start_all_metadata_refresh(self) -> None:
+        if self.metadata_refreshing:
+            return
+        rows = list_anime(self.conn)
+        if not rows:
+            messagebox.showinfo("Refresh metadata", "The watchlist is empty.")
+            return
+        config = load_config()
+        if not config.anilist.enabled:
+            messagebox.showwarning("Refresh metadata", "AniList metadata is disabled in the application config.")
+            return
+        total = len(rows)
+        if not messagebox.askyesno(
+            "Refresh all metadata",
+            f"Refresh AniList metadata and cover art for all {total} watchlist entr{'y' if total == 1 else 'ies'}?\n\n"
+            "This runs in the background and may take several minutes because AniList requests are rate limited.",
+        ):
+            return
+        self.metadata_refreshing = True
+        self.refresh_all_metadata_button.configure(state="disabled")
+        self.dashboard_label.configure(text=f"Refreshing metadata 0/{total}...")
+
+        def progress(current: int, progress_total: int, title: str) -> None:
+            self.run_on_ui(
+                lambda: self.dashboard_label.configure(
+                    text=f"Refreshing metadata {current}/{progress_total}: {split_display_title(title)[0]}"
+                )
+            )
+
+        def worker() -> None:
+            try:
+                with initialize() as conn:
+                    result = refresh_all_metadata(conn, config, progress=progress)
+            except Exception as exc:
+                self.run_on_ui(lambda error=str(exc): self.finish_all_metadata_refresh(None, error=error))
+                return
+            self.run_on_ui(lambda: self.finish_all_metadata_refresh(result, error=None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_all_metadata_refresh(
+        self,
+        result: BulkMetadataRefreshResult | None,
+        *,
+        error: str | None,
+    ) -> None:
+        self.metadata_refreshing = False
+        self.refresh_all_metadata_button.configure(state="normal")
+        self.library_render_signature = None
+        self.activity_signature = None
+        self.refresh_library(preserve_scroll=True)
+        if error:
+            messagebox.showwarning("Metadata refresh failed", error)
+            return
+        if result is None:
+            return
+        lines = [
+            f"Refreshed {result.refreshed} of {result.total} watchlist entries.",
+            f"AniList-linked entries: {result.linked}",
+        ]
+        if result.unresolved:
+            lines.append(f"Need manual match selection: {result.unresolved}")
+        if result.failures:
+            lines.append(f"Failed: {len(result.failures)}")
+            lines.append("")
+            lines.extend(f"• {title}: {failure}" for title, failure in result.failures[:8])
+            if len(result.failures) > 8:
+                lines.append(f"• …and {len(result.failures) - 8} more")
+        messagebox.showinfo("Metadata refresh complete", "\n".join(lines))
 
     def choose_match(self) -> None:
         if self.selected_anime_id is None:

@@ -2,13 +2,28 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from collections.abc import Callable
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .config import AppConfig
 from .paths import get_paths
 from .providers.anilist import AniListProvider, search_title_variants, title_with_content_labels
 from .providers.base import MetadataSearchResult
-from .store import canonicalize_title, get_anime_by_id, now_iso, update_anime_fields
+from .store import canonicalize_title, get_anime_by_id, list_anime, now_iso, update_anime_fields
+
+
+MetadataRefreshProgress = Callable[[int, int, str], None]
+
+
+@dataclass(frozen=True)
+class BulkMetadataRefreshResult:
+    total: int
+    refreshed: int
+    linked: int
+    unresolved: int
+    failures: tuple[tuple[str, str], ...]
 
 
 def _cover_url(payload: dict[str, Any]) -> str | None:
@@ -241,7 +256,8 @@ def refresh_metadata_for_anime(
         media_id = str(anime["anilist_id"])
         media = provider.get_media(media_id)
         cover_path = None
-        if _cover_url(media) and not anime["cover_path"]:
+        current_cover = str(anime["cover_path"] or "").strip()
+        if _cover_url(media) and (not current_cover or not Path(current_cover).expanduser().exists()):
             try:
                 cover_path = provider.cache_cover(media_id, _cover_url(media))
             except Exception:
@@ -274,6 +290,46 @@ def refresh_metadata_for_anime(
             )
         ]
     return search_and_store_matches(conn, anime_id, anime["display_title"], config, provider)
+
+
+def refresh_all_metadata(
+    conn: sqlite3.Connection,
+    config: AppConfig,
+    *,
+    provider: AniListProvider | None = None,
+    progress: MetadataRefreshProgress | None = None,
+) -> BulkMetadataRefreshResult:
+    """Refresh AniList metadata for every anime in the local watchlist."""
+    anime_rows = list_anime(conn)
+    total = len(anime_rows)
+    refreshed = 0
+    linked = 0
+    unresolved = 0
+    failures: list[tuple[str, str]] = []
+    provider = provider or AniListProvider(config.anilist)
+
+    for index, anime in enumerate(anime_rows, start=1):
+        title = str(anime["display_title"])
+        try:
+            refresh_metadata_for_anime(conn, int(anime["id"]), config, provider)
+            refreshed += 1
+            updated = get_anime_by_id(conn, int(anime["id"]))
+            if updated is not None and updated["anilist_id"]:
+                linked += 1
+            else:
+                unresolved += 1
+        except Exception as exc:
+            failures.append((title, str(exc)))
+        if progress is not None:
+            progress(index, total, title)
+
+    return BulkMetadataRefreshResult(
+        total=total,
+        refreshed=refreshed,
+        linked=linked,
+        unresolved=unresolved,
+        failures=tuple(failures),
+    )
 
 
 def select_match(conn: sqlite3.Connection, anime_id: int, match_id: int, provider: AniListProvider | None = None) -> None:

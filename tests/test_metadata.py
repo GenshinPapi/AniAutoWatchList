@@ -4,9 +4,9 @@ import json
 
 from ani_watchlist.config import AppConfig, AniListConfig, MetadataConfig
 from ani_watchlist.db import initialize
-from ani_watchlist.metadata import search_and_store_matches, store_selected_metadata_payload
+from ani_watchlist.metadata import refresh_all_metadata, refresh_metadata_for_anime, search_and_store_matches, store_selected_metadata_payload
 from ani_watchlist.providers.base import MetadataSearchResult
-from ani_watchlist.store import get_or_create_anime
+from ani_watchlist.store import get_or_create_anime, update_anime_fields
 
 
 class FakeProvider:
@@ -20,6 +20,12 @@ class FakeProvider:
 
     def cache_cover(self, media_id, url):
         return f"/tmp/{media_id}.jpg"
+
+    def get_media(self, media_id):
+        for result in self.results:
+            if str(result.media_id) == str(media_id):
+                return result.payload
+        raise RuntimeError(f"missing media: {media_id}")
 
 
 def payload(media_id=1, title="Cowboy Bebop", episodes=26):
@@ -162,3 +168,75 @@ def test_store_selected_metadata_payload_preserves_discovery_match(app_env):
     selected = conn.execute("SELECT * FROM metadata_matches WHERE anime_id = ?", (anime["id"],)).fetchone()
     assert selected["selected"] == 1
     assert json.loads(selected["payload_json"])["synonyms"] == ["Bible Black: Night of the Walpulgiss"]
+
+
+def test_refresh_linked_metadata_replaces_stale_imported_cover_path(app_env, tmp_path) -> None:
+    conn = initialize()
+    anime, _ = get_or_create_anime(conn, "Cowboy Bebop")
+    update_anime_fields(conn, anime["id"], anilist_id=1, cover_path=str(tmp_path / "missing-cover.jpg"))
+    result = MetadataSearchResult("anilist", "1", "Cowboy Bebop", 1.0, payload())
+    config = AppConfig(metadata=MetadataConfig(search_on_new_title=True), anilist=AniListConfig(enabled=True))
+
+    refresh_metadata_for_anime(conn, anime["id"], config, FakeProvider([result]))
+
+    stored = conn.execute("SELECT * FROM anime WHERE id = ?", (anime["id"],)).fetchone()
+    assert stored["cover_path"] == "/tmp/1.jpg"
+
+
+def test_refresh_all_metadata_links_every_confident_watchlist_entry(app_env) -> None:
+    conn = initialize()
+    first, _ = get_or_create_anime(conn, "Cowboy Bebop")
+    second, _ = get_or_create_anime(conn, "Frieren")
+    results = {
+        "Cowboy Bebop": MetadataSearchResult("anilist", "1", "Cowboy Bebop", 1.0, payload()),
+        "Frieren": MetadataSearchResult("anilist", "2", "Frieren", 1.0, payload(2, "Frieren", 28)),
+    }
+
+    class RoutingProvider(FakeProvider):
+        def __init__(self):
+            super().__init__(list(results.values()))
+
+        def search_title(self, title):
+            return [results[title]]
+
+    config = AppConfig(metadata=MetadataConfig(search_on_new_title=True), anilist=AniListConfig(enabled=True))
+    progress: list[tuple[int, int, str]] = []
+
+    summary = refresh_all_metadata(
+        conn,
+        config,
+        provider=RoutingProvider(),
+        progress=lambda current, total, title: progress.append((current, total, title)),
+    )
+
+    assert summary.total == 2
+    assert summary.refreshed == 2
+    assert summary.linked == 2
+    assert summary.unresolved == 0
+    assert summary.failures == ()
+    assert conn.execute("SELECT anilist_id FROM anime WHERE id = ?", (first["id"],)).fetchone()[0] == 1
+    assert conn.execute("SELECT anilist_id FROM anime WHERE id = ?", (second["id"],)).fetchone()[0] == 2
+    assert progress == [(1, 2, "Cowboy Bebop"), (2, 2, "Frieren")]
+
+
+def test_refresh_all_metadata_continues_after_individual_failure(app_env) -> None:
+    conn = initialize()
+    get_or_create_anime(conn, "Broken Show")
+    get_or_create_anime(conn, "Cowboy Bebop")
+    result = MetadataSearchResult("anilist", "1", "Cowboy Bebop", 1.0, payload())
+
+    class PartiallyFailingProvider(FakeProvider):
+        def search_title(self, title):
+            if title == "Broken Show":
+                raise RuntimeError("temporary failure")
+            return super().search_title(title)
+
+    config = AppConfig(metadata=MetadataConfig(search_on_new_title=True), anilist=AniListConfig(enabled=True))
+
+    summary = refresh_all_metadata(conn, config, provider=PartiallyFailingProvider([result]))
+
+    assert summary.total == 2
+    assert summary.refreshed == 1
+    assert summary.linked == 1
+    assert summary.unresolved == 0
+    assert summary.failures == (("Broken Show", "temporary failure"),)
