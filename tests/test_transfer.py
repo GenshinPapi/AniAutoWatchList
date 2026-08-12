@@ -5,7 +5,7 @@ import xml.etree.ElementTree as ET
 
 from ani_watchlist.db import initialize
 from ani_watchlist.store import episodes_for_anime, get_anime, get_or_create_anime, mark_episode, update_anime_fields, upsert_episodes
-from ani_watchlist.transfer import WatchlistTransferError, export_watchlist_text, import_watchlist_text
+from ani_watchlist.transfer import WatchlistTransferError, export_watchlist_text, import_watchlist_text, write_auto_backup_files
 
 
 def _anime_xml(title: str, *, mal_id: int = 0, status: str = "Watching", watched: int = 0, total: int = 0) -> str:
@@ -182,3 +182,40 @@ def test_json_replace_import_preserves_metadata_and_events(app_env) -> None:
     assert episodes_for_anime(conn, anime["id"])[0]["watched"] == 1
     assert conn.execute("SELECT COUNT(*) AS count FROM metadata_matches").fetchone()["count"] == 1
     assert conn.execute("SELECT COUNT(*) AS count FROM watch_events").fetchone()["count"] == 1
+
+
+def test_auto_backup_creates_full_json_and_portable_xml(app_env, tmp_path) -> None:
+    conn = initialize()
+    anime, _ = get_or_create_anime(conn, "Cowboy Bebop")
+    upsert_episodes(conn, anime["id"], ["1", "2"], source_label="test")
+    mark_episode(conn, anime["id"], "1", watched=True)
+
+    targets = write_auto_backup_files(conn, tmp_path / "checkout")
+
+    assert targets["json"].name == "jsonbackup.json"
+    assert targets["xml"].name == "xmlbackup.xml"
+    json_payload = json.loads(targets["json"].read_text(encoding="utf-8"))
+    xml_root = ET.fromstring(targets["xml"].read_text(encoding="utf-8"))
+    assert json_payload["format"] == "ani-watchlist"
+    assert json_payload["anime"][0]["display_title"] == "Cowboy Bebop"
+    assert len(json_payload["episodes"]) == 2
+    assert xml_root.findtext("anime/series_title") == "Cowboy Bebop"
+    assert xml_root.findtext("anime/my_watched_episodes") == "1"
+    assert not list((tmp_path / "checkout").glob(".*backup.*.tmp"))
+
+
+def test_auto_backup_replaces_existing_snapshots(app_env, tmp_path) -> None:
+    conn = initialize()
+    get_or_create_anime(conn, "First Show")
+    backup_dir = tmp_path / "checkout"
+    targets = write_auto_backup_files(conn, backup_dir)
+    targets["json"].write_text("stale JSON", encoding="utf-8")
+    targets["xml"].write_text("stale XML", encoding="utf-8")
+    get_or_create_anime(conn, "Second Show")
+
+    updated_targets = write_auto_backup_files(conn, backup_dir)
+
+    json_titles = [row["display_title"] for row in json.loads(updated_targets["json"].read_text(encoding="utf-8"))["anime"]]
+    xml_titles = [node.findtext("series_title") for node in ET.fromstring(updated_targets["xml"].read_text(encoding="utf-8")).findall("anime")]
+    assert json_titles == ["First Show", "Second Show"]
+    assert xml_titles == ["First Show", "Second Show"]

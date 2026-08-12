@@ -27,6 +27,8 @@ watchlist.csv
 watchlist-*.json
 watchlist-*.csv
 watchlist-*.sqlite3
+jsonbackup.json
+xmlbackup.xml
 
 # Editor / OS noise
 .vscode/
