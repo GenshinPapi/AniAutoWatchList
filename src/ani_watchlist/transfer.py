@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import xml.etree.ElementTree as ET
@@ -21,6 +22,10 @@ MalIdResolver = Callable[[int], int | dict[str, Any] | None]
 JSON_FILETYPES = (("JSON files", "*.json"), ("All files", "*.*"))
 XML_FILETYPES = (("XML files", "*.xml"), ("All files", "*.*"))
 WATCHLIST_FILETYPES = (("Watchlist files", "*.json *.xml"), ("JSON files", "*.json"), ("XML files", "*.xml"), ("All files", "*.*"))
+AUTO_BACKUP_FILENAMES: dict[WatchlistFormat, str] = {
+    "json": "jsonbackup.json",
+    "xml": "xmlbackup.xml",
+}
 
 MAL_STATUS_BY_LOCAL = {
     "watching": "Watching",
@@ -143,6 +148,45 @@ def write_watchlist_file(
         encoding="utf-8",
     )
     return target
+
+
+def write_auto_backup_files(conn: sqlite3.Connection, directory: str | Path) -> dict[WatchlistFormat, Path]:
+    """Write full JSON and portable XML snapshots without a network lookup.
+
+    Both exports are rendered before either current backup is replaced. Each
+    file is then written through a temporary sibling so an interrupted write
+    does not leave a partially written backup behind.
+    """
+    backup_dir = Path(directory).expanduser()
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    contents: dict[WatchlistFormat, str] = {
+        "json": export_watchlist_text(conn, "json"),
+        "xml": export_watchlist_text(conn, "xml"),
+    }
+    targets: dict[WatchlistFormat, Path] = {
+        export_format: backup_dir / filename
+        for export_format, filename in AUTO_BACKUP_FILENAMES.items()
+    }
+    temporary_files: dict[WatchlistFormat, Path] = {}
+    try:
+        for export_format in ("json", "xml"):
+            target = targets[export_format]
+            temporary = target.with_name(f".{target.name}.tmp")
+            with temporary.open("w", encoding="utf-8") as handle:
+                handle.write(contents[export_format])
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary_files[export_format] = temporary
+        for export_format in ("json", "xml"):
+            temporary_files[export_format].replace(targets[export_format])
+    except OSError:
+        for temporary in temporary_files.values():
+            try:
+                temporary.unlink()
+            except OSError:
+                pass
+        raise
+    return targets
 
 
 def anilist_mal_id_resolver(conn: sqlite3.Connection | None = None) -> MalIdResolver:

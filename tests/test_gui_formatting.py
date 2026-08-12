@@ -178,3 +178,28 @@ def test_manual_update_button_can_launch_managed_update(monkeypatch) -> None:
     assert prompts and prompts[0][0] == "Update AniAutoWatchList"
     assert "ani-cli -U" in prompts[0][1]
     assert info_messages and info_messages[0][0] == "Update started"
+
+
+def test_close_app_writes_auto_backups_before_database_close(monkeypatch) -> None:
+    app = object.__new__(WatchlistApp)
+    events: list[str] = []
+    app.shutting_down = False
+    app.party_client = None
+    app.party_host_session = None
+    app.conn = SimpleNamespace(close=lambda: events.append("database closed"))
+    app.root = SimpleNamespace(
+        after_cancel=lambda _job: None,
+        quit=lambda: events.append("root quit"),
+        destroy=lambda: events.append("root destroyed"),
+    )
+    app.backup_watchlist_on_exit = lambda: events.append("backed up") or True
+    app.stop_host_party_mpv_observer = lambda: None
+    app.dismiss_idle_prompt = lambda: None
+    app.stop_party_fullscreen_observer = lambda: None
+    app.stop_party_playback = lambda: None
+    app.destroy_party_window = lambda: None
+
+    app.close_app()
+
+    assert app.shutting_down is True
+    assert events == ["backed up", "database closed", "root quit", "root destroyed"]

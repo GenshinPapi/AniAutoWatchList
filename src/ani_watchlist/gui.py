@@ -43,6 +43,7 @@ from .launcher import (
     resolve_allanime_launch_target,
 )
 from .metadata import refresh_metadata_for_anime, select_match, selected_metadata_payload, store_selected_metadata_payload
+from .paths import get_paths
 from .party import (
     MpvIpcController,
     WatchPartyError,
@@ -60,8 +61,9 @@ from .transfer import (
     anilist_mal_id_resolver,
     export_watchlist_text,
     import_watchlist_file,
+    write_auto_backup_files,
 )
-from .updater import UpdateInfo, check_ani_cli_update, check_for_update, launch_update
+from .updater import UpdateInfo, check_ani_cli_update, check_for_update, launch_update, project_root
 from .store import (
     STATUSES,
     clean_display_title,
@@ -1333,6 +1335,7 @@ class WatchlistApp:
                 except tk.TclError:
                     pass
                 setattr(self, attr, None)
+        self.backup_watchlist_on_exit()
         if self.party_client is not None:
             self.finish_joined_party("Watch party closed.", send_leave=True, show_message=False)
         self.stop_host_party_mpv_observer()
@@ -1359,6 +1362,24 @@ class WatchlistApp:
         try:
             self.root.destroy()
         except tk.TclError:
+            pass
+
+    def backup_watchlist_on_exit(self) -> bool:
+        try:
+            write_auto_backup_files(self.conn, project_root())
+        except Exception as exc:
+            self.log_auto_backup_failure(exc)
+            return False
+        return True
+
+    def log_auto_backup_failure(self, error: Exception) -> None:
+        try:
+            paths = get_paths()
+            paths.log_dir.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now(timezone.utc).astimezone().isoformat()
+            with (paths.log_dir / "auto-backup-errors.log").open("a", encoding="utf-8") as handle:
+                handle.write(f"{timestamp} {type(error).__name__}: {error}\n")
+        except OSError:
             pass
 
     def schedule_auto_refresh(self) -> None:

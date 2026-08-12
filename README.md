@@ -25,6 +25,7 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 - English-first display titles when metadata is available
 - Notes per anime
 - JSON, XML, and CSV export
+- Automatic JSON and XML watchlist backups whenever the GUI closes
 - SQLite backups and restore
 - Duplicate detection and merge command
 - Activity log and repair checks
@@ -122,7 +123,11 @@ Database: ~/.local/share/ani-watchlist/watchlist.sqlite3
 Config:   ~/.config/ani-watchlist/config.toml
 Covers:   ~/.cache/ani-watchlist/covers/
 Logs:     ~/.local/state/ani-watchlist/logs/
+Auto JSON backup: <AniAutoWatchList checkout>/jsonbackup.json
+Auto XML backup:  <AniAutoWatchList checkout>/xmlbackup.xml
 ```
+
+Every normal GUI exit atomically creates or replaces each automatic backup file, including an automatic close from the **Still watching?** idle prompt. The JSON file is the full-fidelity AniAutoWatchList recovery backup. The XML file uses the existing MAL-style portable export and includes every local title without delaying shutdown for network ID lookups. Use the manual XML export with refreshed MAL IDs when preparing a file specifically for MAL import. These generated files are ignored by Git so personal watch history is not committed accidentally.
 
 ## Commands
 
