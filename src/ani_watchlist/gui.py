@@ -23,6 +23,7 @@ except Exception:  # pragma: no cover - optional GUI enhancement
 from .availability import refresh_available_episodes_for_anime
 from .cloud import (
     CloudBackupError,
+    CloudSyncResult,
     GoogleDriveBackupProvider,
     load_cloud_backup_status,
     record_cloud_backup_status,
@@ -701,7 +702,7 @@ class WatchlistApp:
             label="Test Google Drive Connection",
             command=lambda: self.start_google_drive_connection_check(show_result=True),
         )
-        cloud_menu.add_command(label="Back Up to Google Drive Now", command=self.start_google_drive_backup)
+        cloud_menu.add_command(label="Sync with Google Drive Now", command=self.start_google_drive_backup)
         cloud_menu.add_command(label="Google Drive Status", command=self.show_google_drive_status)
         cloud_menu.add_separator()
         cloud_menu.add_command(label="Disconnect Google Drive", command=self.disconnect_google_drive)
@@ -1495,7 +1496,11 @@ class WatchlistApp:
             provider = GoogleDriveBackupProvider()
             if not provider.is_connected():
                 raise CloudBackupError("Automatic cloud backup is enabled, but Google Drive is not connected.")
-            result = provider.upload_backups(targets)
+            result = provider.synchronize_backups(
+                self.conn,
+                project_root(),
+                local_files=targets,
+            )
             record_cloud_backup_status(success=True, files=result.files)
         except Exception as exc:
             try:
@@ -2192,7 +2197,8 @@ class WatchlistApp:
         set_config_value("cloud.google_drive_auto_backup", "true")
         messagebox.showinfo(
             "Google Drive connected",
-            "Automatic JSON and XML cloud backups are enabled. An initial backup will run now.",
+            "Automatic cloud synchronization is enabled. The app will merge any existing Drive watchlist "
+            "with this machine before uploading the combined JSON and XML backups.",
         )
         self.start_google_drive_backup()
 
@@ -2207,39 +2213,50 @@ class WatchlistApp:
             return
         self.cloud_operation_running = True
         self.set_cloud_connection_state("checking", checked=False)
-        self.dashboard_label.configure(text="Backing up watchlist locally and to Google Drive...")
+        self.dashboard_label.configure(text="Synchronizing the local and Google Drive watchlists...")
 
         def worker() -> None:
             try:
                 with initialize() as conn:
-                    targets = write_auto_backup_files(conn, project_root())
-                result = provider.upload_backups(targets)
+                    result = provider.synchronize_backups(conn, project_root())
                 record_cloud_backup_status(success=True, files=result.files)
                 error = None
             except Exception as exc:
+                result = None
                 error = str(exc)
                 try:
                     record_cloud_backup_status(success=False, error=error)
                 except OSError:
                     pass
-            self.run_on_ui(lambda: self.finish_google_drive_backup(error))
+            self.run_on_ui(lambda: self.finish_google_drive_backup(result, error))
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def finish_google_drive_backup(self, error: str | None) -> None:
+    def finish_google_drive_backup(
+        self,
+        result: CloudSyncResult | None,
+        error: str | None,
+    ) -> None:
         self.cloud_operation_running = False
         self.refresh_dashboard()
         if error:
             self.set_cloud_connection_state("disconnected", error=error)
             messagebox.showwarning(
-                "Google Drive backup failed",
-                f"The local backup was kept, but the Google Drive backup failed:\n\n{error}",
+                "Google Drive sync failed",
+                f"The local backup was kept, but Google Drive synchronization failed:\n\n{error}",
             )
             return
         self.set_cloud_connection_state("connected")
+        self.library_render_signature = None
+        self.activity_signature = None
+        if self.current_page == "library":
+            self.refresh_library()
+        imported = 0 if result is None else result.import_result.get("anime", 0)
         messagebox.showinfo(
-            "Google Drive backup complete",
-            "The JSON and XML backups are current locally and in Google Drive.",
+            "Google Drive sync complete",
+            "This machine and Google Drive now contain the combined watchlist. "
+            "The JSON and XML backups are current in both locations."
+            + (f"\n\nAdded {imported} anime from Google Drive." if imported else ""),
         )
 
     def show_google_drive_status(self) -> None:
@@ -2252,7 +2269,7 @@ class WatchlistApp:
         }
         lines = [
             f"Connection: {state_labels.get(self.cloud_connection_state, 'Unknown')}",
-            f"Automatic backup on exit: {'On' if load_config().cloud.google_drive_auto_backup else 'Off'}",
+            f"Automatic sync on launch and exit: {'On' if load_config().cloud.google_drive_auto_backup else 'Off'}",
             f"App sign-in configuration: {provider.client_config_source() or 'Missing'}",
         ]
         if self.cloud_connection_checked_at:
@@ -2302,15 +2319,39 @@ class WatchlistApp:
 
         def worker() -> None:
             try:
-                provider.test_connection()
+                if load_config().cloud.google_drive_auto_backup:
+                    with initialize() as conn:
+                        sync_result = provider.synchronize_backups(conn, project_root())
+                    record_cloud_backup_status(success=True, files=sync_result.files)
+                    synchronized = True
+                else:
+                    provider.test_connection()
+                    synchronized = False
                 error = None
             except Exception as exc:
+                synchronized = False
                 error = str(exc)
-            self.run_on_ui(lambda: self.finish_google_drive_connection_check(error, show_result=show_result))
+                try:
+                    record_cloud_backup_status(success=False, error=error)
+                except OSError:
+                    pass
+            self.run_on_ui(
+                lambda: self.finish_google_drive_connection_check(
+                    error,
+                    show_result=show_result,
+                    synchronized=synchronized,
+                )
+            )
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def finish_google_drive_connection_check(self, error: str | None, *, show_result: bool = False) -> None:
+    def finish_google_drive_connection_check(
+        self,
+        error: str | None,
+        *,
+        show_result: bool = False,
+        synchronized: bool = False,
+    ) -> None:
         self.cloud_connection_check_running = False
         if error:
             self.set_cloud_connection_state("disconnected", error=error)
@@ -2318,10 +2359,17 @@ class WatchlistApp:
                 messagebox.showwarning("Google Drive connection failed", error)
             return
         self.set_cloud_connection_state("connected")
+        if synchronized:
+            self.library_render_signature = None
+            self.activity_signature = None
+            self.refresh_dashboard()
+            if self.current_page == "library":
+                self.refresh_library()
         if show_result:
             messagebox.showinfo(
                 "Google Drive connection",
-                "Google Drive is connected and automatic token refresh is working.",
+                "Google Drive is connected and automatic token refresh is working."
+                + (" The local and cloud watchlists were also synchronized." if synchronized else ""),
             )
 
     def disconnect_google_drive(self) -> None:

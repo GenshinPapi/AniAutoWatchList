@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
+import sqlite3
 import threading
 import urllib.error
 import urllib.parse
@@ -13,7 +15,13 @@ from typing import Any, Mapping
 
 from .config import load_config
 from .paths import get_paths
-from .transfer import AUTO_BACKUP_FILENAMES, WatchlistFormat
+from .store import merge_safe_duplicates
+from .transfer import (
+    AUTO_BACKUP_FILENAMES,
+    WatchlistFormat,
+    import_watchlist_text,
+    write_auto_backup_files,
+)
 
 
 GOOGLE_DRIVE_APPDATA_SCOPE = "https://www.googleapis.com/auth/drive.appdata"
@@ -21,7 +29,7 @@ GOOGLE_DRIVE_API = "https://www.googleapis.com/drive/v3"
 GOOGLE_DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 GOOGLE_TOKEN_REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 BUILTIN_GOOGLE_CLIENT_CONFIG_NAME = "_google_drive_oauth_client.json"
-_CLOUD_TRANSFER_LOCK = threading.Lock()
+_CLOUD_TRANSFER_LOCK = threading.RLock()
 
 
 class CloudBackupError(RuntimeError):
@@ -34,11 +42,19 @@ class CloudBackupFile:
     name: str
     modified_time: str | None = None
     size: int | None = None
+    md5_checksum: str | None = None
 
 
 @dataclass(frozen=True)
 class CloudBackupResult:
     files: tuple[CloudBackupFile, ...]
+
+
+@dataclass(frozen=True)
+class CloudSyncResult:
+    files: tuple[CloudBackupFile, ...]
+    downloaded_format: WatchlistFormat | None
+    import_result: dict[str, int]
 
 
 def _now_iso() -> str:
@@ -346,6 +362,7 @@ class GoogleDriveBackupProvider:
             name=str(payload.get("name") or ""),
             modified_time=str(payload.get("modifiedTime") or "") or None,
             size=size,
+            md5_checksum=str(payload.get("md5Checksum") or "") or None,
         )
 
     def list_backups(self) -> tuple[CloudBackupFile, ...]:
@@ -355,7 +372,7 @@ class GoogleDriveBackupProvider:
             {
                 "spaces": "appDataFolder",
                 "q": f"trashed = false and ({name_query})",
-                "fields": "files(id,name,modifiedTime,size)",
+                "fields": "files(id,name,modifiedTime,size,md5Checksum)",
                 "pageSize": "100",
             }
         )
@@ -377,21 +394,121 @@ class GoogleDriveBackupProvider:
     def upload_backups(self, local_files: Mapping[WatchlistFormat, Path]) -> CloudBackupResult:
         with _CLOUD_TRANSFER_LOCK:
             remote_files = self.list_backups()
-            uploaded: list[CloudBackupFile] = []
-            for export_format in ("json", "xml"):
-                path = Path(local_files[export_format])
-                try:
-                    content = path.read_bytes()
-                except OSError as exc:
-                    raise CloudBackupError(f"Could not read local {export_format.upper()} backup: {exc}") from exc
-                name = AUTO_BACKUP_FILENAMES[export_format]
-                current = self._latest_file(name, remote_files)
-                uploaded.append(
-                    self._update_file(current.file_id, name, export_format, content)
-                    if current is not None
-                    else self._create_file(name, export_format, content)
-                )
+            return self._upload_backups(local_files, remote_files)
+
+    def _upload_backups(
+        self,
+        local_files: Mapping[WatchlistFormat, Path],
+        remote_files: tuple[CloudBackupFile, ...],
+    ) -> CloudBackupResult:
+        uploaded: list[CloudBackupFile] = []
+        for export_format in ("json", "xml"):
+            path = Path(local_files[export_format])
+            try:
+                content = path.read_bytes()
+            except OSError as exc:
+                raise CloudBackupError(f"Could not read local {export_format.upper()} backup: {exc}") from exc
+            name = AUTO_BACKUP_FILENAMES[export_format]
+            current = self._latest_file(name, remote_files)
+            local_checksum = hashlib.md5(content, usedforsecurity=False).hexdigest()
+            if current is not None and current.md5_checksum == local_checksum:
+                uploaded.append(current)
+                continue
+            uploaded.append(
+                self._update_file(current.file_id, name, export_format, content)
+                if current is not None
+                else self._create_file(name, export_format, content)
+            )
         return CloudBackupResult(files=tuple(uploaded))
+
+    @staticmethod
+    def _remote_signature(remote: CloudBackupFile | None) -> tuple[str, str | None, int | None, str | None] | None:
+        if remote is None:
+            return None
+        return (remote.file_id, remote.modified_time, remote.size, remote.md5_checksum)
+
+    def synchronize_backups(
+        self,
+        conn: sqlite3.Connection,
+        directory: str | Path,
+        *,
+        local_files: Mapping[WatchlistFormat, Path] | None = None,
+    ) -> CloudSyncResult:
+        """Safely converge the local watchlist and the connected Drive backup.
+
+        A full local snapshot is always written before the first network call.
+        Existing Drive data is then merged into the database before either
+        cloud file is updated. JSON is preferred because it preserves exact
+        episode state and metadata; XML is used only when it is the sole
+        available cloud backup.
+        """
+        with _CLOUD_TRANSFER_LOCK:
+            targets = (
+                dict(local_files)
+                if local_files is not None
+                else write_auto_backup_files(conn, directory)
+            )
+            downloaded_format: WatchlistFormat | None = None
+            totals = {
+                "anime": 0,
+                "updated_anime": 0,
+                "skipped_anime": 0,
+                "episodes": 0,
+                "metadata": 0,
+                "events": 0,
+            }
+
+            for _attempt in range(3):
+                remote_files = self.list_backups()
+                remote_json = self._latest_file(AUTO_BACKUP_FILENAMES["json"], remote_files)
+                remote_xml = self._latest_file(AUTO_BACKUP_FILENAMES["xml"], remote_files)
+                remote = remote_json or remote_xml
+                remote_format: WatchlistFormat | None = (
+                    "json"
+                    if remote_json is not None
+                    else "xml"
+                    if remote_xml is not None
+                    else None
+                )
+                downloaded_signature = self._remote_signature(remote)
+
+                if remote is not None and remote_format is not None:
+                    content = self._download_file(remote, remote_format)
+                    try:
+                        local_content = Path(targets[remote_format]).read_text(encoding="utf-8")
+                    except OSError as exc:
+                        raise CloudBackupError(
+                            f"Could not read the local {remote_format.upper()} backup before synchronization: {exc}"
+                        ) from exc
+                    if content != local_content:
+                        result = import_watchlist_text(
+                            conn,
+                            content,
+                            remote_format,
+                            mode="merge",
+                            prefer_newer=True,
+                        )
+                        merge_safe_duplicates(conn)
+                        for key in totals:
+                            totals[key] += int(result.get(key, 0))
+                        targets = write_auto_backup_files(conn, directory)
+                    downloaded_format = remote_format
+
+                current_files = self.list_backups()
+                current_json = self._latest_file(AUTO_BACKUP_FILENAMES["json"], current_files)
+                current_xml = self._latest_file(AUTO_BACKUP_FILENAMES["xml"], current_files)
+                current = current_json or current_xml
+                if self._remote_signature(current) == downloaded_signature:
+                    uploaded = self._upload_backups(targets, current_files)
+                    return CloudSyncResult(
+                        files=uploaded.files,
+                        downloaded_format=downloaded_format,
+                        import_result=totals,
+                    )
+
+            raise CloudBackupError(
+                "The Google Drive backup changed repeatedly during synchronization. No cloud file was overwritten; try again."
+            )
 
     def _create_file(self, name: str, export_format: WatchlistFormat, content: bytes) -> CloudBackupFile:
         boundary = f"ani-watchlist-{secrets.token_hex(16)}"
@@ -406,7 +523,7 @@ class GoogleDriveBackupProvider:
                 f"\r\n--{boundary}--\r\n".encode("ascii"),
             )
         )
-        fields = urllib.parse.quote("id,name,modifiedTime,size", safe=",")
+        fields = urllib.parse.quote("id,name,modifiedTime,size,md5Checksum", safe=",")
         raw = self._authorized_request(
             f"{GOOGLE_DRIVE_UPLOAD_API}/files?uploadType=multipart&fields={fields}",
             method="POST",
@@ -423,7 +540,7 @@ class GoogleDriveBackupProvider:
         content: bytes,
     ) -> CloudBackupFile:
         mime_type = "application/json" if export_format == "json" else "application/xml"
-        fields = urllib.parse.quote("id,name,modifiedTime,size", safe=",")
+        fields = urllib.parse.quote("id,name,modifiedTime,size,md5Checksum", safe=",")
         raw = self._authorized_request(
             f"{GOOGLE_DRIVE_UPLOAD_API}/files/{urllib.parse.quote(file_id, safe='')}?uploadType=media&fields={fields}",
             method="PATCH",
@@ -431,7 +548,13 @@ class GoogleDriveBackupProvider:
             headers={"Content-Type": mime_type},
         )
         result = self._decode_file_response(raw, "update")
-        return result if result.name else CloudBackupFile(result.file_id, name, result.modified_time, result.size)
+        return result if result.name else CloudBackupFile(
+            result.file_id,
+            name,
+            result.modified_time,
+            result.size,
+            result.md5_checksum,
+        )
 
     def _decode_file_response(self, raw: bytes, action: str) -> CloudBackupFile:
         try:
@@ -448,10 +571,13 @@ class GoogleDriveBackupProvider:
             remote = self._latest_file(name)
             if remote is None:
                 raise CloudBackupError(f"No {name} backup exists in the connected Google Drive account.")
-            params = urllib.parse.urlencode({"alt": "media"})
-            raw = self._authorized_request(
-                f"{GOOGLE_DRIVE_API}/files/{urllib.parse.quote(remote.file_id, safe='')}?{params}"
-            )
+            return self._download_file(remote, export_format)
+
+    def _download_file(self, remote: CloudBackupFile, export_format: WatchlistFormat) -> str:
+        params = urllib.parse.urlencode({"alt": "media"})
+        raw = self._authorized_request(
+            f"{GOOGLE_DRIVE_API}/files/{urllib.parse.quote(remote.file_id, safe='')}?{params}"
+        )
         try:
             return raw.decode("utf-8")
         except UnicodeDecodeError as exc:

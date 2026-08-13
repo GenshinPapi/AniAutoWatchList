@@ -93,6 +93,7 @@ def import_watchlist_text(
     import_format: WatchlistFormat,
     *,
     mode: ImportMode = "sync",
+    prefer_newer: bool = False,
 ) -> dict[str, int]:
     if mode not in {"sync", "replace", "merge"}:
         raise WatchlistTransferError(f"unsupported import mode: {mode}")
@@ -111,7 +112,12 @@ def import_watchlist_text(
 
     if mode == "replace":
         clear_watchlist(conn)
-    return import_data(conn, payload, update_existing=mode in {"replace", "merge"})
+    return import_data(
+        conn,
+        payload,
+        update_existing=mode in {"replace", "merge"},
+        prefer_newer=prefer_newer,
+    )
 
 
 def import_watchlist_file(

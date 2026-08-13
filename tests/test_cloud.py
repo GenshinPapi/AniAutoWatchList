@@ -1,16 +1,29 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
 import pytest
 
 from ani_watchlist.cloud import (
+    CloudBackupFile,
+    CloudBackupResult,
     CloudBackupError,
     GoogleDriveBackupProvider,
     load_cloud_backup_status,
     record_cloud_backup_status,
 )
+from ani_watchlist.db import initialize
+from ani_watchlist.store import (
+    episodes_for_anime,
+    get_anime,
+    get_or_create_anime,
+    mark_episode,
+    update_anime_fields,
+    upsert_episodes,
+)
+from ani_watchlist.transfer import export_watchlist_text
 
 
 DESKTOP_CLIENT = {
@@ -181,6 +194,113 @@ def test_upload_lists_remote_backups_only_once_when_drive_folder_is_empty(app_en
     provider.upload_backups({"json": local_json, "xml": local_xml})
 
     assert methods == ["GET", "POST", "POST"]
+
+
+def test_upload_skips_remote_files_with_identical_content(app_env, tmp_path, monkeypatch) -> None:
+    provider = GoogleDriveBackupProvider(
+        client_config_path=tmp_path / "client.json",
+        token_path=tmp_path / "token.json",
+    )
+    local_json = tmp_path / "jsonbackup.json"
+    local_xml = tmp_path / "xmlbackup.xml"
+    local_json.write_text('{"anime": []}', encoding="utf-8")
+    local_xml.write_text("<myanimelist />", encoding="utf-8")
+    remote = tuple(
+        CloudBackupFile(
+            f"id-{path.name}",
+            path.name,
+            md5_checksum=hashlib.md5(path.read_bytes(), usedforsecurity=False).hexdigest(),
+        )
+        for path in (local_json, local_xml)
+    )
+    monkeypatch.setattr(provider, "list_backups", lambda: remote)
+    monkeypatch.setattr(provider, "_create_file", lambda *_args: pytest.fail("unchanged file was created"))
+    monkeypatch.setattr(provider, "_update_file", lambda *_args: pytest.fail("unchanged file was updated"))
+
+    result = provider.upload_backups({"json": local_json, "xml": local_xml})
+
+    assert result.files == remote
+
+
+def test_synchronize_downloads_and_merges_before_uploading(app_env, tmp_path, monkeypatch) -> None:
+    local_conn = initialize()
+    get_or_create_anime(local_conn, "Local Only")
+    shared_local, _ = get_or_create_anime(local_conn, "Shared Show")
+    upsert_episodes(local_conn, shared_local["id"], ["1"])
+    update_anime_fields(local_conn, shared_local["id"], status="watching", notes="local note")
+    local_conn.execute(
+        "UPDATE anime SET updated_at = '2026-01-01T00:00:00+00:00' WHERE id = ?",
+        (shared_local["id"],),
+    )
+    local_conn.commit()
+
+    remote_conn = initialize(tmp_path / "remote.sqlite3")
+    get_or_create_anime(remote_conn, "Remote Only")
+    shared_remote, _ = get_or_create_anime(remote_conn, "Shared Show")
+    upsert_episodes(remote_conn, shared_remote["id"], ["1"])
+    mark_episode(remote_conn, shared_remote["id"], "1", watched=True)
+    update_anime_fields(remote_conn, shared_remote["id"], status="completed", notes="remote note")
+    remote_conn.execute(
+        "UPDATE anime SET updated_at = '2026-02-01T00:00:00+00:00' WHERE id = ?",
+        (shared_remote["id"],),
+    )
+    remote_conn.execute(
+        "UPDATE episodes SET updated_at = '2026-02-01T00:00:00+00:00' WHERE anime_id = ?",
+        (shared_remote["id"],),
+    )
+    remote_conn.commit()
+    remote_text = export_watchlist_text(remote_conn, "json")
+    remote_file = CloudBackupFile(
+        "remote-json",
+        "jsonbackup.json",
+        "2026-02-01T00:00:00Z",
+        len(remote_text.encode()),
+        hashlib.md5(remote_text.encode(), usedforsecurity=False).hexdigest(),
+    )
+    provider = GoogleDriveBackupProvider(
+        client_config_path=tmp_path / "client.json",
+        token_path=tmp_path / "token.json",
+    )
+    backup_dir = tmp_path / "checkout"
+    events: list[str] = []
+    uploaded_payloads: dict[str, str] = {}
+
+    def fake_download(_remote, export_format):
+        events.append("download")
+        initial = json.loads((backup_dir / "jsonbackup.json").read_text(encoding="utf-8"))
+        assert [row["display_title"] for row in initial["anime"]] == ["Local Only", "Shared Show"]
+        assert export_format == "json"
+        return remote_text
+
+    def fake_upload(local_files, _remote_files):
+        events.append("upload")
+        uploaded_payloads.update(
+            {export_format: Path(path).read_text(encoding="utf-8") for export_format, path in local_files.items()}
+        )
+        return CloudBackupResult(files=(remote_file,))
+
+    monkeypatch.setattr(provider, "list_backups", lambda: (remote_file,))
+    monkeypatch.setattr(provider, "_download_file", fake_download)
+    monkeypatch.setattr(provider, "_upload_backups", fake_upload)
+
+    result = provider.synchronize_backups(local_conn, backup_dir)
+
+    assert events == ["download", "upload"]
+    assert result.downloaded_format == "json"
+    assert result.import_result["anime"] == 1
+    assert {row["display_title"] for row in local_conn.execute("SELECT display_title FROM anime")} == {
+        "Local Only",
+        "Remote Only",
+        "Shared Show",
+    }
+    shared = get_anime(local_conn, "Shared Show")
+    assert shared["status"] == "completed"
+    assert shared["notes"] == "remote note"
+    assert episodes_for_anime(local_conn, shared["id"])[0]["watched"] == 1
+    uploaded_titles = {row["display_title"] for row in json.loads(uploaded_payloads["json"])["anime"]}
+    assert uploaded_titles == {"Local Only", "Remote Only", "Shared Show"}
+    assert "<series_title>Local Only</series_title>" in uploaded_payloads["xml"]
+    assert "<series_title>Remote Only</series_title>" in uploaded_payloads["xml"]
 
 
 def test_cloud_status_preserves_last_success_when_later_attempt_fails(app_env) -> None:

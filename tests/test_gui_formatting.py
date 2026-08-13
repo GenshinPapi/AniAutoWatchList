@@ -104,7 +104,7 @@ def test_cloud_connection_state_updates_button_style_and_error() -> None:
     assert updates[-1] == {"text": "Cloud !", "style": "CloudDisconnected.TMenubutton"}
 
 
-def test_automatic_cloud_connection_check_turns_button_green(monkeypatch) -> None:
+def test_automatic_cloud_connection_check_turns_button_green(app_env, monkeypatch) -> None:
     app = object.__new__(WatchlistApp)
     app.shutting_down = False
     app.cloud_connection_check_running = False
@@ -118,8 +118,9 @@ def test_automatic_cloud_connection_check_turns_button_green(monkeypatch) -> Non
         def is_connected(self) -> bool:
             return True
 
-        def test_connection(self) -> None:
-            checks.append("tested")
+        def synchronize_backups(self, _conn, _directory):
+            checks.append("synchronized")
+            return SimpleNamespace(files=())
 
     class ImmediateThread:
         def __init__(self, *, target, daemon):
@@ -131,11 +132,20 @@ def test_automatic_cloud_connection_check_turns_button_green(monkeypatch) -> Non
 
     monkeypatch.setattr("ani_watchlist.gui.GoogleDriveBackupProvider", FakeProvider)
     monkeypatch.setattr("ani_watchlist.gui.threading.Thread", ImmediateThread)
+    monkeypatch.setattr(
+        "ani_watchlist.gui.load_config",
+        lambda: SimpleNamespace(cloud=SimpleNamespace(google_drive_auto_backup=True)),
+    )
+    monkeypatch.setattr("ani_watchlist.gui.record_cloud_backup_status", lambda **kwargs: kwargs)
     app.run_on_ui = lambda callback: callback()
+    app.library_render_signature = object()
+    app.activity_signature = object()
+    app.current_page = "detail"
+    app.refresh_dashboard = lambda: None
 
     app.start_google_drive_connection_check()
 
-    assert checks == ["tested"]
+    assert checks == ["synchronized"]
     assert app.cloud_connection_check_job is None
     assert app.cloud_connection_check_running is False
     assert app.cloud_connection_state == "connected"
@@ -298,8 +308,9 @@ def test_exit_backup_writes_local_files_before_google_drive(monkeypatch, tmp_pat
         def is_connected(self) -> bool:
             return True
 
-        def upload_backups(self, received_targets):
-            assert received_targets == targets
+        def synchronize_backups(self, received_conn, _directory, *, local_files):
+            assert received_conn is app.conn
+            assert local_files == targets
             events.append("cloud")
             return SimpleNamespace(files=())
 

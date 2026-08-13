@@ -785,7 +785,60 @@ def merge_anime(conn: sqlite3.Connection, target_id: int, source_id: int) -> dic
     return {"target_id": target_id, "source_id": source_id, "episode_count": len(episode_map)}
 
 
-def import_data(conn: sqlite3.Connection, data: dict[str, Any], *, update_existing: bool = True) -> dict[str, int]:
+def _parsed_timestamp(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _incoming_is_newer(incoming: object, current: object) -> bool:
+    incoming_time = _parsed_timestamp(incoming)
+    if incoming_time is None:
+        return False
+    current_time = _parsed_timestamp(current)
+    return current_time is None or incoming_time >= current_time
+
+
+def _latest_timestamp(*values: object) -> str | None:
+    present = [str(value) for value in values if str(value or "").strip()]
+    if not present:
+        return None
+    return max(
+        present,
+        key=lambda value: (
+            _parsed_timestamp(value) or datetime.min.replace(tzinfo=timezone.utc),
+            value,
+        ),
+    )
+
+
+def _earliest_timestamp(*values: object) -> str | None:
+    present = [str(value) for value in values if str(value or "").strip()]
+    if not present:
+        return None
+    return min(
+        present,
+        key=lambda value: (
+            _parsed_timestamp(value) or datetime.max.replace(tzinfo=timezone.utc),
+            value,
+        ),
+    )
+
+
+def import_data(
+    conn: sqlite3.Connection,
+    data: dict[str, Any],
+    *,
+    update_existing: bool = True,
+    prefer_newer: bool = False,
+) -> dict[str, int]:
     anime_id_map: dict[int, int] = {}
     episode_id_map: dict[int, int] = {}
     imported_source_anime_ids: set[int] = set()
@@ -806,6 +859,7 @@ def import_data(conn: sqlite3.Connection, data: dict[str, Any], *, update_existi
                 existing = conn.execute("SELECT * FROM anime WHERE anilist_id = ?", (item["anilist_id"],)).fetchone()
             if existing is None:
                 existing = get_anime(conn, str(title))
+            created = False
             if existing is None:
                 anime, created = get_or_create_anime(
                     conn,
@@ -824,17 +878,64 @@ def import_data(conn: sqlite3.Connection, data: dict[str, Any], *, update_existi
                 updated_anime += 1
                 imported_source_anime_ids.add(source_anime_id)
             anime_id_map[source_anime_id] = int(anime["id"])
-            update_anime_fields(
-                conn,
-                anime["id"],
-                status=item.get("status") if item.get("status") in STATUSES else anime["status"],
-                anilist_id=item.get("anilist_id") or anime["anilist_id"],
-                total_episodes=item.get("total_episodes") or anime["total_episodes"],
-                cover_url=item.get("cover_url") or anime["cover_url"],
-                cover_path=item.get("cover_path") or anime["cover_path"],
-                notes=item.get("notes") or anime["notes"],
-                last_watched_at=item.get("last_watched_at") or anime["last_watched_at"],
-            )
+            if prefer_newer:
+                incoming_preferred = created or _incoming_is_newer(
+                    item.get("updated_at"),
+                    anime["updated_at"],
+                )
+                fields: dict[str, Any] = {}
+                if incoming_preferred:
+                    if item.get("status") in STATUSES:
+                        fields["status"] = item["status"]
+                    for field in (
+                        "display_title",
+                        "source_title",
+                        "anilist_id",
+                        "total_episodes",
+                        "cover_url",
+                        "notes",
+                    ):
+                        if item.get(field) is not None:
+                            fields[field] = item[field]
+                else:
+                    for field in ("anilist_id", "total_episodes", "cover_url", "notes"):
+                        if anime[field] is None and item.get(field) is not None:
+                            fields[field] = item[field]
+                if anime["cover_path"] is None and item.get("cover_path") is not None:
+                    fields["cover_path"] = item["cover_path"]
+                latest_watched = _latest_timestamp(anime["last_watched_at"], item.get("last_watched_at"))
+                if latest_watched != anime["last_watched_at"]:
+                    fields["last_watched_at"] = latest_watched
+                changed_fields = {key: value for key, value in fields.items() if anime[key] != value}
+                if changed_fields:
+                    update_anime_fields(conn, anime["id"], **changed_fields)
+                    if incoming_preferred and item.get("updated_at"):
+                        conn.execute(
+                            "UPDATE anime SET updated_at = ? WHERE id = ?",
+                            (item["updated_at"], anime["id"]),
+                        )
+                if created:
+                    conn.execute(
+                        """
+                        UPDATE anime
+                        SET created_at = COALESCE(?, created_at),
+                            updated_at = COALESCE(?, updated_at)
+                        WHERE id = ?
+                        """,
+                        (item.get("created_at"), item.get("updated_at"), anime["id"]),
+                    )
+            else:
+                update_anime_fields(
+                    conn,
+                    anime["id"],
+                    status=item.get("status") if item.get("status") in STATUSES else anime["status"],
+                    anilist_id=item.get("anilist_id") or anime["anilist_id"],
+                    total_episodes=item.get("total_episodes") or anime["total_episodes"],
+                    cover_url=item.get("cover_url") or anime["cover_url"],
+                    cover_path=item.get("cover_path") or anime["cover_path"],
+                    notes=item.get("notes") or anime["notes"],
+                    last_watched_at=item.get("last_watched_at") or anime["last_watched_at"],
+                )
 
         for fallback_id, item in enumerate(data.get("episodes", []), start=1):
             source_anime_id = _import_row_id({"id": item.get("anime_id")}, -1)
@@ -843,34 +944,99 @@ def import_data(conn: sqlite3.Connection, data: dict[str, Any], *, update_existi
             anime_id = anime_id_map.get(source_anime_id)
             if anime_id is None:
                 continue
-            episode, _created = get_or_create_episode(conn, anime_id, str(item["episode_key"]))
+            episode, episode_created = get_or_create_episode(conn, anime_id, str(item["episode_key"]))
             source_episode_id = _import_row_id(item, fallback_id)
             episode_id_map[source_episode_id] = int(episode["id"])
-            conn.execute(
-                """
-                UPDATE episodes
-                SET episode_number = COALESCE(?, episode_number),
-                    title = COALESCE(?, title),
-                    watched = ?,
-                    watched_at = ?,
-                    first_started_at = COALESCE(first_started_at, ?),
-                    last_started_at = COALESCE(?, last_started_at),
-                    source_label = COALESCE(?, source_label),
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (
-                    item.get("episode_number"),
-                    item.get("title"),
-                    1 if item.get("watched") else episode["watched"],
-                    item.get("watched_at") if item.get("watched") else episode["watched_at"],
-                    item.get("first_started_at"),
-                    item.get("last_started_at"),
-                    item.get("source_label"),
-                    now_iso(),
-                    episode["id"],
-                ),
-            )
+            if prefer_newer:
+                incoming_preferred = episode_created or _incoming_is_newer(
+                    item.get("updated_at"),
+                    episode["updated_at"],
+                )
+                episode_number = episode["episode_number"]
+                title = episode["title"]
+                source_label = episode["source_label"]
+                if incoming_preferred:
+                    episode_number = item.get("episode_number") or episode_number
+                    title = item.get("title") or title
+                    source_label = item.get("source_label") or source_label
+                else:
+                    episode_number = episode_number or item.get("episode_number")
+                    title = title or item.get("title")
+                    source_label = source_label or item.get("source_label")
+                watched = bool(episode["watched"] or item.get("watched"))
+                watched_at = _latest_timestamp(
+                    episode["watched_at"],
+                    item.get("watched_at") if item.get("watched") else None,
+                )
+                first_started_at = _earliest_timestamp(episode["first_started_at"], item.get("first_started_at"))
+                last_started_at = _latest_timestamp(episode["last_started_at"], item.get("last_started_at"))
+                changed = any(
+                    (
+                        episode["episode_number"] != episode_number,
+                        episode["title"] != title,
+                        bool(episode["watched"]) != watched,
+                        episode["watched_at"] != (watched_at if watched else None),
+                        episode["first_started_at"] != first_started_at,
+                        episode["last_started_at"] != last_started_at,
+                        episode["source_label"] != source_label,
+                    )
+                )
+                updated_at = episode["updated_at"]
+                if episode_created:
+                    updated_at = item.get("updated_at") or updated_at
+                elif changed:
+                    updated_at = (
+                        item.get("updated_at")
+                        if incoming_preferred and item.get("updated_at")
+                        else now_iso()
+                    )
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET episode_number = ?, title = ?, watched = ?, watched_at = ?,
+                        first_started_at = ?, last_started_at = ?, source_label = ?,
+                        created_at = COALESCE(?, created_at), updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        episode_number,
+                        title,
+                        1 if watched else 0,
+                        watched_at if watched else None,
+                        first_started_at,
+                        last_started_at,
+                        source_label,
+                        item.get("created_at") if episode_created else None,
+                        updated_at,
+                        episode["id"],
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE episodes
+                    SET episode_number = COALESCE(?, episode_number),
+                        title = COALESCE(?, title),
+                        watched = ?,
+                        watched_at = ?,
+                        first_started_at = COALESCE(first_started_at, ?),
+                        last_started_at = COALESCE(?, last_started_at),
+                        source_label = COALESCE(?, source_label),
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        item.get("episode_number"),
+                        item.get("title"),
+                        1 if item.get("watched") else episode["watched"],
+                        item.get("watched_at") if item.get("watched") else episode["watched_at"],
+                        item.get("first_started_at"),
+                        item.get("last_started_at"),
+                        item.get("source_label"),
+                        now_iso(),
+                        episode["id"],
+                    ),
+                )
             imported_episodes += 1
 
         for item in data.get("metadata_matches", []):

@@ -216,7 +216,7 @@ The GUI includes:
 - Cover grid
 - Search/filter box
 - Watchlist JSON/XML import and export
-- Automatic local and Google Drive JSON/XML backups, with cloud import
+- Automatic local and cross-machine Google Drive JSON/XML synchronization, with cloud import
 - One-click background metadata and cover refresh for every watchlist entry
 - Anime detail page
 - Related seasons and side stories on detail pages
@@ -235,20 +235,22 @@ Use **Refresh Metadata** on the Watchlist page after a JSON/XML import to update
 
 ### Google Drive backups
 
-AniAutoWatchList always writes `jsonbackup.json` and `xmlbackup.xml` in the project directory when the GUI closes, including an automatic close after the **Still watching?** timeout. Once Google Drive is connected, those same current snapshots are also created or replaced in Google Drive on every close. A cloud failure is recorded but does not remove or invalidate the local backups.
+AniAutoWatchList always writes `jsonbackup.json` and `xmlbackup.xml` in the project directory when the GUI closes, including an automatic close after the **Still watching?** timeout. Once Google Drive is connected, the app synchronizes on launch, manual sync, and exit. It writes the local snapshots first, downloads and merges the existing cloud watchlist, regenerates both formats from the combined database, and only then creates or updates the Drive files. A cloud failure is recorded but does not remove or invalidate the local snapshots.
 
-Google Drive access uses the private `appDataFolder` and the narrow `drive.appdata` OAuth scope. The backup files are hidden from the normal My Drive view and AniAutoWatchList cannot read or change the user's other Drive files. Use **Watchlist → Cloud** to back up immediately, view the latest status, or disconnect. Use **Watchlist → Import → Import JSON/XML from Google Drive** to restore with the same replace-or-sync choice as local imports.
+Google Drive access uses the private `appDataFolder` and the narrow `drive.appdata` OAuth scope. The backup files are hidden from the normal My Drive view and AniAutoWatchList cannot read or change the user's other Drive files. Use **Watchlist → Cloud → Sync with Google Drive Now** to synchronize immediately, view the latest status, or disconnect. Use **Watchlist → Import → Import JSON/XML from Google Drive** when an explicit replace or add-only recovery is preferable to automatic synchronization.
+
+JSON is the canonical cross-machine source because it retains individual episodes, timestamps, metadata, and activity. XML is regenerated as the portable companion backup. Titles present on either machine are retained; newer per-entry fields such as status and notes win based on their update timestamps; watched episode state is combined conservatively so a stale machine cannot erase watched progress. This is a preservation-oriented backup sync, so deleting an entry or marking an episode unwatched on one machine does not remove a preserved cloud copy automatically.
 
 For a release with the publisher's Google OAuth identity bundled, end-user setup is only:
 
 1. Choose **Cloud → Connect Google Drive...**.
 2. Sign in and approve AniAutoWatchList in the browser.
 
-An initial backup runs immediately, automatic exit backups are enabled, and Google's refresh token keeps later backups signed in. After reinstalling on a new machine, connect the same Google account and import the cloud backup. End users do not need a Google Cloud project or an OAuth JSON file.
+An initial synchronization runs immediately, automatic launch/exit synchronization is enabled, and Google's refresh token keeps later syncs signed in. After reinstalling or moving to another machine, connect the same Google account; the existing cloud list is pulled and merged before that machine can upload. A manual cloud import is no longer required for normal cross-machine recovery. End users do not need a Google Cloud project or an OAuth JSON file.
 
-On every later GUI launch, AniAutoWatchList automatically makes a read-only Drive request in the background. This verifies the saved authorization and refreshes an ordinary expired access token without opening the browser. The Watchlist Cloud button shows the result:
+On every later GUI launch, AniAutoWatchList automatically verifies the saved authorization, refreshes an ordinary expired access token without opening the browser, and synchronizes the watchlist in the background. The Watchlist Cloud button shows the result:
 
-- Green **Cloud ✓**: the Drive connection test succeeded.
+- Green **Cloud ✓**: the Drive connection and automatic synchronization succeeded.
 - Red **Cloud !**: no saved authorization exists or Google Drive could not be reached/authorized.
 - Neutral **Cloud ...**: the background check is still running.
 

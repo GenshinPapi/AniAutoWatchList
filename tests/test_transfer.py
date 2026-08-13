@@ -184,6 +184,53 @@ def test_json_replace_import_preserves_metadata_and_events(app_env) -> None:
     assert conn.execute("SELECT COUNT(*) AS count FROM watch_events").fetchone()["count"] == 1
 
 
+def test_cloud_merge_keeps_newer_local_fields_but_unions_watched_progress(app_env) -> None:
+    conn = initialize()
+    anime, _ = get_or_create_anime(conn, "Shared Show")
+    upsert_episodes(conn, anime["id"], ["1"])
+    update_anime_fields(conn, anime["id"], status="completed", notes="newer local note")
+    conn.execute(
+        "UPDATE anime SET updated_at = '2026-03-01T00:00:00+00:00' WHERE id = ?",
+        (anime["id"],),
+    )
+    conn.execute(
+        "UPDATE episodes SET updated_at = '2026-03-01T00:00:00+00:00' WHERE anime_id = ?",
+        (anime["id"],),
+    )
+    conn.commit()
+    payload = {
+        "anime": [
+            {
+                "id": 100,
+                "display_title": "Shared Show",
+                "source_title": "Shared Show",
+                "status": "watching",
+                "notes": "stale cloud note",
+                "updated_at": "2026-02-01T00:00:00+00:00",
+            }
+        ],
+        "episodes": [
+            {
+                "id": 200,
+                "anime_id": 100,
+                "episode_key": "1",
+                "watched": 1,
+                "watched_at": "2026-02-01T00:00:00+00:00",
+                "updated_at": "2026-02-01T00:00:00+00:00",
+            }
+        ],
+    }
+
+    import_watchlist_text(conn, json.dumps(payload), "json", mode="merge", prefer_newer=True)
+
+    merged = get_anime(conn, "Shared Show")
+    episode = episodes_for_anime(conn, merged["id"])[0]
+    assert merged["status"] == "completed"
+    assert merged["notes"] == "newer local note"
+    assert episode["watched"] == 1
+    assert episode["watched_at"] == "2026-02-01T00:00:00+00:00"
+
+
 def test_auto_backup_creates_full_json_and_portable_xml(app_env, tmp_path) -> None:
     conn = initialize()
     anime, _ = get_or_create_anime(conn, "Cowboy Bebop")
