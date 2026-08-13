@@ -25,6 +25,10 @@ endpoint = "https://graphql.anilist.co"
 timeout_seconds = 8
 requests_per_minute = 30
 temporary_block_cooldown_seconds = 600
+
+[cloud]
+google_drive_auto_backup = false
+google_drive_timeout_seconds = 20
 """
 
 
@@ -49,10 +53,17 @@ class AniListConfig:
 
 
 @dataclass(frozen=True)
+class CloudConfig:
+    google_drive_auto_backup: bool = False
+    google_drive_timeout_seconds: int = 20
+
+
+@dataclass(frozen=True)
 class AppConfig:
     tracking: TrackingConfig = TrackingConfig()
     metadata: MetadataConfig = MetadataConfig()
     anilist: AniListConfig = AniListConfig()
+    cloud: CloudConfig = CloudConfig()
 
 
 def ensure_config(path: Path | None = None) -> Path:
@@ -77,6 +88,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     tracking = raw.get("tracking", {})
     metadata = raw.get("metadata", {})
     anilist = raw.get("anilist", {})
+    cloud = raw.get("cloud", {})
     return AppConfig(
         tracking=TrackingConfig(
             mark_watched_after_seconds=int(tracking.get("mark_watched_after_seconds", 0)),
@@ -91,6 +103,10 @@ def load_config(path: Path | None = None) -> AppConfig:
             timeout_seconds=int(anilist.get("timeout_seconds", 8)),
             requests_per_minute=int(anilist.get("requests_per_minute", 30)),
             temporary_block_cooldown_seconds=int(anilist.get("temporary_block_cooldown_seconds", 600)),
+        ),
+        cloud=CloudConfig(
+            google_drive_auto_backup=bool(cloud.get("google_drive_auto_backup", False)),
+            google_drive_timeout_seconds=max(5, int(cloud.get("google_drive_timeout_seconds", 20))),
         ),
     )
 
@@ -131,7 +147,7 @@ def _format_toml_value(value: Any) -> str:
 def write_raw_config(raw: dict[str, Any], path: Path | None = None) -> Path:
     cfg_path = ensure_config(path)
     lines: list[str] = []
-    for section in ("tracking", "metadata", "anilist"):
+    for section in ("tracking", "metadata", "anilist", "cloud"):
         values = raw.get(section, {})
         if not isinstance(values, dict):
             continue

@@ -1,0 +1,13 @@
+{
+  "installed": {
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "client_id": "342636792561-8sotdjlsco0n9afg1eqjugsktgu1g22s.apps.googleusercontent.com",
+    "client_secret": "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",
+    "project_id": "micro-mediator-138723",
+    "redirect_uris": [
+      "http://localhost"
+    ],
+    "token_uri": "https://oauth2.googleapis.com/token"
+  }
+}

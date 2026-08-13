@@ -39,6 +39,20 @@ class AppPaths:
         override = os.environ.get("ANI_WATCHLIST_LOG_DIR")
         return Path(override).expanduser() if override else self.state_dir / "logs"
 
+    @property
+    def google_drive_client_path(self) -> Path:
+        override = os.environ.get("ANI_WATCHLIST_GOOGLE_CLIENT_CONFIG")
+        return Path(override).expanduser() if override else self.config_dir / "google-drive-client.json"
+
+    @property
+    def google_drive_token_path(self) -> Path:
+        override = os.environ.get("ANI_WATCHLIST_GOOGLE_TOKEN")
+        return Path(override).expanduser() if override else self.config_dir / "google-drive-token.json"
+
+    @property
+    def cloud_backup_status_path(self) -> Path:
+        return self.state_dir / "google-drive-backup-status.json"
+
     def ensure(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.config_dir.mkdir(parents=True, exist_ok=True)

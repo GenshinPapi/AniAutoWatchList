@@ -9,6 +9,7 @@ from ani_watchlist.gui import (
     WATCHED_ICON,
     WATCHLIST_AUTO_REFRESH_MS,
     WatchlistApp,
+    cloud_button_presentation,
     discovery_page_count,
     discovery_page_items,
     discovery_title_preview,
@@ -78,6 +79,88 @@ def test_discovery_title_preview_preserves_start_of_long_titles() -> None:
 
 def test_watchlist_auto_refresh_is_thirty_seconds() -> None:
     assert WATCHLIST_AUTO_REFRESH_MS == 30_000
+
+
+def test_cloud_button_presentation_has_accessible_connection_states() -> None:
+    assert cloud_button_presentation("connected") == ("Cloud ✓", "CloudConnected.TMenubutton")
+    assert cloud_button_presentation("disconnected") == ("Cloud !", "CloudDisconnected.TMenubutton")
+    assert cloud_button_presentation("checking") == ("Cloud ...", "CloudChecking.TMenubutton")
+
+
+def test_cloud_connection_state_updates_button_style_and_error() -> None:
+    app = object.__new__(WatchlistApp)
+    updates: list[dict[str, str]] = []
+    app.cloud_button = SimpleNamespace(configure=lambda **kwargs: updates.append(kwargs))
+    app.cloud_connection_checked_at = None
+
+    app.set_cloud_connection_state("connected")
+    assert app.cloud_connection_state == "connected"
+    assert app.cloud_connection_error is None
+    assert app.cloud_connection_checked_at is not None
+    assert updates[-1] == {"text": "Cloud ✓", "style": "CloudConnected.TMenubutton"}
+
+    app.set_cloud_connection_state("disconnected", error="offline")
+    assert app.cloud_connection_error == "offline"
+    assert updates[-1] == {"text": "Cloud !", "style": "CloudDisconnected.TMenubutton"}
+
+
+def test_automatic_cloud_connection_check_turns_button_green(monkeypatch) -> None:
+    app = object.__new__(WatchlistApp)
+    app.shutting_down = False
+    app.cloud_connection_check_running = False
+    app.cloud_operation_running = False
+    app.cloud_connection_check_job = "scheduled"
+    app.cloud_button = SimpleNamespace(configure=lambda **_kwargs: None)
+    app.cloud_connection_checked_at = None
+    checks: list[str] = []
+
+    class FakeProvider:
+        def is_connected(self) -> bool:
+            return True
+
+        def test_connection(self) -> None:
+            checks.append("tested")
+
+    class ImmediateThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+            self.daemon = daemon
+
+        def start(self) -> None:
+            self.target()
+
+    monkeypatch.setattr("ani_watchlist.gui.GoogleDriveBackupProvider", FakeProvider)
+    monkeypatch.setattr("ani_watchlist.gui.threading.Thread", ImmediateThread)
+    app.run_on_ui = lambda callback: callback()
+
+    app.start_google_drive_connection_check()
+
+    assert checks == ["tested"]
+    assert app.cloud_connection_check_job is None
+    assert app.cloud_connection_check_running is False
+    assert app.cloud_connection_state == "connected"
+    assert app.cloud_connection_error is None
+
+
+def test_automatic_cloud_connection_check_turns_button_red_without_token(monkeypatch) -> None:
+    app = object.__new__(WatchlistApp)
+    app.shutting_down = False
+    app.cloud_connection_check_running = False
+    app.cloud_operation_running = False
+    app.cloud_connection_check_job = "scheduled"
+    app.cloud_button = SimpleNamespace(configure=lambda **_kwargs: None)
+    app.cloud_connection_checked_at = None
+
+    class FakeProvider:
+        def is_connected(self) -> bool:
+            return False
+
+    monkeypatch.setattr("ani_watchlist.gui.GoogleDriveBackupProvider", FakeProvider)
+
+    app.start_google_drive_connection_check()
+
+    assert app.cloud_connection_state == "disconnected"
+    assert app.cloud_connection_error == "Google Drive is not connected."
 
 
 def test_idle_watchdog_uses_four_hour_prompt_and_thirty_minute_close() -> None:
@@ -203,3 +286,36 @@ def test_close_app_writes_auto_backups_before_database_close(monkeypatch) -> Non
 
     assert app.shutting_down is True
     assert events == ["backed up", "database closed", "root quit", "root destroyed"]
+
+
+def test_exit_backup_writes_local_files_before_google_drive(monkeypatch, tmp_path) -> None:
+    app = object.__new__(WatchlistApp)
+    app.conn = object()
+    events: list[str] = []
+    targets = {"json": tmp_path / "jsonbackup.json", "xml": tmp_path / "xmlbackup.xml"}
+
+    class FakeProvider:
+        def is_connected(self) -> bool:
+            return True
+
+        def upload_backups(self, received_targets):
+            assert received_targets == targets
+            events.append("cloud")
+            return SimpleNamespace(files=())
+
+    monkeypatch.setattr(
+        "ani_watchlist.gui.write_auto_backup_files",
+        lambda _conn, _directory: events.append("local") or targets,
+    )
+    monkeypatch.setattr(
+        "ani_watchlist.gui.load_config",
+        lambda: SimpleNamespace(cloud=SimpleNamespace(google_drive_auto_backup=True)),
+    )
+    monkeypatch.setattr("ani_watchlist.gui.GoogleDriveBackupProvider", FakeProvider)
+    monkeypatch.setattr(
+        "ani_watchlist.gui.record_cloud_backup_status",
+        lambda **kwargs: events.append("status") or kwargs,
+    )
+
+    assert app.backup_watchlist_on_exit() is True
+    assert events == ["local", "cloud", "status"]

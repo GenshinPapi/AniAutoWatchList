@@ -21,7 +21,13 @@ except Exception:  # pragma: no cover - optional GUI enhancement
     ImageTk = None
 
 from .availability import refresh_available_episodes_for_anime
-from .config import load_config
+from .cloud import (
+    CloudBackupError,
+    GoogleDriveBackupProvider,
+    load_cloud_backup_status,
+    record_cloud_backup_status,
+)
+from .config import load_config, set_config_value
 from .db import initialize
 from .discovery import (
     POPULAR_FILTERS,
@@ -68,6 +74,7 @@ from .transfer import (
     anilist_mal_id_resolver,
     export_watchlist_text,
     import_watchlist_file,
+    import_watchlist_text,
     write_auto_backup_files,
 )
 from .updater import UpdateInfo, check_ani_cli_update, check_for_update, launch_update, project_root
@@ -110,6 +117,12 @@ COLORS = {
     "accent_hover": "#ff8a3d",
     "danger": "#d44b4b",
     "entry": "#0f1115",
+}
+
+CLOUD_BUTTON_PRESENTATIONS = {
+    "checking": ("Cloud ...", "CloudChecking.TMenubutton"),
+    "connected": ("Cloud ✓", "CloudConnected.TMenubutton"),
+    "disconnected": ("Cloud !", "CloudDisconnected.TMenubutton"),
 }
 
 CARD_W = 178
@@ -231,6 +244,10 @@ def monotonic_ms() -> int:
     return int(monotonic() * 1000)
 
 
+def cloud_button_presentation(state: str) -> tuple[str, str]:
+    return CLOUD_BUTTON_PRESENTATIONS.get(state, CLOUD_BUTTON_PRESENTATIONS["disconnected"])
+
+
 def idle_prompt_due(last_activity_ms: int, now_ms: int, *, prompt_after_ms: int = IDLE_PROMPT_AFTER_MS) -> bool:
     return now_ms - last_activity_ms >= prompt_after_ms
 
@@ -288,6 +305,12 @@ class WatchlistApp:
         self.discovery_error: str | None = None
         self.update_checking = False
         self.metadata_refreshing = False
+        self.cloud_operation_running = False
+        self.cloud_connection_check_running = False
+        self.cloud_connection_check_job: str | None = None
+        self.cloud_connection_state = "checking"
+        self.cloud_connection_error: str | None = None
+        self.cloud_connection_checked_at: str | None = None
         self.search_loading = False
         self.search_results: list[dict[str, object]] = []
         self.search_result_query = ""
@@ -363,6 +386,7 @@ class WatchlistApp:
         if auto_discovery:
             self.start_discovery_refresh(force=False)
         self.schedule_auto_refresh()
+        self.cloud_connection_check_job = self.root.after(500, self.start_google_drive_connection_check)
         if check_updates and os.environ.get("ANI_WATCHLIST_SKIP_UPDATE_CHECK") != "1":
             self.root.after(1200, self.start_update_check)
 
@@ -413,6 +437,41 @@ class WatchlistApp:
             padding=(10, 6),
         )
         style.map("Dark.TMenubutton", background=[("active", COLORS["border"])])
+        style.configure(
+            "CloudChecking.TMenubutton",
+            background=COLORS["panel_alt"],
+            foreground=COLORS["text"],
+            bordercolor=COLORS["border"],
+            focusthickness=0,
+            padding=(10, 6),
+        )
+        style.map("CloudChecking.TMenubutton", background=[("active", COLORS["border"])])
+        style.configure(
+            "CloudConnected.TMenubutton",
+            background="#2e7d32",
+            foreground="#ffffff",
+            bordercolor="#43a047",
+            focusthickness=0,
+            padding=(10, 6),
+        )
+        style.map(
+            "CloudConnected.TMenubutton",
+            background=[("active", "#388e3c")],
+            foreground=[("active", "#ffffff")],
+        )
+        style.configure(
+            "CloudDisconnected.TMenubutton",
+            background=COLORS["danger"],
+            foreground="#ffffff",
+            bordercolor="#e57373",
+            focusthickness=0,
+            padding=(10, 6),
+        )
+        style.map(
+            "CloudDisconnected.TMenubutton",
+            background=[("active", "#e05b5b")],
+            foreground=[("active", "#ffffff")],
+        )
         style.configure(
             "Dark.TCombobox",
             fieldbackground=COLORS["entry"],
@@ -616,18 +675,60 @@ class WatchlistApp:
         )
         import_menu.add_command(label="Import JSON", command=lambda: self.import_watchlist("json"))
         import_menu.add_command(label="Import XML", command=lambda: self.import_watchlist("xml"))
+        import_menu.add_separator()
+        import_menu.add_command(
+            label="Import JSON from Google Drive",
+            command=lambda: self.import_watchlist_from_google_drive("json"),
+        )
+        import_menu.add_command(
+            label="Import XML from Google Drive",
+            command=lambda: self.import_watchlist_from_google_drive("xml"),
+        )
         import_button.configure(menu=import_menu)
         import_button.grid(row=0, column=2, padx=(8, 0))
-        ttk.Button(header, text="Add", style="Accent.TButton", command=self.add_anime).grid(row=0, column=3, padx=(8, 0))
+        self.cloud_button = ttk.Menubutton(header, text="Cloud ...", style="CloudChecking.TMenubutton")
+        cloud_menu = tk.Menu(
+            self.cloud_button,
+            tearoff=False,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            activebackground=COLORS["accent"],
+            activeforeground="#111111",
+            relief="flat",
+        )
+        cloud_menu.add_command(label="Connect Google Drive...", command=self.connect_google_drive)
+        cloud_menu.add_command(
+            label="Test Google Drive Connection",
+            command=lambda: self.start_google_drive_connection_check(show_result=True),
+        )
+        cloud_menu.add_command(label="Back Up to Google Drive Now", command=self.start_google_drive_backup)
+        cloud_menu.add_command(label="Google Drive Status", command=self.show_google_drive_status)
+        cloud_menu.add_separator()
+        cloud_menu.add_command(label="Disconnect Google Drive", command=self.disconnect_google_drive)
+        if not GoogleDriveBackupProvider().has_builtin_client_config():
+            cloud_menu.add_separator()
+            cloud_menu.add_command(
+                label="Developer: Configure Google OAuth...",
+                command=self.choose_google_drive_client_config,
+            )
+        self.cloud_button.configure(menu=cloud_menu)
+        self.cloud_button.grid(row=0, column=3, padx=(8, 0))
+        cloud_token_saved = GoogleDriveBackupProvider().is_connected()
+        self.set_cloud_connection_state(
+            "checking" if cloud_token_saved else "disconnected",
+            error=None if cloud_token_saved else "Google Drive is not connected.",
+            checked=False,
+        )
+        ttk.Button(header, text="Add", style="Accent.TButton", command=self.add_anime).grid(row=0, column=4, padx=(8, 0))
         self.refresh_all_metadata_button = ttk.Button(
             header,
             text="Refresh Metadata",
             style="Dark.TButton",
             command=self.start_all_metadata_refresh,
         )
-        self.refresh_all_metadata_button.grid(row=0, column=4, padx=(8, 0))
+        self.refresh_all_metadata_button.grid(row=0, column=5, padx=(8, 0))
         ttk.Button(header, text="Refresh List", style="Dark.TButton", command=self.refresh_library).grid(
-            row=0, column=5, padx=(8, 0)
+            row=0, column=6, padx=(8, 0)
         )
 
         tabs = tk.Frame(page, bg=COLORS["bg"])
@@ -1339,6 +1440,7 @@ class WatchlistApp:
             "idle_close_job",
             "idle_countdown_job",
             "auto_refresh_job",
+            "cloud_connection_check_job",
             "search_suggestion_job",
             "library_filter_job",
             "party_host_refresh_job",
@@ -1383,8 +1485,23 @@ class WatchlistApp:
 
     def backup_watchlist_on_exit(self) -> bool:
         try:
-            write_auto_backup_files(self.conn, project_root())
+            targets = write_auto_backup_files(self.conn, project_root())
         except Exception as exc:
+            self.log_auto_backup_failure(exc)
+            return False
+        if not load_config().cloud.google_drive_auto_backup:
+            return True
+        try:
+            provider = GoogleDriveBackupProvider()
+            if not provider.is_connected():
+                raise CloudBackupError("Automatic cloud backup is enabled, but Google Drive is not connected.")
+            result = provider.upload_backups(targets)
+            record_cloud_backup_status(success=True, files=result.files)
+        except Exception as exc:
+            try:
+                record_cloud_backup_status(success=False, error=str(exc))
+            except OSError:
+                pass
             self.log_auto_backup_failure(exc)
             return False
         return True
@@ -1991,6 +2108,9 @@ class WatchlistApp:
         except WatchlistTransferError as exc:
             messagebox.showwarning("Watchlist import failed", str(exc))
             return
+        self.finish_watchlist_import(result)
+
+    def finish_watchlist_import(self, result: dict[str, int]) -> None:
         self.selected_anime_id = None
         self.library_render_signature = None
         self.activity_signature = None
@@ -2001,6 +2121,316 @@ class WatchlistApp:
         if skipped:
             summary += f"\nSkipped {skipped} existing anime."
         messagebox.showinfo("Watchlist imported", summary)
+
+    def connect_google_drive(self) -> None:
+        if self.cloud_operation_running:
+            messagebox.showinfo("Google Drive", "A Google Drive operation is already running.")
+            return
+        provider = GoogleDriveBackupProvider()
+        if not provider.has_client_config():
+            if not messagebox.askyesno(
+                "Google Drive publisher setup needed",
+                "This development build does not yet include AniAutoWatchList's Google sign-in identity. "
+                "Normal users will only need to sign in after the app maintainer bundles it.\n\n"
+                "Configure a developer OAuth client for local testing now?",
+            ):
+                return
+            if not self.choose_google_drive_client_config(show_success=False):
+                return
+        self.cloud_operation_running = True
+        self.set_cloud_connection_state("checking", checked=False)
+        self.dashboard_label.configure(text="Waiting for Google Drive sign-in...")
+
+        def worker() -> None:
+            try:
+                provider.connect()
+                error = None
+            except Exception as exc:
+                error = str(exc)
+            self.run_on_ui(lambda: self.finish_google_drive_connect(error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def choose_google_drive_client_config(self, *, show_success: bool = True) -> bool:
+        provider = GoogleDriveBackupProvider()
+        if provider.is_connected():
+            messagebox.showinfo(
+                "Google Drive setup",
+                "Disconnect Google Drive before changing its OAuth client configuration.",
+            )
+            return False
+        if show_success or not provider.has_client_config():
+            messagebox.showinfo(
+                "Google Drive developer setup",
+                "Choose a Desktop OAuth client JSON created by the AniAutoWatchList maintainer. "
+                "This developer-only override is not required by end users after the app identity is bundled.",
+            )
+            source = filedialog.askopenfilename(
+                parent=self.root,
+                title="Choose Google Desktop OAuth client JSON",
+                filetypes=JSON_FILETYPES,
+            )
+            if not source:
+                return False
+            try:
+                provider.install_client_config(source)
+            except CloudBackupError as exc:
+                messagebox.showwarning("Google Drive setup failed", str(exc))
+                return False
+        if show_success:
+            messagebox.showinfo("Google Drive setup", "The Google OAuth Desktop client configuration was saved.")
+        return True
+
+    def finish_google_drive_connect(self, error: str | None) -> None:
+        self.cloud_operation_running = False
+        self.refresh_dashboard()
+        if error:
+            self.set_cloud_connection_state("disconnected", error=error)
+            messagebox.showwarning("Google Drive sign-in failed", error)
+            return
+        self.set_cloud_connection_state("checking", checked=False)
+        set_config_value("cloud.google_drive_auto_backup", "true")
+        messagebox.showinfo(
+            "Google Drive connected",
+            "Automatic JSON and XML cloud backups are enabled. An initial backup will run now.",
+        )
+        self.start_google_drive_backup()
+
+    def start_google_drive_backup(self) -> None:
+        if self.cloud_operation_running:
+            messagebox.showinfo("Google Drive", "A Google Drive operation is already running.")
+            return
+        provider = GoogleDriveBackupProvider()
+        if not provider.is_connected():
+            if messagebox.askyesno("Google Drive", "Google Drive is not connected. Connect it now?"):
+                self.connect_google_drive()
+            return
+        self.cloud_operation_running = True
+        self.set_cloud_connection_state("checking", checked=False)
+        self.dashboard_label.configure(text="Backing up watchlist locally and to Google Drive...")
+
+        def worker() -> None:
+            try:
+                with initialize() as conn:
+                    targets = write_auto_backup_files(conn, project_root())
+                result = provider.upload_backups(targets)
+                record_cloud_backup_status(success=True, files=result.files)
+                error = None
+            except Exception as exc:
+                error = str(exc)
+                try:
+                    record_cloud_backup_status(success=False, error=error)
+                except OSError:
+                    pass
+            self.run_on_ui(lambda: self.finish_google_drive_backup(error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_google_drive_backup(self, error: str | None) -> None:
+        self.cloud_operation_running = False
+        self.refresh_dashboard()
+        if error:
+            self.set_cloud_connection_state("disconnected", error=error)
+            messagebox.showwarning(
+                "Google Drive backup failed",
+                f"The local backup was kept, but the Google Drive backup failed:\n\n{error}",
+            )
+            return
+        self.set_cloud_connection_state("connected")
+        messagebox.showinfo(
+            "Google Drive backup complete",
+            "The JSON and XML backups are current locally and in Google Drive.",
+        )
+
+    def show_google_drive_status(self) -> None:
+        provider = GoogleDriveBackupProvider()
+        status = load_cloud_backup_status()
+        state_labels = {
+            "connected": "Good",
+            "checking": "Checking now",
+            "disconnected": "Disconnected or unavailable",
+        }
+        lines = [
+            f"Connection: {state_labels.get(self.cloud_connection_state, 'Unknown')}",
+            f"Automatic backup on exit: {'On' if load_config().cloud.google_drive_auto_backup else 'Off'}",
+            f"App sign-in configuration: {provider.client_config_source() or 'Missing'}",
+        ]
+        if self.cloud_connection_checked_at:
+            lines.append(f"Last connection test: {self.cloud_connection_checked_at}")
+        if self.cloud_connection_error:
+            lines.extend(("", f"Connection error: {self.cloud_connection_error}"))
+        if status.get("last_success_at"):
+            lines.append(f"Last successful cloud backup: {status['last_success_at']}")
+        elif status.get("last_attempt_at"):
+            lines.append("No successful cloud backup has been recorded yet.")
+        else:
+            lines.append("No cloud backup has been attempted yet.")
+        if status.get("error"):
+            lines.extend(("", f"Last error: {status['error']}"))
+        messagebox.showinfo("Google Drive status", "\n".join(lines))
+
+    def set_cloud_connection_state(
+        self,
+        state: str,
+        *,
+        error: str | None = None,
+        checked: bool = True,
+    ) -> None:
+        self.cloud_connection_state = state if state in CLOUD_BUTTON_PRESENTATIONS else "disconnected"
+        self.cloud_connection_error = error
+        if checked:
+            self.cloud_connection_checked_at = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        text, style = cloud_button_presentation(self.cloud_connection_state)
+        if hasattr(self, "cloud_button"):
+            self.cloud_button.configure(text=text, style=style)
+
+    def start_google_drive_connection_check(self, *, show_result: bool = False) -> None:
+        self.cloud_connection_check_job = None
+        if self.shutting_down or self.cloud_connection_check_running:
+            return
+        if self.cloud_operation_running:
+            return
+        provider = GoogleDriveBackupProvider()
+        if not provider.is_connected():
+            error = "Google Drive is not connected."
+            self.set_cloud_connection_state("disconnected", error=error)
+            if show_result:
+                messagebox.showwarning("Google Drive connection", error)
+            return
+        self.cloud_connection_check_running = True
+        self.set_cloud_connection_state("checking", checked=False)
+
+        def worker() -> None:
+            try:
+                provider.test_connection()
+                error = None
+            except Exception as exc:
+                error = str(exc)
+            self.run_on_ui(lambda: self.finish_google_drive_connection_check(error, show_result=show_result))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_google_drive_connection_check(self, error: str | None, *, show_result: bool = False) -> None:
+        self.cloud_connection_check_running = False
+        if error:
+            self.set_cloud_connection_state("disconnected", error=error)
+            if show_result:
+                messagebox.showwarning("Google Drive connection failed", error)
+            return
+        self.set_cloud_connection_state("connected")
+        if show_result:
+            messagebox.showinfo(
+                "Google Drive connection",
+                "Google Drive is connected and automatic token refresh is working.",
+            )
+
+    def disconnect_google_drive(self) -> None:
+        if self.cloud_operation_running:
+            messagebox.showinfo("Google Drive", "A Google Drive operation is already running.")
+            return
+        provider = GoogleDriveBackupProvider()
+        if not provider.is_connected():
+            set_config_value("cloud.google_drive_auto_backup", "false")
+            self.set_cloud_connection_state("disconnected", error="Google Drive is not connected.")
+            messagebox.showinfo("Google Drive", "Google Drive is already disconnected.")
+            return
+        if not messagebox.askyesno(
+            "Disconnect Google Drive",
+            "Stop automatic cloud backups and remove this app's saved Google sign-in?\n\n"
+            "Existing backups in Google Drive will not be deleted.",
+        ):
+            return
+        set_config_value("cloud.google_drive_auto_backup", "false")
+        self.cloud_operation_running = True
+        self.set_cloud_connection_state("checking", checked=False)
+        self.dashboard_label.configure(text="Disconnecting Google Drive...")
+
+        def worker() -> None:
+            try:
+                provider.disconnect()
+                error = None
+            except Exception as exc:
+                error = str(exc)
+            self.run_on_ui(lambda: self.finish_google_drive_disconnect(error))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_google_drive_disconnect(self, error: str | None) -> None:
+        self.cloud_operation_running = False
+        set_config_value("cloud.google_drive_auto_backup", "false")
+        self.set_cloud_connection_state("disconnected", error=error)
+        self.refresh_dashboard()
+        if error:
+            messagebox.showwarning("Google Drive disconnected", error)
+            return
+        messagebox.showinfo(
+            "Google Drive disconnected",
+            "Automatic cloud backups are off. Local automatic backups are unchanged.",
+        )
+
+    def import_watchlist_from_google_drive(self, import_format: str) -> None:
+        if self.cloud_operation_running:
+            messagebox.showinfo("Google Drive", "A Google Drive operation is already running.")
+            return
+        provider = GoogleDriveBackupProvider()
+        if not provider.is_connected():
+            if messagebox.askyesno("Google Drive", "Google Drive is not connected. Connect it now?"):
+                self.connect_google_drive()
+            return
+        replace = messagebox.askyesnocancel(
+            "Import cloud backup",
+            "Replace the current watchlist with the Google Drive backup?\n\n"
+            "Yes: replace the current watchlist first.\n"
+            "No: sync by adding only missing anime and leaving current entries unchanged.\n"
+            "Cancel: do not import.",
+        )
+        if replace is None:
+            return
+        mode = "replace" if replace else "sync"
+        self.cloud_operation_running = True
+        self.set_cloud_connection_state("checking", checked=False)
+        self.dashboard_label.configure(text=f"Downloading {import_format.upper()} backup from Google Drive...")
+
+        def worker() -> None:
+            try:
+                content = provider.download_backup(import_format)
+                error = None
+            except Exception as exc:
+                content = None
+                error = str(exc)
+            self.run_on_ui(
+                lambda: self.finish_google_drive_import(
+                    content,
+                    import_format=import_format,
+                    mode=mode,
+                    error=error,
+                )
+            )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_google_drive_import(
+        self,
+        content: str | None,
+        *,
+        import_format: str,
+        mode: str,
+        error: str | None,
+    ) -> None:
+        self.cloud_operation_running = False
+        self.refresh_dashboard()
+        if error or content is None:
+            self.set_cloud_connection_state("disconnected", error=error or "The cloud backup was empty.")
+            messagebox.showwarning("Google Drive import failed", error or "The cloud backup was empty.")
+            return
+        self.set_cloud_connection_state("connected")
+        try:
+            result = import_watchlist_text(self.conn, content, import_format, mode=mode)
+            merge_safe_duplicates(self.conn)
+        except WatchlistTransferError as exc:
+            messagebox.showwarning("Google Drive import failed", str(exc))
+            return
+        self.finish_watchlist_import(result)
 
     def start_discovery_refresh(self, *, force: bool = False, page_name: str | None = None) -> None:
         if self.discovery_refreshing:

@@ -29,6 +29,10 @@ watchlist-*.csv
 watchlist-*.sqlite3
 jsonbackup.json
 xmlbackup.xml
+credentials.json
+client_secret*.json
+google-drive-client.json
+google-drive-token.json
 
 # Editor / OS noise
 .vscode/

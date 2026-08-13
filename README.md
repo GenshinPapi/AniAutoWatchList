@@ -216,6 +216,7 @@ The GUI includes:
 - Cover grid
 - Search/filter box
 - Watchlist JSON/XML import and export
+- Automatic local and Google Drive JSON/XML backups, with cloud import
 - One-click background metadata and cover refresh for every watchlist entry
 - Anime detail page
 - Related seasons and side stories on detail pages
@@ -231,6 +232,41 @@ The GUI includes:
 Type in the top search box to fetch AniList title suggestions. Press Enter to show matching titles as discovery-style cards with the same Plan and AniList actions.
 
 Use **Refresh Metadata** on the Watchlist page after a JSON/XML import to update AniList details and cover art for every entry. The refresh runs in the background, displays progress, and reports titles that could not be linked confidently so they can be handled with the detail page's match selector.
+
+### Google Drive backups
+
+AniAutoWatchList always writes `jsonbackup.json` and `xmlbackup.xml` in the project directory when the GUI closes, including an automatic close after the **Still watching?** timeout. Once Google Drive is connected, those same current snapshots are also created or replaced in Google Drive on every close. A cloud failure is recorded but does not remove or invalidate the local backups.
+
+Google Drive access uses the private `appDataFolder` and the narrow `drive.appdata` OAuth scope. The backup files are hidden from the normal My Drive view and AniAutoWatchList cannot read or change the user's other Drive files. Use **Watchlist → Cloud** to back up immediately, view the latest status, or disconnect. Use **Watchlist → Import → Import JSON/XML from Google Drive** to restore with the same replace-or-sync choice as local imports.
+
+For a release with the publisher's Google OAuth identity bundled, end-user setup is only:
+
+1. Choose **Cloud → Connect Google Drive...**.
+2. Sign in and approve AniAutoWatchList in the browser.
+
+An initial backup runs immediately, automatic exit backups are enabled, and Google's refresh token keeps later backups signed in. After reinstalling on a new machine, connect the same Google account and import the cloud backup. End users do not need a Google Cloud project or an OAuth JSON file.
+
+On every later GUI launch, AniAutoWatchList automatically makes a read-only Drive request in the background. This verifies the saved authorization and refreshes an ordinary expired access token without opening the browser. The Watchlist Cloud button shows the result:
+
+- Green **Cloud ✓**: the Drive connection test succeeded.
+- Red **Cloud !**: no saved authorization exists or Google Drive could not be reached/authorized.
+- Neutral **Cloud ...**: the background check is still running.
+
+Use **Cloud → Test Google Drive Connection** to repeat the check immediately. Users normally sign in only once. Google can still require reconnection if the user revokes access, the refresh token is unused for six months, an account/administrator policy invalidates it, or another Google token-lifetime rule applies.
+
+#### One-time publisher setup
+
+Google requires every application that calls its APIs to have a registered OAuth identity. This cannot be created silently on an end user's behalf, but it is only a maintainer/release task:
+
+1. Create separate development and production projects in [Google Cloud Console](https://console.cloud.google.com/), then enable the Google Drive API.
+2. Configure Google Auth Platform branding and an External audience. Add maintainer accounts as test users in the development project.
+3. Create an OAuth client with application type **Desktop app**.
+4. For a production build, save its downloaded JSON as `src/ani_watchlist/_google_drive_oauth_client.json`. The packaging configuration includes that file automatically.
+5. Move the production project to **In production** and complete Google's brand requirements. The `drive.appdata` scope is non-sensitive, so sensitive-scope verification is not required for this design.
+
+Google explicitly treats an installed desktop application's client ID and client secret as an embedded app identity rather than a confidential secret. Never place a user's access token or refresh token in the package or repository. During development, when no built-in identity is present, the GUI exposes **Developer: Configure Google OAuth...** so a maintainer can select a local Desktop client JSON without changing the source tree.
+
+Google's Testing publishing status limits authorizations to seven days, so it is unsuitable for the intended sign-in-once experience. User refresh tokens and optional local developer overrides are stored with user-only permissions under `~/.config/ani-watchlist/` (or the configured XDG config directory) and excluded from Git.
 
 When a watchlist entry has an AniList match, the detail page shows related anime from AniList below the episode and activity panels. Sequels, prequels, parent entries, side stories, and spin-offs appear as discovery-style cards. Prequel, sequel, and parent links are followed across the relation chain so later seasons can appear even when AniList links them through an intermediate entry.
 
