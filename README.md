@@ -229,7 +229,9 @@ The GUI includes:
 - AniList match selection
 - Recent activity panel
 
-Type in the top search box to fetch AniList title suggestions. Press Enter to show matching titles as discovery-style cards with the same Plan and AniList actions.
+Type in the top search box to fetch AniList title suggestions. Press Enter to show matching titles as discovery-style cards with the same watchlist-status and AniList actions.
+
+Each discovery, search-result, and related-title card has a status menu for adding the anime directly to Watching, Completed, Dropped, On Hold, or Plan to Watch. When the title is already present, the menu shows its current status and can move it to another section without creating a duplicate. Clicking the card's cover, title, or metadata area opens the normal watchlist detail and episode view once that anime has been added; the status menu and AniList button remain independent actions.
 
 Use **Refresh Metadata** on the Watchlist page after a JSON/XML import to update AniList details and cover art for every entry. The refresh runs in the background, displays progress, and reports titles that could not be linked confidently so they can be handled with the detail page's match selector.
 

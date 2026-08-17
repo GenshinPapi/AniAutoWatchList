@@ -84,6 +84,7 @@ from .store import (
     clean_display_title,
     delete_anime,
     episodes_for_anime,
+    get_anime,
     get_anime_by_anilist_id,
     get_anime_by_id,
     get_or_create_anime,
@@ -105,6 +106,14 @@ STATUS_LABELS = {
     "dropped": "Dropped",
     "on_hold": "On Hold",
     "plan_to_watch": "Plan to Watch",
+}
+
+DISCOVERY_STATUS_BUTTON_LABELS = {
+    "watching": "Watching",
+    "completed": "Completed",
+    "dropped": "Dropped",
+    "on_hold": "On Hold",
+    "plan_to_watch": "Planned",
 }
 
 COLORS = {
@@ -247,6 +256,10 @@ def monotonic_ms() -> int:
 
 def cloud_button_presentation(state: str) -> tuple[str, str]:
     return CLOUD_BUTTON_PRESENTATIONS.get(state, CLOUD_BUTTON_PRESENTATIONS["disconnected"])
+
+
+def discovery_status_button_text(status: object) -> str:
+    return DISCOVERY_STATUS_BUTTON_LABELS.get(str(status or ""), "Add...")
 
 
 def idle_prompt_due(last_activity_ms: int, now_ms: int, *, prompt_after_ms: int = IDLE_PROMPT_AFTER_MS) -> bool:
@@ -423,6 +436,15 @@ class WatchlistApp:
             padding=(6, 4),
         )
         style.map("Compact.Dark.TButton", background=[("active", COLORS["border"])])
+        style.configure(
+            "Compact.Dark.TMenubutton",
+            background=COLORS["panel_alt"],
+            foreground=COLORS["text"],
+            bordercolor=COLORS["border"],
+            focusthickness=0,
+            padding=(6, 4),
+        )
+        style.map("Compact.Dark.TMenubutton", background=[("active", COLORS["border"])])
         style.configure("Accent.TButton", background=COLORS["accent"], foreground="#111111", padding=(10, 6))
         style.map("Accent.TButton", background=[("active", COLORS["accent_hover"])])
         style.configure("Compact.Accent.TButton", background=COLORS["accent"], foreground="#111111", padding=(6, 4))
@@ -2695,6 +2717,8 @@ class WatchlistApp:
     def create_discovery_card(self, parent: tk.Frame, item: dict[str, object]) -> tk.Frame:
         title_text, _alt_title = split_display_title(str(item.get("display_title") or "Unknown title"))
         media_id = int(item.get("id") or 0)
+        watchlist_anime = self.discovery_watchlist_anime(item)
+        card_cursor = "hand2" if watchlist_anime is not None else ""
         card = tk.Frame(
             parent,
             width=DISCOVERY_CARD_W,
@@ -2702,15 +2726,23 @@ class WatchlistApp:
             bg=COLORS["panel"],
             highlightthickness=1,
             highlightbackground=COLORS["border"],
+            cursor=card_cursor,
         )
         card.grid_propagate(False)
         card.columnconfigure(0, weight=1)
         card.rowconfigure(4, weight=1)
         cover_path = item.get("cover_path") if isinstance(item.get("cover_path"), str) else None
         image = self._image_for(media_id, cover_path, (COVER_W, COVER_H), title_text)
-        cover = tk.Label(card, image=image or "", text="" if image else "No Cover", bg=COLORS["panel"], fg=COLORS["muted"])
+        cover = tk.Label(
+            card,
+            image=image or "",
+            text="" if image else "No Cover",
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            cursor=card_cursor,
+        )
         cover.grid(row=0, column=0, pady=(10, 8))
-        title = self.create_scrollable_card_title(card, title_text)
+        title = self.create_scrollable_card_title(card, title_text, cursor=card_cursor)
         title.grid(row=1, column=0, sticky="ew", padx=12)
         relation_label = item.get("relation_label")
         score = item.get("average_score") or "-"
@@ -2721,6 +2753,7 @@ class WatchlistApp:
             bg=COLORS["panel"],
             fg=COLORS["muted"],
             anchor="w",
+            cursor=card_cursor,
         )
         meta.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 0))
         next_ep = item.get("next_airing_episode") or {}
@@ -2729,21 +2762,49 @@ class WatchlistApp:
             next_text = f"Next ep {next_ep.get('episode')}"
         else:
             next_text = str(item.get("status") or "")
-        info = tk.Label(card, text=next_text, bg=COLORS["panel"], fg=COLORS["muted"], anchor="w")
+        info = tk.Label(
+            card,
+            text=next_text,
+            bg=COLORS["panel"],
+            fg=COLORS["muted"],
+            anchor="w",
+            cursor=card_cursor,
+        )
         info.grid(row=3, column=0, sticky="ew", padx=12)
+        click_widgets = (card, cover, title, meta, info)
+        for widget in click_widgets:
+            widget.bind(
+                "<Button-1>",
+                lambda _event, value=item: self.open_discovery_watchlist_item(value),
+            )
         actions = tk.Frame(card, bg=COLORS["panel"])
         actions.grid(row=5, column=0, sticky="sew", padx=10, pady=(6, 10))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
-        ttk.Button(
+        status_button = ttk.Menubutton(
             actions,
-            text="Plan",
-            width=7,
-            style="Compact.Dark.TButton",
-            command=lambda value=item: self.add_discovery_to_plan(value),
-        ).grid(
-            row=0, column=0, sticky="ew", padx=(0, 4)
+            text=discovery_status_button_text(watchlist_anime["status"] if watchlist_anime is not None else None),
+            width=9,
+            style="Compact.Dark.TMenubutton",
         )
+        status_menu = tk.Menu(
+            status_button,
+            tearoff=False,
+            bg=COLORS["panel_alt"],
+            fg=COLORS["text"],
+            activebackground=COLORS["accent"],
+            activeforeground="#111111",
+            relief="flat",
+        )
+        for status in STATUSES:
+            status_menu.add_command(
+                label=STATUS_LABELS[status],
+                command=lambda chosen=status, value=item, button=status_button, widgets=click_widgets: (
+                    self.set_discovery_watchlist_status(value, chosen, button, widgets)
+                ),
+            )
+        status_button.configure(menu=status_menu)
+        status_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
         ttk.Button(
             actions,
             text="AniList",
@@ -2817,22 +2878,50 @@ class WatchlistApp:
         ).grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 6))
         return frame
 
-    def add_discovery_to_plan(self, item: dict[str, object]) -> None:
-        title = str(item.get("display_title") or "Unknown title")
+    def discovery_watchlist_anime(self, item: dict[str, object]):
         anime = get_anime_by_anilist_id(self.conn, item.get("id"))
+        if anime is not None:
+            return anime
+        title = str(item.get("display_title") or "").strip()
+        return get_anime(self.conn, title) if title else None
+
+    def open_discovery_watchlist_item(self, item: dict[str, object]) -> str | None:
+        anime = self.discovery_watchlist_anime(item)
         if anime is None:
-            anime, created = get_or_create_anime(self.conn, title, status="plan_to_watch")
+            return None
+        self.open_detail(int(anime["id"]))
+        return "break"
+
+    def set_discovery_watchlist_status(
+        self,
+        item: dict[str, object],
+        status: str,
+        status_button,
+        click_widgets: tuple[object, ...],
+    ) -> None:
+        anime = self.add_discovery_to_watchlist(item, status)
+        status_button.configure(text=discovery_status_button_text(anime["status"]))
+        for widget in click_widgets:
+            widget.configure(cursor="hand2")
+
+    def add_discovery_to_watchlist(self, item: dict[str, object], status: str):
+        if status not in STATUSES:
+            raise ValueError(f"invalid watchlist status: {status}")
+        title = str(item.get("display_title") or "Unknown title")
+        anime = self.discovery_watchlist_anime(item)
+        if anime is None:
+            anime, created = get_or_create_anime(self.conn, title, status=status)
         else:
             created = False
+        previous_status = str(anime["status"])
         metadata_payload = item.get("metadata_payload") if isinstance(item.get("metadata_payload"), dict) else None
         updates = {
+            "status": status,
             "anilist_id": item.get("id") or anime["anilist_id"],
             "total_episodes": item.get("episodes") or anime["total_episodes"],
             "cover_url": item.get("cover_url") or anime["cover_url"],
             "cover_path": item.get("cover_path") or anime["cover_path"],
         }
-        if created:
-            updates["status"] = "plan_to_watch"
         update_anime_fields(self.conn, anime["id"], **updates)
         if metadata_payload is not None:
             store_selected_metadata_payload(
@@ -2849,11 +2938,21 @@ class WatchlistApp:
         else:
             label = self.discovery_status_labels.get(self.current_page) or self.discovery_status_labels.get("trending")
         if label is not None:
+            if created:
+                message = f"{split_display_title(title)[0]} added to {STATUS_LABELS[status]}."
+            elif previous_status != status:
+                message = f"{split_display_title(title)[0]} moved to {STATUS_LABELS[status]}."
+            else:
+                message = f"{split_display_title(title)[0]} is already in {STATUS_LABELS[status]}."
             label.configure(
-                text=f"{split_display_title(title)[0]} {'added to' if created else 'is already in'} your watchlist.",
+                text=message,
                 fg=COLORS["muted"],
             )
         self.start_episode_availability_refresh(int(anime["id"]))
+        return get_anime_by_id(self.conn, int(anime["id"]))
+
+    def add_discovery_to_plan(self, item: dict[str, object]) -> None:
+        self.add_discovery_to_watchlist(item, "plan_to_watch")
 
     def start_episode_availability_refresh(self, anime_id: int) -> None:
         try:

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
+from ani_watchlist.db import initialize
 from ani_watchlist.gui import (
     IDLE_CLOSE_GRACE_MS,
     IDLE_PROMPT_AFTER_MS,
@@ -12,6 +15,7 @@ from ani_watchlist.gui import (
     cloud_button_presentation,
     discovery_page_count,
     discovery_page_items,
+    discovery_status_button_text,
     discovery_title_preview,
     idle_prompt_due,
     metadata_payload_is_adult,
@@ -21,6 +25,7 @@ from ani_watchlist.gui import (
     widget_class_owns_mousewheel,
     yview_can_scroll,
 )
+from ani_watchlist.store import get_anime, get_or_create_anime, update_anime_fields
 from ani_watchlist.updater import UpdateInfo, UpdateLaunchResult
 
 
@@ -204,6 +209,79 @@ def test_discovery_paging_splits_items_into_twenty_item_pages() -> None:
     assert discovery_page_items(items, 0) == list(range(20))
     assert discovery_page_items(items, 1) == list(range(20, 40))
     assert discovery_page_items(items, 2) == list(range(40, 45))
+
+
+def test_discovery_status_button_has_compact_labels_for_every_watchlist_status() -> None:
+    assert discovery_status_button_text(None) == "Add..."
+    assert discovery_status_button_text("watching") == "Watching"
+    assert discovery_status_button_text("completed") == "Completed"
+    assert discovery_status_button_text("dropped") == "Dropped"
+    assert discovery_status_button_text("on_hold") == "On Hold"
+    assert discovery_status_button_text("plan_to_watch") == "Planned"
+
+
+def test_discovery_status_action_adds_and_moves_one_watchlist_entry(app_env) -> None:
+    app = object.__new__(WatchlistApp)
+    app.conn = initialize()
+    app.current_page = "trending"
+    messages: list[dict[str, str]] = []
+    refreshed: list[int] = []
+    app.discovery_status_labels = {
+        "trending": SimpleNamespace(configure=lambda **kwargs: messages.append(kwargs)),
+    }
+    app.start_episode_availability_refresh = lambda anime_id: refreshed.append(anime_id)
+    item = {
+        "id": 1,
+        "display_title": "Cowboy Bebop",
+        "episodes": 26,
+        "cover_url": "https://example.test/bebop.jpg",
+    }
+
+    added = app.add_discovery_to_watchlist(item, "watching")
+    moved = app.add_discovery_to_watchlist(item, "on_hold")
+
+    rows = list(app.conn.execute("SELECT * FROM anime"))
+    assert len(rows) == 1
+    assert int(added["id"]) == int(moved["id"])
+    assert moved["status"] == "on_hold"
+    assert moved["anilist_id"] == 1
+    assert moved["total_episodes"] == 26
+    assert messages[0]["text"] == "Cowboy Bebop added to Watching."
+    assert messages[1]["text"] == "Cowboy Bebop moved to On Hold."
+    assert refreshed == [int(added["id"]), int(added["id"])]
+
+    with pytest.raises(ValueError, match="invalid watchlist status"):
+        app.add_discovery_to_watchlist(item, "invalid")
+
+
+def test_discovery_card_navigation_only_opens_titles_in_watchlist(app_env) -> None:
+    app = object.__new__(WatchlistApp)
+    app.conn = initialize()
+    opened: list[int] = []
+    app.open_detail = lambda anime_id: opened.append(anime_id)
+    item = {"id": 999, "display_title": "A Place Further than the Universe"}
+
+    assert app.open_discovery_watchlist_item(item) is None
+    anime, _created = get_or_create_anime(app.conn, str(item["display_title"]), status="plan_to_watch")
+    update_anime_fields(app.conn, anime["id"], anilist_id=item["id"])
+
+    assert app.discovery_watchlist_anime(item)["id"] == anime["id"]
+    assert app.open_discovery_watchlist_item(item) == "break"
+    assert opened == [int(anime["id"])]
+
+
+def test_discovery_lookup_falls_back_to_matching_local_title(app_env) -> None:
+    app = object.__new__(WatchlistApp)
+    app.conn = initialize()
+    anime, _created = get_or_create_anime(app.conn, "Frieren: Beyond Journey's End")
+
+    matched = app.discovery_watchlist_anime(
+        {"id": 154587, "display_title": "Frieren: Beyond Journey's End"}
+    )
+
+    assert matched is not None
+    assert matched["id"] == anime["id"]
+    assert get_anime(app.conn, "Frieren: Beyond Journey's End")["anilist_id"] is None
 
 
 def test_ani_cli_only_update_prompt_can_launch_managed_update(monkeypatch) -> None:
