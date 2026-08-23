@@ -37,6 +37,7 @@ def test_search_uses_title_variants_and_deduplicates(app_env) -> None:
         def _request(self, query, variables):  # noqa: ANN001
             assert "isAdult" in query
             assert "format" in query
+            assert "averageScore" in query
             assert "isAdult:" not in query
             calls.append(variables["search"])
             if variables["search"] == "One Piece":
@@ -49,6 +50,20 @@ def test_search_uses_title_variants_and_deduplicates(app_env) -> None:
     assert len(matches) == 1
     assert matches[0].media_id == "21"
     assert matches[0].confidence_score >= 0.9
+
+
+def test_metadata_queries_request_anilist_average_score(app_env) -> None:
+    class FakeAniListProvider(AniListProvider):
+        def _request(self, query, variables):  # noqa: ANN001
+            assert "averageScore" in query
+            if "id_in" in query:
+                return {"Page": {"media": [{"id": media_id, "averageScore": 80} for media_id in variables["ids"]]}}
+            return {"Media": {"id": variables["id"], "averageScore": 88}}
+
+    provider = FakeAniListProvider()
+
+    assert provider.get_media("21")["averageScore"] == 88
+    assert [item["averageScore"] for item in provider.get_media_batch([21, 22])] == [80, 80]
 
 
 def test_trending_query_returns_media_payloads(app_env) -> None:

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from ani_watchlist.db import initialize
+from ani_watchlist.metadata import selected_metadata_payload
 from ani_watchlist.gui import (
     IDLE_CLOSE_GRACE_MS,
     IDLE_PROMPT_AFTER_MS,
@@ -12,13 +13,16 @@ from ani_watchlist.gui import (
     WATCHED_ICON,
     WATCHLIST_AUTO_REFRESH_MS,
     WatchlistApp,
+    anilist_average_score,
     cloud_button_presentation,
     discovery_page_count,
     discovery_page_items,
     discovery_status_button_text,
     discovery_title_preview,
+    format_anilist_star_rating,
     idle_prompt_due,
     metadata_payload_is_adult,
+    metadata_average_score,
     scroll_units_from_mousewheel,
     split_display_title,
     title_has_adult_label,
@@ -45,6 +49,19 @@ def test_split_display_title_leaves_plain_titles_alone() -> None:
 
 def test_episode_status_icons_are_distinct() -> None:
     assert WATCHED_ICON != UNWATCHED_ICON
+
+
+def test_anilist_average_score_is_presented_as_an_exact_five_star_rating() -> None:
+    assert anilist_average_score(88) == 88.0
+    assert format_anilist_star_rating(88) == "★ 4.4/5"
+    assert format_anilist_star_rating(100) == "★ 5.0/5"
+    assert metadata_average_score({"averageScore": 74}) == 74.0
+
+
+@pytest.mark.parametrize("value", [None, True, "unknown", -1, 101, float("nan")])
+def test_anilist_average_score_rejects_missing_or_invalid_values(value: object) -> None:
+    assert anilist_average_score(value) is None
+    assert format_anilist_star_rating(value) == "☆ Not rated"
 
 
 def test_scroll_units_support_common_mousewheel_events() -> None:
@@ -234,7 +251,9 @@ def test_discovery_status_action_adds_and_moves_one_watchlist_entry(app_env) -> 
         "id": 1,
         "display_title": "Cowboy Bebop",
         "episodes": 26,
+        "average_score": 88,
         "cover_url": "https://example.test/bebop.jpg",
+        "metadata_payload": {"id": 1, "title": {"english": "Cowboy Bebop"}, "episodes": 26},
     }
 
     added = app.add_discovery_to_watchlist(item, "watching")
@@ -246,6 +265,7 @@ def test_discovery_status_action_adds_and_moves_one_watchlist_entry(app_env) -> 
     assert moved["status"] == "on_hold"
     assert moved["anilist_id"] == 1
     assert moved["total_episodes"] == 26
+    assert metadata_average_score(selected_metadata_payload(app.conn, int(added["id"]))) == 88.0
     assert messages[0]["text"] == "Cowboy Bebop added to Watching."
     assert messages[1]["text"] == "Cowboy Bebop moved to On Hold."
     assert refreshed == [int(added["id"]), int(added["id"])]

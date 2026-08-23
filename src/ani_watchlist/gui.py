@@ -7,7 +7,7 @@ import re
 import threading
 import webbrowser
 from datetime import datetime, timedelta, timezone
-from math import ceil
+from math import ceil, isfinite
 from time import monotonic, sleep
 from textwrap import wrap
 import tkinter as tk
@@ -51,6 +51,7 @@ from .launcher import (
 )
 from .metadata import (
     BulkMetadataRefreshResult,
+    backfill_anilist_average_scores,
     refresh_all_metadata,
     refresh_metadata_for_anime,
     select_match,
@@ -125,6 +126,7 @@ COLORS = {
     "muted": "#a9b0bb",
     "accent": "#f47521",
     "accent_hover": "#ff8a3d",
+    "rating": "#f6c344",
     "danger": "#d44b4b",
     "entry": "#0f1115",
 }
@@ -210,6 +212,31 @@ def metadata_payload_is_adult(payload: dict[str, object] | None) -> bool:
 
 def title_has_adult_label(title: object) -> bool:
     return bool(ADULT_TITLE_LABEL_RE.search(str(title or "")))
+
+
+def anilist_average_score(value: object) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not isfinite(score) or not 0 <= score <= 100:
+        return None
+    return score
+
+
+def format_anilist_star_rating(value: object) -> str:
+    score = anilist_average_score(value)
+    if score is None:
+        return "☆ Not rated"
+    return f"★ {score / 20:.1f}/5"
+
+
+def metadata_average_score(payload: dict[str, object] | None) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    return anilist_average_score(payload.get("averageScore"))
 
 
 def scroll_units_from_mousewheel(event) -> int:
@@ -319,6 +346,8 @@ class WatchlistApp:
         self.discovery_error: str | None = None
         self.update_checking = False
         self.metadata_refreshing = False
+        self.rating_backfill_started = False
+        self.rating_backfill_running = False
         self.cloud_operation_running = False
         self.cloud_connection_check_running = False
         self.cloud_connection_check_job: str | None = None
@@ -996,9 +1025,11 @@ class WatchlistApp:
         info.columnconfigure(1, weight=1)
         self.progress_label = tk.Label(info, text="", bg=COLORS["panel"], fg=COLORS["text"], anchor="w")
         self.progress_label.grid(row=0, column=0, columnspan=2, sticky="ew", padx=12, pady=(12, 4))
+        self.detail_rating_label = tk.Label(info, text="", bg=COLORS["panel"], fg=COLORS["muted"], anchor="w")
+        self.detail_rating_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=4)
         self.last_label = tk.Label(info, text="", bg=COLORS["panel"], fg=COLORS["muted"], anchor="w")
-        self.last_label.grid(row=1, column=0, columnspan=2, sticky="ew", padx=12, pady=4)
-        tk.Label(info, text="Status", bg=COLORS["panel"], fg=COLORS["muted"]).grid(row=2, column=0, sticky="w", padx=12, pady=4)
+        self.last_label.grid(row=2, column=0, columnspan=2, sticky="ew", padx=12, pady=4)
+        tk.Label(info, text="Status", bg=COLORS["panel"], fg=COLORS["muted"]).grid(row=3, column=0, sticky="w", padx=12, pady=4)
         self.status_box = ttk.Combobox(
             info,
             values=[STATUS_LABELS[status] for status in STATUSES],
@@ -1006,12 +1037,12 @@ class WatchlistApp:
             state="readonly",
             style="Dark.TCombobox",
         )
-        self.status_box.grid(row=2, column=1, sticky="ew", padx=12, pady=4)
+        self.status_box.grid(row=3, column=1, sticky="ew", padx=12, pady=4)
         self.status_box.bind("<<ComboboxSelected>>", lambda _event: self.save_status())
         self.anilist_label = tk.Label(info, text="", bg=COLORS["panel"], fg=COLORS["muted"], anchor="w")
-        self.anilist_label.grid(row=3, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 12))
+        self.anilist_label.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 12))
         self.launch_label = tk.Label(info, text="", bg=COLORS["panel"], fg=COLORS["muted"], anchor="w")
-        self.launch_label.grid(row=4, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
+        self.launch_label.grid(row=5, column=0, columnspan=2, sticky="ew", padx=12, pady=(0, 12))
 
         actions = tk.Frame(summary, bg=COLORS["bg"])
         actions.grid(row=1, column=1, sticky="ew", pady=(10, 0))
@@ -1197,6 +1228,7 @@ class WatchlistApp:
         self._hide_pages()
         self.library_page.grid(row=0, column=0, sticky="nsew")
         self.refresh_library()
+        self.start_rating_backfill()
 
     def show_discovery_list(self, page_name: str) -> None:
         self.current_page = page_name
@@ -1305,7 +1337,35 @@ class WatchlistApp:
         if hasattr(self, "detail_canvas"):
             self.detail_canvas.yview_moveto(0)
         self.load_detail()
+        self.start_rating_backfill()
         self.start_episode_availability_refresh(anime_id)
+
+    def start_rating_backfill(self) -> None:
+        if self.rating_backfill_started or self.rating_backfill_running:
+            return
+        self.rating_backfill_started = True
+        self.rating_backfill_running = True
+        config = load_config()
+
+        def worker() -> None:
+            try:
+                with initialize() as conn:
+                    updated = backfill_anilist_average_scores(conn, config)
+            except Exception:
+                updated = 0
+            self.run_on_ui(lambda: self.finish_rating_backfill(updated))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def finish_rating_backfill(self, updated: int) -> None:
+        self.rating_backfill_running = False
+        if not updated:
+            return
+        self.library_render_signature = None
+        if self.current_page == "library":
+            self.refresh_library(preserve_scroll=True)
+        elif self.current_page == "detail":
+            self.load_detail()
 
     def run_on_ui(self, callback) -> None:
         if self.shutting_down:
@@ -1611,6 +1671,7 @@ class WatchlistApp:
         return cover_marker
 
     def library_row_signature(self, row) -> tuple[object, ...]:
+        rating = metadata_average_score(selected_metadata_payload(self.conn, int(row["id"])))
         return (
             int(row["id"]),
             row["display_title"],
@@ -1619,6 +1680,7 @@ class WatchlistApp:
             row["available_episode_count"],
             row["total_episodes"],
             row["last_watched_at"],
+            rating,
             self.cover_signature_marker(row["cover_path"]),
         )
 
@@ -1702,6 +1764,16 @@ class WatchlistApp:
         cover.grid(row=0, column=0, pady=(10, 8))
         title = self.create_scrollable_card_title(card, primary_title, cursor="hand2")
         title.grid(row=1, column=0, sticky="ew", padx=12)
+        rating_score = metadata_average_score(selected_metadata_payload(self.conn, int(row["id"])))
+        rating = tk.Label(
+            card,
+            text=format_anilist_star_rating(rating_score),
+            bg=COLORS["panel"],
+            fg=COLORS["rating"] if rating_score is not None else COLORS["muted"],
+            anchor="w",
+            cursor="hand2",
+        )
+        rating.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 0))
         total = row["total_episodes"] if row["total_episodes"] is not None else "?"
         available = row["available_episode_count"] if row["available_episode_count"] is not None else "?"
         progress = tk.Label(
@@ -1712,7 +1784,7 @@ class WatchlistApp:
             anchor="w",
             cursor="hand2",
         )
-        progress.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 0))
+        progress.grid(row=3, column=0, sticky="ew", padx=12)
         last = tk.Label(
             card,
             text=local_time(row["last_watched_at"], date_only=True) if row["last_watched_at"] else "Not watched",
@@ -1721,8 +1793,8 @@ class WatchlistApp:
             anchor="w",
             cursor="hand2",
         )
-        last.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 12))
-        for widget in (card, cover, progress, last):
+        last.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 12))
+        for widget in (card, cover, rating, progress, last):
             widget.bind("<Button-1>", lambda _event, anime_id=row["id"]: self.open_detail(anime_id))
         title.bind("<Button-1>", lambda _event, anime_id=row["id"]: (self.open_detail(anime_id), "break")[1])
         self.card_widgets[int(row["id"])] = card
@@ -2745,20 +2817,21 @@ class WatchlistApp:
         title = self.create_scrollable_card_title(card, title_text, cursor=card_cursor)
         title.grid(row=1, column=0, sticky="ew", padx=12)
         relation_label = item.get("relation_label")
-        score = item.get("average_score") or "-"
-        trending = item.get("trending") or "-"
+        rating_score = anilist_average_score(item.get("average_score"))
         meta = tk.Label(
             card,
-            text=str(relation_label) if relation_label else f"Score {score}   Trend {trending}",
+            text=format_anilist_star_rating(rating_score),
             bg=COLORS["panel"],
-            fg=COLORS["muted"],
+            fg=COLORS["rating"] if rating_score is not None else COLORS["muted"],
             anchor="w",
             cursor=card_cursor,
         )
         meta.grid(row=2, column=0, sticky="ew", padx=12, pady=(4, 0))
         next_ep = item.get("next_airing_episode") or {}
         next_text = ""
-        if isinstance(next_ep, dict) and next_ep.get("episode"):
+        if relation_label:
+            next_text = str(relation_label)
+        elif isinstance(next_ep, dict) and next_ep.get("episode"):
             next_text = f"Next ep {next_ep.get('episode')}"
         else:
             next_text = str(item.get("status") or "")
@@ -2915,6 +2988,9 @@ class WatchlistApp:
             created = False
         previous_status = str(anime["status"])
         metadata_payload = item.get("metadata_payload") if isinstance(item.get("metadata_payload"), dict) else None
+        if metadata_payload is not None and "averageScore" not in metadata_payload:
+            metadata_payload = dict(metadata_payload)
+            metadata_payload["averageScore"] = item.get("average_score")
         updates = {
             "status": status,
             "anilist_id": item.get("id") or anime["anilist_id"],
@@ -3094,6 +3170,11 @@ class WatchlistApp:
         available = anime["available_episode_count"] if anime["available_episode_count"] is not None else len(episodes) or "?"
         total = anime["total_episodes"] if anime["total_episodes"] is not None else "?"
         self.progress_label.configure(text=f"Progress: {watched}/{available}/{total}")
+        rating_score = metadata_average_score(selected_metadata_payload(self.conn, int(anime["id"])))
+        self.detail_rating_label.configure(
+            text=f"AniList rating: {format_anilist_star_rating(rating_score)}",
+            fg=COLORS["rating"] if rating_score is not None else COLORS["muted"],
+        )
         self.last_label.configure(text=f"Last watched: {local_time(anime['last_watched_at'])}")
         self.anilist_label.configure(text=f"AniList ID: {anime['anilist_id'] or '-'}")
         if not self.launch_label.cget("text"):

@@ -181,6 +181,7 @@ def _metadata_payload(media: dict[str, Any]) -> dict[str, Any]:
             "isAdult",
             "season",
             "seasonYear",
+            "averageScore",
             "coverImage",
             "siteUrl",
             "nextAiringEpisode",

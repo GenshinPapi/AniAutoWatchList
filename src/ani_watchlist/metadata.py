@@ -98,6 +98,59 @@ def selected_metadata_payload(conn: sqlite3.Connection, anime_id: int, provider:
     return payload if isinstance(payload, dict) else None
 
 
+def backfill_anilist_average_scores(
+    conn: sqlite3.Connection,
+    config: AppConfig,
+    provider: AniListProvider | None = None,
+) -> int:
+    """Fetch and persist missing AniList community scores in efficient batches."""
+    if not config.anilist.enabled:
+        return 0
+    pending: dict[int, list[tuple[int, dict[str, Any]]]] = {}
+    rows = conn.execute(
+        """
+        SELECT metadata_matches.id, metadata_matches.provider_media_id, metadata_matches.payload_json
+        FROM metadata_matches
+        JOIN anime ON anime.id = metadata_matches.anime_id
+        WHERE metadata_matches.provider = 'anilist'
+          AND metadata_matches.selected = 1
+          AND anime.anilist_id IS NOT NULL
+        """
+    )
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+            media_id = int(row["provider_media_id"])
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if isinstance(payload, dict) and "averageScore" not in payload:
+            pending.setdefault(media_id, []).append((int(row["id"]), payload))
+    if not pending:
+        return 0
+
+    provider = provider or AniListProvider(config.anilist)
+    scores: dict[int, object] = {}
+    for media in provider.get_media_batch(pending):
+        try:
+            media_id = int(media["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        scores[media_id] = media.get("averageScore")
+    updated = 0
+    with conn:
+        for media_id, matches in pending.items():
+            if media_id not in scores:
+                continue
+            for match_id, payload in matches:
+                payload["averageScore"] = scores[media_id]
+                conn.execute(
+                    "UPDATE metadata_matches SET payload_json = ? WHERE id = ?",
+                    (json.dumps(payload, sort_keys=True), match_id),
+                )
+                updated += 1
+    return updated
+
+
 def _apply_selected_match(
     conn: sqlite3.Connection,
     anime_id: int,

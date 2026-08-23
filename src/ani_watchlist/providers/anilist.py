@@ -29,6 +29,7 @@ query ($search: String) {
       status
       format
       isAdult
+      averageScore
       coverImage { extraLarge large medium color }
       siteUrl
       externalLinks { id site url type language }
@@ -110,6 +111,7 @@ query ($id: Int) {
     status
     format
     isAdult
+    averageScore
     description(asHtml: false)
     coverImage { extraLarge large medium color }
     siteUrl
@@ -127,6 +129,7 @@ query ($ids: [Int], $page: Int, $perPage: Int) {
       idMal
       episodes
       format
+      averageScore
       externalLinks { id site url type language }
     }
   }

@@ -13,6 +13,7 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 - Local SQLite watchlist
 - Dark Tkinter desktop GUI
 - Trending, top airing, most popular, and release schedule tabs powered by AniList metadata
+- AniList community ratings shown on a five-star scale across discovery, watchlist, and anime-detail views
 - Status tabs: Watching, Completed, Dropped, On Hold, Plan to Watch
 - Episode watched/unwatched tracking
 - Continue button in the GUI for launching a selected episode through ani-cli
@@ -230,6 +231,8 @@ The GUI includes:
 - Recent activity panel
 
 Type in the top search box to fetch AniList title suggestions. Press Enter to show matching titles as discovery-style cards with the same watchlist-status and AniList actions.
+
+Each discovery, search-result, and related-title card shows AniList's weighted community score as a gold star rating on a five-point scale, replacing the less useful score/trend statistics. The same rating appears on watchlist cards and anime detail pages; unrated titles are identified clearly. Existing AniList-linked entries have missing ratings filled in with a small batched request when the Watchlist or a detail page is first opened.
 
 Each discovery, search-result, and related-title card has a status menu for adding the anime directly to Watching, Completed, Dropped, On Hold, or Plan to Watch. When the title is already present, the menu shows its current status and can move it to another section without creating a duplicate. Clicking the card's cover, title, or metadata area opens the normal watchlist detail and episode view once that anime has been added; the status menu and AniList button remain independent actions.
 

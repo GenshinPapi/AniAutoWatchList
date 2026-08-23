@@ -4,7 +4,14 @@ import json
 
 from ani_watchlist.config import AppConfig, AniListConfig, MetadataConfig
 from ani_watchlist.db import initialize
-from ani_watchlist.metadata import refresh_all_metadata, refresh_metadata_for_anime, search_and_store_matches, store_selected_metadata_payload
+from ani_watchlist.metadata import (
+    backfill_anilist_average_scores,
+    refresh_all_metadata,
+    refresh_metadata_for_anime,
+    search_and_store_matches,
+    selected_metadata_payload,
+    store_selected_metadata_payload,
+)
 from ani_watchlist.providers.base import MetadataSearchResult
 from ani_watchlist.store import get_or_create_anime, update_anime_fields
 
@@ -168,6 +175,30 @@ def test_store_selected_metadata_payload_preserves_discovery_match(app_env):
     selected = conn.execute("SELECT * FROM metadata_matches WHERE anime_id = ?", (anime["id"],)).fetchone()
     assert selected["selected"] == 1
     assert json.loads(selected["payload_json"])["synonyms"] == ["Bible Black: Night of the Walpulgiss"]
+
+
+def test_backfill_anilist_average_scores_updates_missing_scores_in_one_batch(app_env) -> None:
+    conn = initialize()
+    first, _ = get_or_create_anime(conn, "Cowboy Bebop")
+    second, _ = get_or_create_anime(conn, "Frieren")
+    store_selected_metadata_payload(conn, first["id"], 1, payload())
+    store_selected_metadata_payload(conn, second["id"], 2, payload(2, "Frieren", 28) | {"averageScore": 93})
+    calls: list[list[int]] = []
+
+    class RatingProvider:
+        def get_media_batch(self, media_ids):  # noqa: ANN001
+            calls.append(list(media_ids))
+            return [{"id": 1, "averageScore": 88}]
+
+    updated = backfill_anilist_average_scores(conn, AppConfig(), RatingProvider())
+
+    assert updated == 1
+    assert calls == [[1]]
+    assert selected_metadata_payload(conn, first["id"])["averageScore"] == 88
+    assert selected_metadata_payload(conn, second["id"])["averageScore"] == 93
+
+    assert backfill_anilist_average_scores(conn, AppConfig(), RatingProvider()) == 0
+    assert calls == [[1]]
 
 
 def test_refresh_linked_metadata_replaces_stale_imported_cover_path(app_env, tmp_path) -> None:
