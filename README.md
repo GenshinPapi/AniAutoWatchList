@@ -18,6 +18,7 @@ This project does not bypass DRM, paywalls, or login systems, and does not use E
 - Episode watched/unwatched tracking
 - Continue button in the GUI for launching a selected episode through ani-cli
 - Automatic playback failover from anidb.app to hianime.at when the primary provider is down
+- Automatic repair of image-wrapped HLS segments that mpv, VLC, and ffmpeg otherwise refuse to play
 - Startup update check against the GitHub `main` branch
 - Global AniList title search with suggestions and card results
 - Related seasons on anime detail pages
@@ -317,13 +318,53 @@ anidb.app playback failed: anidb.app is down for maintenance. Trying hianime.at.
 hianime.at Links Fetched
 ```
 
-If both providers fail, the error names each one separately.
+If both providers fail, the error names each one separately. hianime.at also distinguishes an episode
+that is still being encoded from one it has no source for, so those cases no longer read as a generic
+parse failure:
+
+```text
+hianime.at is still transcoding episode 1, try again in a few minutes
+hianime.at has no sub source for episode 8
+```
 
 hianime.at serves subtitles as a separate WebVTT track rather than burning them into the video, so
 AniAutoWatchList hands the English track to the player (`--sub-file` for mpv/IINA/Syncplay,
-`:input-slave=` for VLC). Its streams also require a Referer header, so Android intents, `catt`, and the
-iSH `vlc://` handler cannot play from it. hianime.at currently serves a single 1080p variant, so `-q`
-falls back to best for other values.
+`:input-slave=` for VLC). Its playlists require a Referer header, so Android intents, `catt`, and the
+iSH `vlc://` handler cannot play from it. Most titles offer 360p, 720p and 1080p, but some are encoded
+at a single resolution, in which case `-q` falls back to best.
+
+### Image-wrapped segments
+
+hianime.at ships a minority of its episodes with every `.ts` segment hidden behind a decoy PNG header.
+Browsers play them because hls.js resynchronises on the transport-stream sync byte, but mpv, VLC and
+ffmpeg probe the segment, decide it is a 1x1 image and refuse it — the symptom is one episode of a show
+failing while its neighbours play.
+
+AniAutoWatchList detects this after the quality is chosen. It reads the first few kilobytes of the first
+segment, finds where the real transport stream begins, measures every segment, and writes a local copy
+of the playlist whose entries carry an `#EXT-X-BYTERANGE` that starts past the decoy. The player is then
+handed that local playlist:
+
+```text
+Segments hide behind a 252 byte image header, measuring them...
+```
+
+Detecting the wrapper costs one playlist request and one 4 KB range request, about 0.4 s per launch.
+Measuring the segments costs a further `HEAD` sweep, roughly five seconds for a 24 minute episode, and
+only happens for affected episodes. Unaffected streams are handed to the player exactly as before.
+Anything unexpected — an unmeasurable segment, an encrypted or byte-ranged playlist, a fragmented-mp4
+stream — leaves the original URL in place, so this can only ever add working episodes. Set
+`ANI_CLI_HLS_FIX=0` to skip the check entirely.
+
+Watch parties use the same launcher, so they get the repair too, including the embedded player, the
+mpv IPC socket, and seek/pause synchronisation.
+
+Local playlists live in `${TMPDIR:-/tmp}/ani-cli-hls.XXXXXX/stream.m3u8` and are swept on the next run
+once they are a day old; they outlive the script because a detached player still needs them. mpv, IINA
+and Syncplay additionally receive `--demuxer-lavf-o-append=protocol_whitelist=...`, because mpv drops
+http from the nested protocol whitelist when the playlist itself is a local file. Downloads switch from
+`yt-dlp` to `ffmpeg` for these episodes. Android intents, `catt`, iSH and `--debug` cannot use a local
+playlist, so they keep the original URL.
 
 These environment variables control provider selection:
 
@@ -331,6 +372,7 @@ These environment variables control provider selection:
 ANI_CLI_ANIDB=0            # skip anidb.app and go straight to hianime.at
 ANI_CLI_HIANIME=0          # disable the fallback and use anidb.app only
 ANI_CLI_HIANIME_BASE=...   # point the fallback at a different hianime domain
+ANI_CLI_HLS_FIX=0          # never rewrite a playlist, even when segments are image-wrapped
 ```
 
 Setting `ANI_CLI_ANIDB=0` is worth doing while anidb.app is in maintenance: it removes one failed round

@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="4.15.0"
+version_number="4.16.0"
 # shellcheck disable=SC2034
 ani_watch_upstream_commit="b8032b72901721a1ce859ca2816e8e2c914bc616"
 
@@ -581,6 +581,143 @@ hls_playlist_links() {
 ' | sort -rn
 }
 
+# print every segment url of the media playlist on stdin, resolved against $1
+hls_segment_urls() {
+    awk -v base="${1%/*}/" '
+/^#/ { next }
+/^[[:space:]]*$/ { next }
+{ print ($0 ~ /^https?:\/\//) ? $0 : base $0 }
+'
+}
+
+# Some stream hosts hide the transport stream of every segment behind a decoy
+# image header. Browsers cope because hls.js resyncs on the transport-stream sync
+# byte, but libavformat probes the segment, settles on the image demuxer and
+# refuses to play it. Print the offset of the first transport-stream packet in
+# the file $1, or nothing when the file holds no transport stream at all.
+hls_payload_offset() {
+    od -v -An -tu1 "$1" | awk '
+{ for (i = 1; i <= NF; i++) octet[total++] = $i + 0 }
+END {
+    packet = 188
+    probes = 5
+    if (total < packet * probes) exit
+    last = total - packet * (probes - 1)
+    for (start = 0; start < last; start++) {
+        if (octet[start] != 71) continue
+        aligned = 1
+        for (n = 1; n < probes; n++)
+            if (octet[start + n * packet] != 71) { aligned = 0; break }
+        if (aligned) { print start; exit }
+    }
+}'
+}
+
+# print the byte size of every segment url on stdin, in order; $1 is the referer
+hls_segment_sizes() {
+    if [ -n "$1" ]; then
+        xargs curl -sI -A "$scraper_agent" -H "Referer: $1" --connect-timeout 5 --max-time 300 2>/dev/null
+    else
+        xargs curl -sI -A "$scraper_agent" --connect-timeout 5 --max-time 300 2>/dev/null
+    fi | tr -d '\r' | awk 'tolower($1) == "content-length:" { print $2 }'
+}
+
+# rewrite the media playlist on stdin so every segment is read from $2 bytes in,
+# past the decoy header; $1 is the playlist url segments resolve against and $3
+# their byte sizes, one per line. Byte ranges need playlist version 4.
+hls_byterange_playlist() {
+    awk -v base="${1%/*}/" -v offset="$2" -v sizes="$3" '
+BEGIN { split(sizes, size, "\n"); opened = 0; segment = 0 }
+/^#EXTM3U/ && !opened { print; print "#EXT-X-VERSION:4"; opened = 1; next }
+/^#EXT-X-VERSION:/ { next }
+/^#/ { print; next }
+/^[[:space:]]*$/ { next }
+{
+    segment++
+    span = size[segment] - offset
+    if (span > 0) printf "#EXT-X-BYTERANGE:%d@%d\n", span, offset
+    print ($0 ~ /^https?:\/\//) ? $0 : base $0
+}'
+}
+
+# players that can only be handed a url cannot use a rewritten local playlist
+hls_local_playlist_supported() {
+    case "$(printf '%s' "$player_function" | cut -f1 -d' ')" in
+        android* | iSH | catt | debug) return 1 ;;
+        *) return 0 ;;
+    esac
+}
+
+# a rewritten playlist outlives a detached player, so sweep yesterday's leftovers
+hls_prune_playlists() {
+    command -v find >/dev/null || return 0
+    find "${TMPDIR:-/tmp}" -maxdepth 1 -type d -name 'ani-cli-hls.*' -mtime +0 -exec rm -rf {} \; 2>/dev/null
+    return 0
+}
+
+# libavformat cannot demux a segment whose transport stream hides behind a decoy
+# image header, so rewrite the selected playlist locally with the byte ranges
+# that skip the decoy and point the player at that copy. Anything unexpected
+# leaves $episode alone, so playback is never worse than it was without this.
+hls_localize_playlist() {
+    # a replayed episode is already pointing at the rewritten playlist
+    [ -n "$hls_playlist_file" ] && [ "$episode" = "$hls_playlist_file" ] && return 0
+    hls_lavf_flag=""
+    hls_playlist_file=""
+    [ "$hls_fix_enabled" = "1" ] || return 0
+    hls_local_playlist_supported || return 0
+    case "$episode" in
+        http://*m3u8* | https://*m3u8*) ;;
+        *) return 0 ;;
+    esac
+
+    if [ -n "$m3u8_refr" ]; then
+        _hls_playlist="$(provider_curl "the stream host" "$episode" -A "$scraper_agent" -H "Referer: $m3u8_refr" --max-time 20)"
+    else
+        _hls_playlist="$(provider_curl "the stream host" "$episode" -A "$scraper_agent" --max-time 20)"
+    fi
+    printf '%s' "$_hls_playlist" | grep -q "#EXTM3U" || return 0
+    # a master playlist lists variants, and byte ranges or encryption mean the
+    # segment layout is not ours to rewrite
+    printf '%s' "$_hls_playlist" | grep -qE '#EXT-X-STREAM-INF|#EXT-X-BYTERANGE|#EXT-X-KEY' && return 0
+
+    _hls_segments="$(printf '%s\n' "$_hls_playlist" | hls_segment_urls "$episode")"
+    [ -n "$_hls_segments" ] || return 0
+
+    _hls_probe="$(mktemp)" || return 0
+    curl -sL -A "$scraper_agent" --connect-timeout 5 --max-time 20 -r 0-4095 -o "$_hls_probe" \
+        "$(printf '%s\n' "$_hls_segments" | head -n 1)" 2>/dev/null
+    _hls_offset="$(hls_payload_offset "$_hls_probe")"
+    rm -f "$_hls_probe"
+    # no transport stream in sight, or it already starts where the player looks
+    [ -n "$_hls_offset" ] || return 0
+    [ "$_hls_offset" -gt 0 ] || return 0
+
+    printf "\33[2K\r\033[1;33m%s\033[0m\n" "Segments hide behind a ${_hls_offset} byte image header, measuring them..." 1>&2
+    _hls_sizes="$(printf '%s\n' "$_hls_segments" | hls_segment_sizes "$m3u8_refr")"
+    _hls_wanted="$(printf '%s\n' "$_hls_segments" | wc -l | tr -d '[:space:]')"
+    _hls_measured="$(printf '%s\n' "$_hls_sizes" | grep -c '^[0-9][0-9]*$')"
+    _hls_short="$(printf '%s\n' "$_hls_sizes" | awk -v offset="$_hls_offset" '$1 !~ /^[0-9]+$/ || $1 + 0 <= offset { short++ } END { print short + 0 }')"
+    if [ "$_hls_wanted" != "$_hls_measured" ] || [ "$_hls_short" != "0" ]; then
+        printf "\33[2K\r\033[1;33m%s\033[0m\n" "Could not measure every segment, leaving the stream untouched." 1>&2
+        return 0
+    fi
+
+    hls_prune_playlists
+    _hls_dir="$(mktemp -d "${TMPDIR:-/tmp}/ani-cli-hls.XXXXXX")" || return 0
+    printf '%s\n' "$_hls_playlist" | hls_byterange_playlist "$episode" "$_hls_offset" "$_hls_sizes" >"$_hls_dir/stream.m3u8"
+    if ! grep -q "#EXT-X-BYTERANGE" "$_hls_dir/stream.m3u8"; then
+        rm -rf "$_hls_dir"
+        return 0
+    fi
+
+    hls_playlist_file="$_hls_dir/stream.m3u8"
+    episode="$hls_playlist_file"
+    # a local playlist makes mpv drop http from the nested protocol whitelist
+    hls_lavf_flag="--demuxer-lavf-o-append=protocol_whitelist=file,crypto,data,http,https,tcp,tls"
+    return 0
+}
+
 anidb_fetch_episode_links() {
     _anidb_title="${1:-$title}"
     [ -n "$_anidb_title" ] || _anidb_title="$allanime_title"
@@ -898,7 +1035,13 @@ hianime_fetch_episode_links() {
     _hianime_status=$?
     _hianime_blob="$(printf '%s' "$_hianime_embed_page" | sed -nE 's|.*window\.__P="([^"]*)".*|\1|p' | head -n 1)"
     if [ -z "$_hianime_blob" ]; then
-        if [ "$_hianime_status" -eq 2 ]; then
+        # the embed serves a status card instead of a player while a source is
+        # still being transcoded, or when the episode has no source at all
+        if printf '%s' "$_hianime_embed_page" | grep -q '<span>// Encoding</span>'; then
+            hianime_last_error="hianime.at is still transcoding episode ${ep_no}, try again in a few minutes"
+        elif printf '%s' "$_hianime_embed_page" | grep -q '<span>// Error</span>'; then
+            hianime_last_error="hianime.at has no ${mode} source for episode ${ep_no}"
+        elif [ "$_hianime_status" -eq 2 ]; then
             hianime_last_error="hianime.at returned a Cloudflare browser challenge"
         else
             hianime_last_error="hianime.at embed did not expose a player config"
@@ -1163,7 +1306,11 @@ download() {
     [ -n "$subtitle" ] && curl -s "$subtitle" -o "$download_dir/$2.vtt"
     case $1 in
         *m3u8*)
-            if command -v "yt-dlp" >/dev/null; then
+            if [ -f "$1" ]; then
+                # a locally rewritten playlist: ffmpeg has to be allowed to follow
+                # it out to the segment host, and rejects http-only flags for it
+                ffmpeg -extension_picky 0 -protocol_whitelist file,crypto,data,http,https,tcp,tls -loglevel error -stats -i "$1" -c copy "$download_dir/$2.mp4"
+            elif command -v "yt-dlp" >/dev/null; then
                 yt-dlp --referer "$m3u8_refr" "$1" --no-skip-unavailable-fragments --fragment-retries infinite -N 16 -o "$download_dir/$2.mp4"
             else
                 ffmpeg -extension_picky 0 -referer "$m3u8_refr" -loglevel error -stats -i "$1" -c copy "$download_dir/$2.mp4"
@@ -1188,6 +1335,7 @@ play_episode() {
     [ -n "${ANI_WATCH_MPV_WID:-}" ] && wid_flag="--wid=$ANI_WATCH_MPV_WID"
     [ -n "${ANI_WATCH_MPV_EXTRA_ARGS:-}" ] && mpv_extra_flags="$ANI_WATCH_MPV_EXTRA_ARGS"
     [ -z "$episode" ] && get_episode_url
+    hls_localize_playlist
     # shellcheck disable=SC2086
     case "$player_function" in
         debug)
@@ -1196,9 +1344,9 @@ play_episode() {
             ;;
         mpv*)
             if [ "$no_detach" = 0 ]; then
-                ani_watch_run_detached $player_function $skip_flag $ipc_flag $wid_flag $mpv_extra_flags --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag
+                ani_watch_run_detached $player_function $skip_flag $ipc_flag $wid_flag $mpv_extra_flags $hls_lavf_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag
             else
-                ani_watch_run_foreground $player_function $skip_flag $ipc_flag $wid_flag $mpv_extra_flags $subs_flag $refr_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
+                ani_watch_run_foreground $player_function $skip_flag $ipc_flag $wid_flag $mpv_extra_flags $hls_lavf_flag $subs_flag $refr_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
@@ -1208,14 +1356,15 @@ play_episode() {
         *iina*)
             [ -n "$subs_flag" ] && subs_flag="--mpv-${subs_flag#--}"
             [ -n "$refr_flag" ] && refr_flag="--mpv-${refr_flag#--}"
+            [ -n "$hls_lavf_flag" ] && hls_lavf_flag="--mpv-${hls_lavf_flag#--}"
             if pgrep -f "IINA" >/dev/null 2>&1; then
                 # omit --keep-running when an IINA instance exists to prevent hanging
-                ani_watch_run_detached $player_function --no-stdin --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag "$episode"
+                ani_watch_run_detached $player_function --no-stdin --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $hls_lavf_flag "$episode"
             else
-                ani_watch_run_detached $player_function --no-stdin --keep-running --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag "$episode"
+                ani_watch_run_detached $player_function --no-stdin --keep-running --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $hls_lavf_flag "$episode"
             fi
             ;;
-        flatpak_mpv) ani_watch_run_detached flatpak run io.mpv.Mpv $ipc_flag $wid_flag $mpv_extra_flags --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag ;;
+        flatpak_mpv) ani_watch_run_detached flatpak run io.mpv.Mpv $ipc_flag $wid_flag $mpv_extra_flags $hls_lavf_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag ;;
         vlc*)
             vlc_refr="${refr_flag#--referrer=}"
             [ "$vlc_refr" = "$refr_flag" ] && vlc_refr="$allanime_refr"
@@ -1224,7 +1373,7 @@ play_episode() {
             [ -n "$subtitle" ] && vlc_subs_flag=":input-slave=$subtitle"
             ani_watch_run_detached $player_function --http-referrer="$vlc_refr" --play-and-exit --meta-title="${allanime_title}Episode ${ep_no}" "$episode" $vlc_subs_flag
             ;;
-        *yncpla*) ani_watch_run_detached $player_function "$episode" -- --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag ;;
+        *yncpla*) ani_watch_run_detached $player_function "$episode" -- --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $hls_lavf_flag ;;
         download) ani_watch_run_foreground "$player_function" "$episode" "${allanime_title}Episode ${ep_no}" "$subtitle" ;;
         catt) ani_watch_run_detached catt cast "$episode" -s "$subtitle" ;;
         iSH)
@@ -1279,6 +1428,9 @@ hianime_agent="$scraper_agent"
 hianime_base="${ANI_CLI_HIANIME_BASE:-https://hianime.at}"
 anidb_enabled="${ANI_CLI_ANIDB:-1}"
 hianime_enabled="${ANI_CLI_HIANIME:-1}"
+hls_fix_enabled="${ANI_CLI_HLS_FIX:-1}"
+hls_playlist_file=""
+hls_lavf_flag=""
 allanime_refr="https://youtu-chan.com"
 allanime_api_refr="https://mkissa.to"
 allanime_api="https://api.mkissa.net"
