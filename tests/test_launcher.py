@@ -475,6 +475,8 @@ def test_launch_episode_can_pass_mpv_ipc_and_wid(monkeypatch) -> None:
 
     monkeypatch.setattr(launcher.shutil, "which", fake_which)
     monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    # an X11 session needs no GPU context of its own, so mpv keeps choosing
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
 
     result = launcher.launch_episode(
         "One Piece",
@@ -496,7 +498,8 @@ def test_launch_episode_can_pass_mpv_ipc_and_wid(monkeypatch) -> None:
     assert result.pid == 4322
     assert seen["ipc"] == "/tmp/party.sock"
     assert seen["wid"] == "12345"
-    assert seen["mpv_extra"] == launcher.DEFAULT_MPV_EXTRA_ARGS
+    # an embedded player gets mpv's own frame timing, not the app's display sync
+    assert seen["mpv_extra"] == launcher.EMBEDDED_MPV_EXTRA_ARGS
 
 
 def test_launch_episode_can_detach_and_quiet_embedded_playback(monkeypatch) -> None:
@@ -537,3 +540,162 @@ def test_launch_episode_can_detach_and_quiet_embedded_playback(monkeypatch) -> N
     assert seen["mpv_extra"] == launcher.DEFAULT_MPV_EXTRA_ARGS
     assert seen["stdout"] == launcher.subprocess.DEVNULL
     assert seen["stderr"] == launcher.subprocess.DEVNULL
+
+
+MPV_GPU_CONTEXT_HELP = """Available GPU contexts:
+  auto             Auto detect
+  waylandvk        Wayland/Vulkan
+  x11vk            X11/Vulkan
+  wayland          Wayland/EGL
+  x11egl           X11/EGL
+  x11              X11/GLX
+  drm              DRM/EGL
+"""
+
+
+def test_parse_mpv_gpu_contexts_reads_the_help_listing() -> None:
+    assert launcher.parse_mpv_gpu_contexts(MPV_GPU_CONTEXT_HELP) == (
+        "auto",
+        "waylandvk",
+        "x11vk",
+        "wayland",
+        "x11egl",
+        "x11",
+        "drm",
+    )
+
+
+def test_mpv_gpu_contexts_asks_the_player_once(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    class FakeResult:
+        stdout = MPV_GPU_CONTEXT_HELP
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return FakeResult()
+
+    launcher._MPV_GPU_CONTEXT_CACHE.pop("mpv-probe-test", None)
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+
+    first = launcher.mpv_gpu_contexts("mpv-probe-test")
+    second = launcher.mpv_gpu_contexts("mpv-probe-test")
+
+    assert first == second
+    assert "x11egl" in first
+    assert calls == [["mpv-probe-test", "--gpu-context=help"]]
+
+
+def test_embedded_player_is_pinned_to_x11_on_wayland(monkeypatch) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.setattr(launcher, "mpv_gpu_contexts", lambda mpv="mpv": ("auto", "waylandvk", "x11egl", "x11"))
+
+    assert launcher.with_mpv_embed_args("--video-sync=display-resample") == (
+        "--video-sync=display-resample --gpu-context=x11egl"
+    )
+
+
+def test_embedded_player_falls_back_through_the_x11_contexts(monkeypatch) -> None:
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+
+    monkeypatch.setattr(launcher, "mpv_gpu_contexts", lambda mpv="mpv": ("auto", "wayland", "x11"))
+    assert launcher.with_mpv_embed_args("") == "--gpu-context=x11"
+
+    # a player that cannot be asked still gets the context every mainstream build has
+    monkeypatch.setattr(launcher, "mpv_gpu_contexts", lambda mpv="mpv": ())
+    assert launcher.with_mpv_embed_args("") == "--gpu-context=x11egl"
+
+    # no X11 context at all: embedding is impossible, so leave mpv alone
+    monkeypatch.setattr(launcher, "mpv_gpu_contexts", lambda mpv="mpv": ("auto", "wayland", "waylandvk"))
+    assert launcher.with_mpv_embed_args("--video-sync=display-resample") == "--video-sync=display-resample"
+
+
+def test_embedded_player_is_left_alone_outside_wayland_and_when_chosen(monkeypatch) -> None:
+    monkeypatch.setattr(launcher, "mpv_gpu_contexts", lambda mpv="mpv": ("auto", "waylandvk", "x11egl"))
+
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setenv("DISPLAY", ":0")
+    assert launcher.with_mpv_embed_args("--video-sync=display-resample") == "--video-sync=display-resample"
+
+    # no X display to embed into, so forcing X11 would only break playback
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    assert launcher.with_mpv_embed_args("--video-sync=display-resample") == "--video-sync=display-resample"
+
+    # an explicit choice wins
+    monkeypatch.setenv("DISPLAY", ":0")
+    assert launcher.with_mpv_embed_args("--gpu-context=wayland") == "--gpu-context=wayland"
+
+
+def test_launch_episode_pins_x11_only_for_the_embedded_player(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4324
+
+    def fake_popen(command, *, start_new_session, env=None, stdout=None, stderr=None):
+        seen["mpv_extra"] = (env or {}).get("ANI_WATCH_MPV_EXTRA_ARGS")
+        return FakeProcess()
+
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/home/me/.local/bin/ani-cli")
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(launcher, "mpv_gpu_contexts", lambda mpv="mpv": ("auto", "waylandvk", "x11egl"))
+    monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+    monkeypatch.setenv("DISPLAY", ":0")
+    monkeypatch.delenv("ANI_WATCH_MPV_EXTRA_ARGS", raising=False)
+
+    launcher.launch_episode("One Piece", "1090", prefer_terminal=False, mpv_wid=12345)
+    assert seen["mpv_extra"] == f"{launcher.EMBEDDED_MPV_EXTRA_ARGS} --gpu-context=x11egl"
+
+    # a normal launch has no window to embed into and must stay untouched
+    launcher.launch_episode("One Piece", "1090", prefer_terminal=False)
+    assert seen["mpv_extra"] == launcher.DEFAULT_MPV_EXTRA_ARGS
+
+
+def test_embedded_player_drops_the_display_sync_the_compositor_cannot_follow(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4325
+
+    def fake_popen(command, *, start_new_session, env=None, stdout=None, stderr=None):
+        seen["mpv_extra"] = (env or {}).get("ANI_WATCH_MPV_EXTRA_ARGS")
+        return FakeProcess()
+
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/home/me/.local/bin/ani-cli")
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(launcher, "mpv_embed_gpu_context", lambda mpv="mpv": None)
+    monkeypatch.delenv("ANI_WATCH_MPV_EXTRA_ARGS", raising=False)
+
+    launcher.launch_episode("One Piece", "1090", prefer_terminal=False, mpv_wid=99)
+    assert "--video-sync=display-resample" not in str(seen["mpv_extra"])
+    assert seen["mpv_extra"] == launcher.EMBEDDED_MPV_EXTRA_ARGS
+
+    # the normal player keeps the smoother cadence, it owns its own window
+    launcher.launch_episode("One Piece", "1090", prefer_terminal=False)
+    assert seen["mpv_extra"] == launcher.DEFAULT_MPV_EXTRA_ARGS
+
+
+def test_configured_mpv_arguments_win_for_both_players(monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4326
+
+    def fake_popen(command, *, start_new_session, env=None, stdout=None, stderr=None):
+        seen["mpv_extra"] = (env or {}).get("ANI_WATCH_MPV_EXTRA_ARGS")
+        return FakeProcess()
+
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/home/me/.local/bin/ani-cli")
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(launcher, "mpv_embed_gpu_context", lambda mpv="mpv": None)
+    monkeypatch.setenv("ANI_WATCH_MPV_EXTRA_ARGS", "--video-sync=display-resample --hwdec=auto")
+
+    launcher.launch_episode("One Piece", "1090", prefer_terminal=False, mpv_wid=99)
+    assert seen["mpv_extra"] == "--video-sync=display-resample --hwdec=auto"
+
+    launcher.launch_episode("One Piece", "1090", prefer_terminal=False)
+    assert seen["mpv_extra"] == "--video-sync=display-resample --hwdec=auto"

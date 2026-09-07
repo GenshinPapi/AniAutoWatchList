@@ -49,6 +49,13 @@ ALLANIME_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/2010
 ALLANIME_SEARCH_GQL = "query( $search: SearchInput $limit: Int $page: Int $translationType: VaildTranslationTypeEnumType $countryOrigin: VaildCountryOriginEnumType ) { shows( search: $search limit: $limit page: $page translationType: $translationType countryOrigin: $countryOrigin ) { edges { _id name englishName nativeName availableEpisodes __typename } }}"
 ALLANIME_EPISODES_GQL = "query ($showId: String!) { show( _id: $showId ) { _id availableEpisodesDetail }}"
 DEFAULT_MPV_EXTRA_ARGS = "--video-sync=display-resample"
+# An embedded player draws into a child window, and mpv's display-sync mode times
+# its presents against a refresh clock the compositor never agrees with, so the
+# screen shows black blocks flickering through video the player itself renders
+# correctly. mpv's own timing keeps the picture whole.
+EMBEDDED_MPV_EXTRA_ARGS = "--video-sync=audio"
+# mpv only honours --wid on X11, in preference order for an embedded player
+X11_EMBED_GPU_CONTEXTS = ("x11egl", "x11vk", "x11")
 
 
 @dataclass(frozen=True)
@@ -659,6 +666,69 @@ def build_terminal_command(command: list[str]) -> tuple[list[str], bool]:
     return shell_command, False
 
 
+def wayland_session() -> bool:
+    """True when mpv would reach for Wayland while Tk is still an X11 client."""
+    return bool(os.environ.get("WAYLAND_DISPLAY")) and bool(os.environ.get("DISPLAY"))
+
+
+def parse_mpv_gpu_contexts(help_output: str) -> tuple[str, ...]:
+    """Read the context names out of `mpv --gpu-context=help`, one indented name per line."""
+    names = []
+    for line in help_output.splitlines():
+        if not line[:1].isspace():
+            continue
+        parts = line.split()
+        if parts:
+            names.append(parts[0])
+    return tuple(names)
+
+
+_MPV_GPU_CONTEXT_CACHE: dict[str, tuple[str, ...]] = {}
+
+
+def mpv_gpu_contexts(mpv: str = "mpv") -> tuple[str, ...]:
+    """The GPU contexts this mpv build offers, or an empty tuple when it cannot be asked."""
+    cached = _MPV_GPU_CONTEXT_CACHE.get(mpv)
+    if cached is not None:
+        return cached
+    contexts: tuple[str, ...] = ()
+    if shutil.which(mpv):
+        try:
+            result = subprocess.run([mpv, "--gpu-context=help"], capture_output=True, text=True, timeout=5)
+        except (OSError, subprocess.SubprocessError):
+            result = None
+        if result is not None:
+            contexts = parse_mpv_gpu_contexts(result.stdout)
+    _MPV_GPU_CONTEXT_CACHE[mpv] = contexts
+    return contexts
+
+
+def mpv_embed_gpu_context(mpv: str = "mpv") -> str | None:
+    """The GPU context an embedded player needs here, or None to leave mpv's own choice alone."""
+    if not wayland_session():
+        return None
+    contexts = mpv_gpu_contexts(mpv)
+    if not contexts:
+        # mpv is not on PATH to ask, so it is a flatpak or a wrapper. Every
+        # mainstream build ships EGL on X11, and a wrong guess costs no more
+        # than the embedding that is already broken without it.
+        return X11_EMBED_GPU_CONTEXTS[0]
+    for context in X11_EMBED_GPU_CONTEXTS:
+        if context in contexts:
+            return context
+    return None
+
+
+def with_mpv_embed_args(extra_args: str, mpv: str = "mpv") -> str:
+    """Pin the GPU context an embedded player needs, keeping an explicit choice intact."""
+    if "--gpu-context" in extra_args:
+        return extra_args
+    context = mpv_embed_gpu_context(mpv)
+    if context is None:
+        return extra_args
+    return f"{extra_args} --gpu-context={context}".strip()
+
+
 def launch_episode(
     title: str,
     episode: str,
@@ -682,14 +752,21 @@ def launch_episode(
     if prefer_terminal:
         command, used_terminal = build_terminal_command(command)
     env = None
-    mpv_extra_args = os.environ.get("ANI_WATCH_MPV_EXTRA_ARGS", DEFAULT_MPV_EXTRA_ARGS)
+    configured_extra_args = os.environ.get("ANI_WATCH_MPV_EXTRA_ARGS")
+    if mpv_wid:
+        mpv_extra_args = EMBEDDED_MPV_EXTRA_ARGS if configured_extra_args is None else configured_extra_args
+        # mpv ignores --wid on its Wayland backend and opens a window of its own,
+        # which leaves the watch party with an empty video panel
+        mpv_extra_args = with_mpv_embed_args(mpv_extra_args)
+    else:
+        mpv_extra_args = DEFAULT_MPV_EXTRA_ARGS if configured_extra_args is None else configured_extra_args
     if mpv_ipc_path or mpv_wid or mpv_extra_args:
         env = os.environ.copy()
         if mpv_ipc_path:
             env["ANI_WATCH_MPV_IPC"] = str(mpv_ipc_path)
         if mpv_wid:
             env["ANI_WATCH_MPV_WID"] = str(mpv_wid)
-        if "ANI_WATCH_MPV_EXTRA_ARGS" not in env and mpv_extra_args:
+        if mpv_extra_args:
             env["ANI_WATCH_MPV_EXTRA_ARGS"] = mpv_extra_args
     try:
         stdout = subprocess.DEVNULL if quiet else None

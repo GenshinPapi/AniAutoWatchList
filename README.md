@@ -107,6 +107,25 @@ The anime detail page also includes a **Watch Party** menu. Hosting a watch part
 ani-watch party join URL
 ```
 
+The watch party plays video inside its own window rather than in a separate player. Double-click the
+video, or press F11, to fill the screen, and press Escape or double-click again to drop back into the
+panel.
+
+Two mpv settings make that embedding work, and both apply only to the embedded player:
+
+- **An X11 GPU context.** mpv is embedded with `--wid`, which it only honours on X11, so on a Wayland
+  session the player is pinned to `x11egl` (falling back to `x11vk` then `x11`) and runs through
+  XWayland. Without the pin mpv reaches for its Wayland backend, silently ignores `--wid`, and opens a
+  window of its own beside an empty video panel. X11 sessions are left to mpv's own choice.
+- **mpv's own frame timing.** The embedded player runs with `--video-sync=audio` instead of the
+  `--video-sync=display-resample` used elsewhere. A child window's presents are not synchronised with
+  the compositor, and display sync times them against a refresh clock the compositor never agrees
+  with, so the screen shows black blocks flickering through video that mpv itself renders correctly.
+  It only shows while the window is not fullscreen, because a fullscreen surface is presented whole.
+
+Setting `ANI_WATCH_MPV_EXTRA_ARGS` replaces both for every player, so an explicit choice always wins.
+Set `ANI_WATCH_PARTY_DISABLE_EMBED=1` to keep the player in its own window instead.
+
 Watch parties synchronize local playback control only; video is not rebroadcast. For friends outside your local network, AniAutoWatchList uses Cloudflare Tunnel through `cloudflared` to create a temporary public link. If `cloudflared` is not already installed, the app downloads a user-local copy into its app data directory. If the download or tunnel startup fails, the generated link is local-only and the host window shows the tunnel error.
 
 To open the GUI automatically for a single ani-cli run:
