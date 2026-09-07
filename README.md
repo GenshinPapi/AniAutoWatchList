@@ -6,7 +6,7 @@ It keeps ani-cli's normal playback path intact. The patched ani-cli script only 
 
 ## Safety
 
-This project does not add new streaming scrapers, does not bypass DRM/paywalls/login systems, and does not use EverythingMoe or link-list sites as playback resolvers. AniList is used only for metadata and cover art.
+This project does not bypass DRM, paywalls, or login systems, and does not use EverythingMoe or link-list sites as playback resolvers. Playback resolves against the same class of public source ani-cli already targets: anidb.app first, with hianime.at as a fallback when anidb.app is unavailable. AniList is used only for metadata and cover art.
 
 ## Features
 
@@ -17,6 +17,7 @@ This project does not add new streaming scrapers, does not bypass DRM/paywalls/l
 - Status tabs: Watching, Completed, Dropped, On Hold, Plan to Watch
 - Episode watched/unwatched tracking
 - Continue button in the GUI for launching a selected episode through ani-cli
+- Automatic playback failover from anidb.app to hianime.at when the primary provider is down
 - Startup update check against the GitHub `main` branch
 - Global AniList title search with suggestions and card results
 - Related seasons on anime detail pages
@@ -94,6 +95,8 @@ ani-watch gui
 The GUI does not need to be open for tracking to work.
 
 By default, an episode is marked watched when the player exits successfully. Playback failures are recorded but do not mark episodes watched.
+
+Playback resolves stream links through anidb.app first and falls back to hianime.at when anidb.app cannot serve the episode. See [Playback providers](#playback-providers).
 
 In the GUI detail page, select an episode and click **Continue** to choose **Sub** or **Dub** and open ani-cli for that title and episode. Continue uses selected metadata to resolve the intended AllAnime show when it can do so confidently, then opens that show through ani-cli. If the metadata match is not confident enough, it falls back to the normal ani-cli title search. Dub launches use ani-cli's `--dub` option; if no dub is found for the selected episode, the GUI offers to search sub instead.
 
@@ -294,6 +297,44 @@ The bundled `ani-cli/ani-cli` script is based on upstream ani-cli. The local pat
 Search still uses ani-cli's existing AllAnime API path. The patch requests the existing `englishName` field so search results can display English titles when available.
 
 Playback is still handled by ani-cli and the configured player.
+
+## Playback providers
+
+Titles, episode lists, and every tracking hook come from ani-cli's existing AllAnime API path. Only the
+stream links for an already selected title and episode are resolved by a playback provider.
+
+There are two, tried in order:
+
+1. **anidb.app** — the primary provider, unchanged.
+2. **hianime.at** — a fallback used only when anidb.app fails.
+
+The fallback exists because anidb.app periodically goes offline behind a 503 maintenance page, which
+previously made every launch fail. When that happens the terminal prints why anidb.app failed and then
+retries the same title and episode on hianime.at:
+
+```text
+anidb.app playback failed: anidb.app is down for maintenance. Trying hianime.at...
+hianime.at Links Fetched
+```
+
+If both providers fail, the error names each one separately.
+
+hianime.at serves subtitles as a separate WebVTT track rather than burning them into the video, so
+AniAutoWatchList hands the English track to the player (`--sub-file` for mpv/IINA/Syncplay,
+`:input-slave=` for VLC). Its streams also require a Referer header, so Android intents, `catt`, and the
+iSH `vlc://` handler cannot play from it. hianime.at currently serves a single 1080p variant, so `-q`
+falls back to best for other values.
+
+These environment variables control provider selection:
+
+```sh
+ANI_CLI_ANIDB=0            # skip anidb.app and go straight to hianime.at
+ANI_CLI_HIANIME=0          # disable the fallback and use anidb.app only
+ANI_CLI_HIANIME_BASE=...   # point the fallback at a different hianime domain
+```
+
+Setting `ANI_CLI_ANIDB=0` is worth doing while anidb.app is in maintenance: it removes one failed round
+trip per episode. Unset it when anidb.app returns.
 
 Do not use `ani-cli -U` against the `~/.local/bin/ani-cli` symlink installed by this project. The bundled script disables that direct upstream self-patcher so the hook integration, embedded-player mpv flags, and mp4 provider fixes are not overwritten. Update through AniAutoWatchList instead.
 

@@ -1,6 +1,6 @@
 #!/bin/sh
 
-version_number="4.14.1"
+version_number="4.15.0"
 # shellcheck disable=SC2034
 ani_watch_upstream_commit="b8032b72901721a1ce859ca2816e8e2c914bc616"
 
@@ -259,11 +259,12 @@ prefer_playable_links() {
     printf '%s\n' "$1"
 }
 
-anidb_curl_python() {
-    _anidb_python="$(ani_watch_python || true)"
-    [ -n "$_anidb_python" ] || return 127
+# GET $@ through curl_cffi with a real browser TLS fingerprint; 127 if unavailable, 2 on a Cloudflare challenge
+impersonate_curl() {
+    _impersonate_python="$(ani_watch_python || true)"
+    [ -n "$_impersonate_python" ] || return 127
 
-    "$_anidb_python" - "$@" <<'PY'
+    "$_impersonate_python" - "$@" <<'PY'
 import sys
 
 try:
@@ -320,11 +321,13 @@ except Exception:
     raise SystemExit(1)
 
 text = response.text.replace("\r", "")
+# a bare challenges.cloudflare.com reference is not enough: providers embed the
+# Turnstile widget on ordinary pages, so only interstitial-specific markers count
 challenge_markers = (
-    "Just a moment",
-    "challenges.cloudflare.com",
+    "<title>just a moment",
+    "<title>attention required!",
     "cf_chl",
-    "Enable JavaScript and cookies",
+    "enable javascript and cookies",
 )
 if any(marker.lower() in text.lower() for marker in challenge_markers):
     raise SystemExit(2)
@@ -335,51 +338,69 @@ sys.stdout.write(text)
 PY
 }
 
-anidb_curl() {
-    anidb_last_error=""
-    _anidb_result="$(anidb_curl_python "$@")"
-    _anidb_status=$?
-    if [ "$_anidb_status" -eq 0 ] && [ -n "$_anidb_result" ]; then
-        printf '%s' "$_anidb_result"
+# fetches $2.. with browser impersonation, falling back to plain curl with retries
+# $1 is the provider label used in the error text stored in provider_last_error
+provider_curl() {
+    _provider_label="$1"
+    shift
+    provider_last_error=""
+    _provider_result="$(impersonate_curl "$@")"
+    _provider_status=$?
+    if [ "$_provider_status" -eq 0 ] && [ -n "$_provider_result" ]; then
+        printf '%s' "$_provider_result"
         return 0
     fi
-    if [ "$_anidb_status" -eq 2 ]; then
-        anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+    if [ "$_provider_status" -eq 2 ]; then
+        provider_last_error="$_provider_label returned a Cloudflare browser challenge"
         return 2
     fi
 
-    _anidb_retries=2
-    _anidb_result=""
-    while [ "$_anidb_retries" -gt 0 ]; do
-        _anidb_result="$(curl -sL --connect-timeout 5 --max-time 15 "$@" 2>/dev/null | tr -d '\r')"
-        if printf '%s' "$_anidb_result" | grep -qiE 'Just a moment|challenges\.cloudflare\.com|cf_chl|Enable JavaScript and cookies'; then
-            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+    _provider_retries=2
+    _provider_result=""
+    while [ "$_provider_retries" -gt 0 ]; do
+        _provider_result="$(curl -sL --connect-timeout 5 --max-time 15 "$@" 2>/dev/null | tr -d '\r')"
+        if printf '%s' "$_provider_result" | grep -qiE '<title>Just a moment|<title>Attention Required!|cf_chl|Enable JavaScript and cookies'; then
+            provider_last_error="$_provider_label returned a Cloudflare browser challenge"
             return 2
         fi
-        if [ -n "$_anidb_result" ]; then
-            printf '%s' "$_anidb_result"
+        if [ -n "$_provider_result" ]; then
+            printf '%s' "$_provider_result"
             return 0
         fi
-        _anidb_retries=$((_anidb_retries - 1))
-        [ "$_anidb_retries" -gt 0 ] && sleep 1
+        _provider_retries=$((_provider_retries - 1))
+        [ "$_provider_retries" -gt 0 ] && sleep 1
     done
-    anidb_last_error="anidb.app returned an empty response"
+    provider_last_error="$_provider_label returned an empty response"
     return 1
 }
 
-anidb_query_string() {
+anidb_curl() {
+    provider_curl "anidb.app" "$@"
+    _anidb_status=$?
+    anidb_last_error="$provider_last_error"
+    return "$_anidb_status"
+}
+
+hianime_curl() {
+    provider_curl "hianime.at" "$@"
+    _hianime_status=$?
+    hianime_last_error="$provider_last_error"
+    return "$_hianime_status"
+}
+
+provider_query_string() {
     printf '%s' "$1" |
         sed 's/([^)]*)//g;s/[^[:alnum:] ]/ /g;s/[[:space:]][[:space:]]*/ /g;s/^ //;s/ $//;s/ /+/g'
 }
 
-anidb_normalize_title() {
+provider_normalize_title() {
     printf '%s' "$1" |
         tr '[:upper:]' '[:lower:]' |
         sed 's/([^)]*)//g;s/[^[:alnum:]]/ /g;s/[[:space:]][[:space:]]*/ /g;s/^ //;s/ $//'
 }
 
 search_anidb() {
-    _anidb_query="$(anidb_query_string "$1")"
+    _anidb_query="$(provider_query_string "$1")"
     [ -n "$_anidb_query" ] || return 1
 
     _anidb_page="$(anidb_curl "https://anidb.app/search/suggestions?q=${_anidb_query}" -A "$anidb_agent" --max-time 15)"
@@ -392,6 +413,8 @@ search_anidb() {
         [ "$_anidb_status" -eq 2 ] && return 2
         return 1
     fi
+    # anidb.app answers every route with a 503 maintenance page while it is offline
+    printf '%s' "$_anidb_page" | grep -qiE '<title>[^<]*maintenance' && return 3
 
     printf '%s' "$_anidb_page" |
         tr '\n' ' ' |
@@ -412,17 +435,20 @@ anidb_resolve_id() {
         if [ "$_anidb_status" -eq 2 ]; then
             anidb_last_error="anidb.app returned a Cloudflare browser challenge"
             return 2
+        elif [ "$_anidb_status" -eq 3 ]; then
+            anidb_last_error="anidb.app is down for maintenance"
+            return 3
         else
             anidb_last_error="anidb.app did not return a matching anime"
             return 1
         fi
     fi
 
-    _anidb_want="$(anidb_normalize_title "$_anidb_title")"
+    _anidb_want="$(provider_normalize_title "$_anidb_title")"
     _anidb_first="$(printf '%s\n' "$_anidb_results" | head -n 1 | cut -f1)"
     while IFS='	' read -r _anidb_id _anidb_name; do
         [ -n "$_anidb_id" ] || continue
-        _anidb_have="$(anidb_normalize_title "$_anidb_name")"
+        _anidb_have="$(provider_normalize_title "$_anidb_name")"
         [ "$_anidb_have" = "$_anidb_want" ] && printf '%s' "$_anidb_id" && return 0
     done <<EOF
 $_anidb_results
@@ -529,17 +555,19 @@ if fallback:
     printf '%s' "$_anidb_embed" | sed 's|\\/|/|g'
 }
 
-anidb_playlist_links() {
-    _anidb_playlist_url="$1"
-    _anidb_playlist="$2"
-    _anidb_base_url="${_anidb_playlist_url%/*}/"
+# turns an HLS master playlist into the "quality >url" lines select_quality expects
+hls_playlist_links() {
+    _hls_playlist_url="$1"
+    _hls_playlist="$2"
+    _hls_base_url="${_hls_playlist_url%/*}/"
 
-    printf '%s' "$_anidb_playlist" | awk -v base="$_anidb_base_url" '
+    printf '%s' "$_hls_playlist" | awk -v base="$_hls_base_url" '
 /^#EXT-X-STREAM/ {
     q = $0
     sub(/^.*RESOLUTION=[0-9]+x/, "", q)
-    sub(/,.*/, "p", q)
-    if (q !~ /^[0-9]+p$/) q = "Hls"
+    sub(/,.*/, "", q)
+    if (q ~ /^[0-9]+$/) q = q "p"
+    else q = "Hls"
     next
 }
 /^#/ || /^$/ { next }
@@ -563,6 +591,8 @@ anidb_fetch_episode_links() {
     if [ -z "$_anidb_id" ]; then
         if [ "$_anidb_status" -eq 2 ]; then
             anidb_last_error="anidb.app returned a Cloudflare browser challenge"
+        elif [ "$_anidb_status" -eq 3 ]; then
+            anidb_last_error="anidb.app is down for maintenance"
         else
             anidb_last_error="anidb.app did not return a matching anime"
         fi
@@ -632,7 +662,270 @@ anidb_fetch_episode_links() {
         return 1
     fi
 
-    anidb_playlist_links "$_anidb_m3u8" "$_anidb_m3u8_content"
+    hls_playlist_links "$_anidb_m3u8" "$_anidb_m3u8_content"
+}
+
+# hianime.at is the playback fallback used when anidb.app cannot serve an episode.
+# Search, the episode list, and every hook still come from the AllAnime path above;
+# only the stream links for the already selected title and episode are resolved here.
+
+# GNU coreutils, BSD and openssl all spell base64 decoding differently
+hianime_b64_decode() {
+    printf '%s\n' "$1" | base64 -d 2>/dev/null ||
+        printf '%s\n' "$1" | base64 -D 2>/dev/null ||
+        printf '%s\n' "$1" | openssl base64 -d -A 2>/dev/null
+}
+
+# The embed page ships its player config as base64(json XOR "otaku-embed-v1").
+# Runs in a subshell so the key bytes can live in the positional parameters and rotate with shift.
+hianime_deobfuscate() (
+    _hianime_bytes="$(hianime_b64_decode "$1" | od -v -An -tu1)"
+    [ -n "$_hianime_bytes" ] || return 1
+    set -- 111 116 97 107 117 45 101 109 98 101 100 45 118 49
+    _hianime_out=""
+    # shellcheck disable=SC2086
+    for _hianime_byte in $_hianime_bytes; do
+        _hianime_char=$((_hianime_byte ^ $1))
+        _hianime_out="${_hianime_out}\\0$((_hianime_char / 64))$(((_hianime_char / 8) % 8))$((_hianime_char % 8))"
+        set -- "$@" "$1"
+        shift
+    done
+    printf '%b' "$_hianime_out"
+)
+
+# search the query and print "show_id<TAB>name" lines
+hianime_search() {
+    _hianime_query="$(provider_query_string "$1")"
+    [ -n "$_hianime_query" ] || return 1
+
+    _hianime_page="$(hianime_curl "${hianime_base}/search?keyword=${_hianime_query}" -A "$hianime_agent" --max-time 20)"
+    _hianime_status=$?
+    if [ -z "$_hianime_page" ]; then
+        [ "$_hianime_status" -eq 2 ] && return 2
+        return 1
+    fi
+
+    # the "Top 10" sidebar repeats the result markup, so drop it before flattening the page
+    printf '%s' "$_hianime_page" |
+        sed '/id="main-sidebar"/,$d' |
+        tr '\n' ' ' |
+        sed 's|<div class="film-detail">|\n<div class="film-detail">|g' |
+        sed -nE 's|.*<h3 class="film-name">[[:space:]]*<a href="[^"]*/([^"/]*)"[[:space:]]*title="([^"]*)".*|\1	\2|p' |
+        sed 's/&amp;/\&/g;s/&#0*39;/'"'"'/g;s/&quot;/"/g' |
+        awk -F '\t' 'NF >= 2 && !seen[$1]++ { print $1 "\t" $2 }'
+}
+
+hianime_resolve_id() {
+    _hianime_title="$1"
+    [ -n "$_hianime_title" ] || return 1
+
+    _hianime_results="$(hianime_search "$_hianime_title")"
+    _hianime_status=$?
+    if [ -z "$_hianime_results" ]; then
+        [ "$_hianime_status" -eq 2 ] && return 2
+        return 1
+    fi
+
+    _hianime_want="$(provider_normalize_title "$_hianime_title")"
+    _hianime_first="$(printf '%s\n' "$_hianime_results" | head -n 1 | cut -f1)"
+    while IFS="	" read -r _hianime_id _hianime_name; do
+        [ -n "$_hianime_id" ] || continue
+        _hianime_have="$(provider_normalize_title "$_hianime_name")"
+        [ "$_hianime_have" = "$_hianime_want" ] && printf '%s' "$_hianime_id" && return 0
+    done <<EOF
+$_hianime_results
+EOF
+    [ -n "$_hianime_first" ] && printf '%s' "$_hianime_first"
+}
+
+# print "episode_id<TAB>episode_number" lines for a hianime show id
+hianime_episodes() {
+    _hianime_show_id="$1"
+    [ -n "$_hianime_show_id" ] || return 1
+
+    _hianime_ep_page="$(hianime_curl "${hianime_base}/api/theme/episode/list/${_hianime_show_id##*-}" -A "$hianime_agent" -H "Accept: application/json" --max-time 25)"
+    _hianime_status=$?
+    if [ -z "$_hianime_ep_page" ]; then
+        [ "$_hianime_status" -eq 2 ] && return 2
+        return 1
+    fi
+
+    # ids from other providers share the name-<number> shape, so confirm the slug in each episode link
+    _hianime_id_re="$(printf '%s' "$_hianime_show_id" | sed "s/[.[\\*^\$()+?{}|]/\\\\&/g")"
+    printf '%s' "$_hianime_ep_page" |
+        sed 's|\\||g;s|ep-item|\nep-item|g' |
+        sed -nE "s|.*data-number=\"([^\"]*)\".*data-id=\"([0-9]+)\".*/watch/${_hianime_id_re}[?]ep=.*|\\2	\\1|p"
+}
+
+hianime_episode_id() {
+    _hianime_ep_id="$(printf '%s\n' "$1" | awk -F '\t' -v want="$2" '$2 == want { print $1; exit }')"
+    if [ -z "$_hianime_ep_id" ] && [ -n "${2##*[!0-9]*}" ] && [ "$2" -gt 0 ] 2>/dev/null; then
+        _hianime_ep_id="$(printf '%s\n' "$1" | awk -F '\t' -v n="$2" 'NR == n { print $1; exit }')"
+    fi
+    [ -n "$_hianime_ep_id" ] || return 1
+    printf '%s' "$_hianime_ep_id"
+}
+
+# print the embed url of the HD-1/ZokoAnime server for an episode id in the current mode
+hianime_embed_url() {
+    _hianime_servers="$(hianime_curl "${hianime_base}/api/theme/episode/servers?episodeId=${1}" -A "$hianime_agent" -H "Accept: application/json" --max-time 20)"
+    _hianime_status=$?
+    if [ -z "$_hianime_servers" ]; then
+        [ "$_hianime_status" -eq 2 ] && return 2
+        return 1
+    fi
+
+    _hianime_type="sub"
+    [ "$mode" = "dub" ] && _hianime_type="dub"
+    # HD-2 serves a different player that hianime_deobfuscate cannot read, so it is skipped
+    _hianime_hash="$(printf '%s' "$_hianime_servers" |
+        sed 's|\\"|"|g;s|server-item|\nserver-item|g' |
+        sed -nE 's#.*data-type="'"$_hianime_type"'".*data-server-name="(HD-1|ZokoAnime)".*data-hash="([^"]*)".*#\2#p' |
+        head -n 1)"
+    [ -n "$_hianime_hash" ] || return 1
+    hianime_b64_decode "$_hianime_hash"
+}
+
+# print the master playlist url on line 1 and the preferred subtitle url on line 2
+hianime_media_fields() {
+    _hianime_config="$1"
+    _hianime_python="$(ani_watch_python || true)"
+    if [ -n "$_hianime_python" ]; then
+        printf '%s' "$_hianime_config" | "$_hianime_python" -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+
+source = payload.get("src")
+if not isinstance(source, str) or ".m3u8" not in source:
+    raise SystemExit(1)
+
+default_tracks = []
+english_tracks = []
+other_tracks = []
+tracks = payload.get("subtitles")
+if isinstance(tracks, list):
+    for track in tracks:
+        if not isinstance(track, dict):
+            continue
+        url = track.get("src")
+        if not isinstance(url, str) or ".vtt" not in url:
+            continue
+        label = str(track.get("label") or "").casefold()
+        language = str(track.get("lang") or "").casefold()
+        if track.get("default"):
+            default_tracks.append(url)
+        elif label.startswith("english") or language.startswith("en"):
+            english_tracks.append(url)
+        else:
+            other_tracks.append(url)
+
+subtitle = ""
+for group in (default_tracks, english_tracks, other_tracks):
+    if group:
+        subtitle = group[0]
+        break
+
+print(source)
+print(subtitle)
+' 2>/dev/null && return 0
+    fi
+
+    _hianime_source="$(printf '%s' "$_hianime_config" | sed -nE 's|.*"src":"([^"]*\.m3u8[^"]*)".*|\1|p' | head -n 1 | sed 's|\\/|/|g')"
+    [ -n "$_hianime_source" ] || return 1
+    printf '%s\n' "$_hianime_source"
+    printf '%s' "$_hianime_config" |
+        sed -nE 's|.*"subtitles":\[\{[^}]*"src":"([^"]*\.vtt[^"]*)".*|\1|p' |
+        head -n 1 |
+        sed 's|\\/|/|g'
+}
+
+# resolve $ep_no of $1 on hianime.at, print its quality links and set hianime_refr/hianime_sub_link
+hianime_fetch_episode_links() {
+    _hianime_want_title="${1:-$title}"
+    [ -n "$_hianime_want_title" ] || _hianime_want_title="$allanime_title"
+    [ -n "$_hianime_want_title" ] || return 1
+
+    _hianime_show="$(hianime_resolve_id "$_hianime_want_title")"
+    _hianime_status=$?
+    if [ -z "$_hianime_show" ]; then
+        if [ "$_hianime_status" -eq 2 ]; then
+            hianime_last_error="hianime.at returned a Cloudflare browser challenge"
+        else
+            hianime_last_error="hianime.at did not return a matching anime"
+        fi
+        return 1
+    fi
+
+    _hianime_ep_list="$(hianime_episodes "$_hianime_show")"
+    _hianime_status=$?
+    if [ -z "$_hianime_ep_list" ]; then
+        if [ "$_hianime_status" -eq 2 ]; then
+            hianime_last_error="hianime.at returned a Cloudflare browser challenge"
+        else
+            hianime_last_error="hianime.at did not return episodes for ${_hianime_want_title}"
+        fi
+        return 1
+    fi
+
+    _hianime_episode="$(hianime_episode_id "$_hianime_ep_list" "$ep_no" || true)"
+    if [ -z "$_hianime_episode" ]; then
+        hianime_last_error="hianime.at did not expose episode ${ep_no} for ${_hianime_want_title}"
+        return 1
+    fi
+
+    _hianime_embed="$(hianime_embed_url "$_hianime_episode")"
+    _hianime_status=$?
+    if [ -z "$_hianime_embed" ]; then
+        if [ "$_hianime_status" -eq 2 ]; then
+            hianime_last_error="hianime.at returned a Cloudflare browser challenge"
+        else
+            hianime_last_error="hianime.at returned no ${mode} server for episode ${ep_no}"
+        fi
+        return 1
+    fi
+
+    # the stream host rejects requests that do not carry the embed site as referer
+    hianime_refr="$(printf '%s' "$_hianime_embed" | sed -E 's|^(https?://[^/]*).*|\1/|')"
+
+    _hianime_embed_page="$(hianime_curl "$_hianime_embed" -A "$hianime_agent" -H "Referer: ${hianime_base}/" --max-time 20)"
+    _hianime_status=$?
+    _hianime_blob="$(printf '%s' "$_hianime_embed_page" | sed -nE 's|.*window\.__P="([^"]*)".*|\1|p' | head -n 1)"
+    if [ -z "$_hianime_blob" ]; then
+        if [ "$_hianime_status" -eq 2 ]; then
+            hianime_last_error="hianime.at returned a Cloudflare browser challenge"
+        else
+            hianime_last_error="hianime.at embed did not expose a player config"
+        fi
+        return 1
+    fi
+
+    _hianime_media="$(hianime_media_fields "$(hianime_deobfuscate "$_hianime_blob")" || true)"
+    _hianime_master="$(printf '%s\n' "$_hianime_media" | sed -n '1p')"
+    hianime_sub_link="$(printf '%s\n' "$_hianime_media" | sed -n '2p')"
+    if [ -z "$_hianime_master" ]; then
+        hianime_last_error="hianime.at embed did not expose an HLS playlist"
+        return 1
+    fi
+
+    _hianime_playlist="$(hianime_curl "$_hianime_master" -A "$hianime_agent" -H "Referer: $hianime_refr" --max-time 20)"
+    _hianime_status=$?
+    if ! printf '%s' "$_hianime_playlist" | grep -q "EXTM3U"; then
+        if [ "$_hianime_status" -eq 2 ]; then
+            hianime_last_error="hianime.at returned a Cloudflare browser challenge"
+        else
+            hianime_last_error="hianime.at playlist was not valid HLS"
+        fi
+        return 1
+    fi
+
+    hls_playlist_links "$_hianime_master" "$_hianime_playlist"
 }
 
 ani_watch_python() {
@@ -652,29 +945,86 @@ ani_watch_python() {
 }
 
 # resolves the requested episode through anidb.app and selects the desired quality into $episode
-get_episode_url() {
+anidb_select_episode_url() {
     unset episode links subtitle subs_flag refr_flag m3u8_refr result
-
-    printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Episode not released!"
+    anidb_last_error=""
 
     anidb_links_file="$(mktemp)"
     anidb_fetch_episode_links "$title" >"$anidb_links_file" || true
     links="$(cat "$anidb_links_file")"
     rm -f "$anidb_links_file"
-    if [ -n "$links" ]; then
-        links="$(prefer_playable_links "$links")"
-        select_quality "$quality"
-        if [ -n "$episode" ]; then
-            refr_flag="--referrer=https://anidb.app"
-            m3u8_refr="https://anidb.app"
-            printf "\033[1;32m%s\033[0m Links Fetched\n" "anidb.app" 1>&2
-            return 0
-        fi
+    [ -n "$links" ] || return 1
+
+    links="$(prefer_playable_links "$links")"
+    select_quality "$quality"
+    if [ -z "$episode" ]; then
         anidb_last_error="anidb.app returned streams, but no playable quality matched"
+        return 1
+    fi
+    refr_flag="--referrer=https://anidb.app"
+    m3u8_refr="https://anidb.app"
+    printf "\033[1;32m%s\033[0m Links Fetched\n" "anidb.app" 1>&2
+    return 0
+}
+
+# resolves the requested episode through hianime.at and selects the desired quality into $episode
+hianime_select_episode_url() {
+    unset episode links subtitle subs_flag refr_flag m3u8_refr result
+    hianime_last_error=""
+    hianime_refr=""
+    hianime_sub_link=""
+
+    hianime_links_file="$(mktemp)"
+    hianime_fetch_episode_links "$title" >"$hianime_links_file" || true
+    links="$(cat "$hianime_links_file")"
+    rm -f "$hianime_links_file"
+    [ -n "$links" ] || return 1
+
+    select_quality "$quality"
+    if [ -z "$episode" ]; then
+        hianime_last_error="hianime.at returned streams, but no playable quality matched"
+        return 1
+    fi
+    if [ -n "$hianime_refr" ]; then
+        refr_flag="--referrer=$hianime_refr"
+        m3u8_refr="$hianime_refr"
+    fi
+    # hianime does not burn subtitles into the video, so the external track has to be handed to the player
+    if [ -n "$hianime_sub_link" ]; then
+        subtitle="$hianime_sub_link"
+        subs_flag="--sub-file=$hianime_sub_link"
+    fi
+    printf "\033[1;32m%s\033[0m Links Fetched\n" "hianime.at" 1>&2
+    return 0
+}
+
+# tries anidb.app first and falls back to hianime.at so a single provider outage is not fatal
+get_episode_url() {
+    unset episode links subtitle subs_flag refr_flag m3u8_refr result
+    anidb_last_error=""
+    hianime_last_error=""
+
+    printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Episode not released!"
+
+    if [ "$anidb_enabled" = "1" ]; then
+        anidb_select_episode_url && return 0
+        [ -n "$anidb_last_error" ] || anidb_last_error="no playable sources returned"
+        if [ "$hianime_enabled" = "1" ]; then
+            printf "\33[2K\r\033[1;33m%s\033[0m\n" "anidb.app playback failed: ${anidb_last_error}. Trying hianime.at..." 1>&2
+        fi
     fi
 
+    if [ "$hianime_enabled" = "1" ]; then
+        hianime_select_episode_url && return 0
+        [ -n "$hianime_last_error" ] || hianime_last_error="no playable sources returned"
+    fi
+
+    if [ -n "$anidb_last_error" ] && [ -n "$hianime_last_error" ]; then
+        die "Playback failed. anidb.app: ${anidb_last_error}. hianime.at: ${hianime_last_error}."
+    fi
     [ -n "$anidb_last_error" ] && die "anidb.app playback failed: ${anidb_last_error}."
-    die "anidb.app playback failed: no playable sources returned."
+    [ -n "$hianime_last_error" ] && die "hianime.at playback failed: ${hianime_last_error}."
+    die "Playback failed: no playback provider is enabled."
 }
 
 # search the query and give results
@@ -869,7 +1219,10 @@ play_episode() {
         vlc*)
             vlc_refr="${refr_flag#--referrer=}"
             [ "$vlc_refr" = "$refr_flag" ] && vlc_refr="$allanime_refr"
-            ani_watch_run_detached $player_function --http-referrer="$vlc_refr" --play-and-exit --meta-title="${allanime_title}Episode ${ep_no}" "$episode"
+            # vlc rewrites --sub-file into a local path, so an external subtitle url rides along as an MRL option
+            unset vlc_subs_flag
+            [ -n "$subtitle" ] && vlc_subs_flag=":input-slave=$subtitle"
+            ani_watch_run_detached $player_function --http-referrer="$vlc_refr" --play-and-exit --meta-title="${allanime_title}Episode ${ep_no}" "$episode" $vlc_subs_flag
             ;;
         *yncpla*) ani_watch_run_detached $player_function "$episode" -- --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag ;;
         download) ani_watch_run_foreground "$player_function" "$episode" "${allanime_title}Episode ${ep_no}" "$subtitle" ;;
@@ -920,7 +1273,12 @@ play() {
 
 # setup
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
-anidb_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+scraper_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+anidb_agent="$scraper_agent"
+hianime_agent="$scraper_agent"
+hianime_base="${ANI_CLI_HIANIME_BASE:-https://hianime.at}"
+anidb_enabled="${ANI_CLI_ANIDB:-1}"
+hianime_enabled="${ANI_CLI_HIANIME:-1}"
 allanime_refr="https://youtu-chan.com"
 allanime_api_refr="https://mkissa.to"
 allanime_api="https://api.mkissa.net"
