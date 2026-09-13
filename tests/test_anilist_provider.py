@@ -5,7 +5,7 @@ import urllib.error
 
 import pytest
 
-from ani_watchlist.config import AniListConfig
+from ani_watchlist.config import ANILIST_DEGRADED_SAFE_REQUESTS_PER_MINUTE, AniListConfig
 from ani_watchlist.providers.anilist import (
     AniListProvider,
     _AniListCircuitBreaker,
@@ -121,7 +121,7 @@ def test_temporary_403_opens_anilist_circuit_breaker(app_env, monkeypatch) -> No
     assert calls == 1
 
 
-def test_rate_limiter_spaces_anilist_requests_below_30_per_minute() -> None:
+def test_rate_limiter_stays_below_current_degraded_anilist_limit() -> None:
     now = 100.0
     sleeps: list[float] = []
 
@@ -139,7 +139,57 @@ def test_rate_limiter_spaces_anilist_requests_below_30_per_minute() -> None:
     limiter.wait(30)
     limiter.wait(30)
 
-    assert sleeps == pytest.approx([2.05, 2.05])
+    assert ANILIST_DEGRADED_SAFE_REQUESTS_PER_MINUTE == 20
+    assert sleeps == pytest.approx([3.05, 3.05])
+
+
+def test_rate_limiter_reduces_traffic_when_anilist_advertises_a_lower_limit() -> None:
+    now = 100.0
+    sleeps: list[float] = []
+
+    def clock() -> float:
+        return now
+
+    def sleeper(seconds: float) -> None:
+        nonlocal now
+        sleeps.append(seconds)
+        now += seconds
+
+    limiter = _AniListRateLimiter(clock=clock, sleeper=sleeper, safety_seconds=0.05)
+    limiter.observe_response_headers({"X-RateLimit-Limit": "10"})
+
+    assert limiter.effective_requests_per_minute(30) == 8
+    limiter.wait(30)
+    limiter.wait(30)
+
+    assert sleeps == pytest.approx([7.55])
+
+
+def test_rate_limit_response_without_retry_header_defers_requests_for_one_minute(app_env, monkeypatch) -> None:
+    deferred: list[float] = []
+
+    class RecordingLimiter:
+        def wait(self, _requests_per_minute: int) -> None:
+            pass
+
+        def defer(self, seconds: float) -> None:
+            deferred.append(seconds)
+
+        def observe_response_headers(self, _headers) -> None:  # noqa: ANN001
+            pass
+
+    def fake_urlopen(request, timeout):  # noqa: ANN001
+        body = b'{"errors":[{"message":"Too Many Requests.","status":429}]}'
+        raise urllib.error.HTTPError(request.full_url, 429, "Too Many Requests", {}, io.BytesIO(body))
+
+    monkeypatch.setattr("ani_watchlist.providers.anilist.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("ani_watchlist.providers.anilist._ANILIST_RATE_LIMITER", RecordingLimiter())
+    monkeypatch.setattr("ani_watchlist.providers.anilist._ANILIST_CIRCUIT_BREAKER", _AniListCircuitBreaker())
+
+    with pytest.raises(RuntimeError, match="Too Many Requests"):
+        AniListProvider().get_trending_anime(limit=1)
+
+    assert deferred == [60.0]
 
 
 def test_search_anime_media_uses_search_match_query(app_env) -> None:

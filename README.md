@@ -302,7 +302,7 @@ When a watchlist entry has an AniList match, the detail page shows related anime
 
 When an anime is added from discovery/search or opened from the watchlist, the GUI checks AllAnime for currently released sub episodes and upserts those episode rows. This keeps the watchlist progress count and detail episode list populated before launching playback.
 
-Discovery and schedule data refresh from AniList at most once per local day on GUI startup, unless you press Refresh or use the CLI `--refresh` option. On startup, the GUI also checks GitHub for a newer `main` branch commit and checks whether the AniAutoWatchList-bundled patched `ani-cli` has moved beyond the local installed copy. If an AniAutoWatchList update is available and you accept it, a terminal opens, pulls the latest code, reruns `scripts/install-user.sh`, and prompts you to relaunch the GUI.
+Discovery and schedule data refresh from AniList at most once per local day on GUI startup, unless you press Refresh or use the CLI `--refresh` option. During AniList's current degraded 30-requests-per-minute period, AniAutoWatchList caps traffic at a conservative 20 requests per minute, spaces every request globally, honors retry/reset headers, and automatically slows further if AniList advertises a lower ceiling. Discovery initially fetches one 50-title page per card section; use the page control to load more on demand. On startup, the GUI also checks GitHub for a newer `main` branch commit and checks whether the AniAutoWatchList-bundled patched `ani-cli` has moved beyond the local installed copy. If an AniAutoWatchList update is available and you accept it, a terminal opens, pulls the latest code, reruns `scripts/install-user.sh`, and prompts you to relaunch the GUI.
 
 ## How ani-cli Is Patched
 

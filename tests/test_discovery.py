@@ -244,7 +244,7 @@ def test_refresh_discovery_populates_all_discovery_tabs(app_env) -> None:
     assert discovery["schedule_fresh"] is True
 
 
-def test_refresh_discovery_uses_hundred_item_media_batches(app_env) -> None:
+def test_refresh_discovery_uses_fifty_item_media_batches(app_env) -> None:
     conn = initialize()
 
     payload = refresh_discovery(conn, TEST_CONFIG, force=True, provider=FakeDiscoveryProvider())
@@ -252,9 +252,9 @@ def test_refresh_discovery_uses_hundred_item_media_batches(app_env) -> None:
     assert len(payload["trending"]["items"]) == MEDIA_LIST_BATCH_LIMIT
     assert len(payload["top_airing"]["items"]) == MEDIA_LIST_BATCH_LIMIT
     assert len(payload["popular"]["items"]) == MEDIA_LIST_BATCH_LIMIT
-    assert payload["trending"]["next_page"] == 3
-    assert payload["top_airing"]["next_page"] == 3
-    assert payload["popular"]["next_page"] == 3
+    assert payload["trending"]["next_page"] == 2
+    assert payload["top_airing"]["next_page"] == 2
+    assert payload["popular"]["next_page"] == 2
 
 
 def test_append_discovery_media_page_extends_existing_cache(app_env) -> None:
@@ -266,5 +266,5 @@ def test_append_discovery_media_page_extends_existing_cache(app_env) -> None:
 
     assert len(first["items"]) == MEDIA_LIST_BATCH_LIMIT
     assert len(second["items"]) == MEDIA_LIST_BATCH_LIMIT * 2
-    assert second["items"][MEDIA_LIST_BATCH_LIMIT]["id"] == 121
-    assert second["next_page"] == 5
+    assert second["items"][MEDIA_LIST_BATCH_LIMIT]["id"] == 71
+    assert second["next_page"] == 3

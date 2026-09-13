@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ani_watchlist.config import load_config, set_config_value
+from ani_watchlist.config import ANILIST_DEGRADED_SAFE_REQUESTS_PER_MINUTE, load_config, set_config_value
 
 
 def test_cloud_config_defaults_when_existing_config_has_no_cloud_section(app_env) -> None:
@@ -8,6 +8,7 @@ def test_cloud_config_defaults_when_existing_config_has_no_cloud_section(app_env
 
     assert config.cloud.google_drive_auto_backup is False
     assert config.cloud.google_drive_timeout_seconds == 20
+    assert config.anilist.requests_per_minute == ANILIST_DEGRADED_SAFE_REQUESTS_PER_MINUTE
 
 
 def test_cloud_config_can_enable_auto_backup_without_losing_existing_sections(app_env) -> None:

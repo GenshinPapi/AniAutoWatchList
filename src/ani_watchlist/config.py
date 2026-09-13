@@ -12,6 +12,9 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 fallback
 from .paths import get_paths
 
 
+ANILIST_DEGRADED_SAFE_REQUESTS_PER_MINUTE = 20
+
+
 DEFAULT_CONFIG_TEXT = """[tracking]
 mark_watched_after_seconds = 0
 
@@ -23,7 +26,8 @@ auto_link_confidence = 0.86
 enabled = true
 endpoint = "https://graphql.anilist.co"
 timeout_seconds = 8
-requests_per_minute = 30
+# AniList is temporarily limited to 30 requests/minute; keep client traffic below that limit.
+requests_per_minute = 20
 temporary_block_cooldown_seconds = 600
 
 [cloud]
@@ -48,7 +52,7 @@ class AniListConfig:
     enabled: bool = True
     endpoint: str = "https://graphql.anilist.co"
     timeout_seconds: int = 8
-    requests_per_minute: int = 30
+    requests_per_minute: int = ANILIST_DEGRADED_SAFE_REQUESTS_PER_MINUTE
     temporary_block_cooldown_seconds: int = 600
 
 
@@ -101,7 +105,9 @@ def load_config(path: Path | None = None) -> AppConfig:
             enabled=bool(anilist.get("enabled", True)),
             endpoint=str(anilist.get("endpoint", "https://graphql.anilist.co")),
             timeout_seconds=int(anilist.get("timeout_seconds", 8)),
-            requests_per_minute=int(anilist.get("requests_per_minute", 30)),
+            requests_per_minute=int(
+                anilist.get("requests_per_minute", ANILIST_DEGRADED_SAFE_REQUESTS_PER_MINUTE)
+            ),
             temporary_block_cooldown_seconds=int(anilist.get("temporary_block_cooldown_seconds", 600)),
         ),
         cloud=CloudConfig(

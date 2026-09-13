@@ -12,7 +12,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
-from ..config import AniListConfig
+from ..config import ANILIST_DEGRADED_SAFE_REQUESTS_PER_MINUTE, AniListConfig
 from ..paths import get_paths
 from .base import MetadataSearchResult
 
@@ -417,6 +417,47 @@ def _retry_after_seconds(headers: Any) -> float | None:
     return seconds if seconds > 0 else None
 
 
+def _header_int(headers: Any, name: str) -> int | None:
+    if headers is None:
+        return None
+    try:
+        value = headers.get(name)
+    except AttributeError:
+        return None
+    try:
+        return int(str(value or "").strip())
+    except ValueError:
+        return None
+
+
+def _rate_limit_reset_seconds(
+    headers: Any,
+    *,
+    require_depleted: bool = True,
+    wall_clock=time.time,
+) -> float | None:
+    if require_depleted and _header_int(headers, "X-RateLimit-Remaining") != 0:
+        return None
+    reset_at = _header_int(headers, "X-RateLimit-Reset")
+    if reset_at is None:
+        return None
+    return max(0.0, float(reset_at) - wall_clock())
+
+
+def _graphql_errors_include_status(errors: object, status: int) -> bool:
+    if not isinstance(errors, list):
+        return False
+    for error in errors:
+        if not isinstance(error, dict):
+            continue
+        try:
+            if int(error.get("status") or 0) == status:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _is_temporary_unavailable_error(status_code: int, detail: str) -> bool:
     if status_code != 403:
         return False
@@ -436,15 +477,36 @@ class _AniListRateLimiter:
         clock=time.monotonic,
         sleeper=time.sleep,
         safety_seconds: float = 0.05,
+        maximum_requests_per_minute: int = ANILIST_DEGRADED_SAFE_REQUESTS_PER_MINUTE,
+        server_limit_headroom: float = 0.8,
     ) -> None:
         self._clock = clock
         self._sleeper = sleeper
         self._safety_seconds = max(0.0, float(safety_seconds))
+        self._maximum_requests_per_minute = max(1, int(maximum_requests_per_minute))
+        self._server_limit_headroom = min(1.0, max(0.1, float(server_limit_headroom)))
         self._lock = threading.Lock()
         self._next_request_at = 0.0
+        self._server_requests_per_minute: int | None = None
+
+    def observe_response_headers(self, headers: Any) -> None:
+        limit = _header_int(headers, "X-RateLimit-Limit")
+        if limit is None or limit < 1:
+            return
+        with self._lock:
+            self._server_requests_per_minute = limit
+
+    def effective_requests_per_minute(self, requests_per_minute: int) -> int:
+        requested = max(1, int(requests_per_minute or self._maximum_requests_per_minute))
+        with self._lock:
+            server_limit = self._server_requests_per_minute
+        effective = min(requested, self._maximum_requests_per_minute)
+        if server_limit is not None:
+            effective = min(effective, max(1, int(server_limit * self._server_limit_headroom)))
+        return max(1, effective)
 
     def wait(self, requests_per_minute: int) -> None:
-        limit = max(1, int(requests_per_minute or 30))
+        limit = self.effective_requests_per_minute(requests_per_minute)
         interval = (60.0 / limit) + self._safety_seconds
         with self._lock:
             now = self._clock()
@@ -522,18 +584,29 @@ class AniListProvider:
         try:
             with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
+                headers = response.headers
         except urllib.error.HTTPError as exc:
             detail = _http_error_detail(exc)
+            _ANILIST_RATE_LIMITER.observe_response_headers(exc.headers)
             retry_after = _retry_after_seconds(exc.headers)
-            if retry_after is not None:
+            reset_after = _rate_limit_reset_seconds(exc.headers, require_depleted=False)
+            if exc.code == 429:
+                _ANILIST_RATE_LIMITER.defer(retry_after or reset_after or 60.0)
+            elif retry_after is not None:
                 _ANILIST_RATE_LIMITER.defer(retry_after)
             if _is_temporary_unavailable_error(exc.code, detail):
                 _ANILIST_CIRCUIT_BREAKER.open(self.config.temporary_block_cooldown_seconds, detail)
             raise RuntimeError(f"AniList request failed: {detail}") from exc
         except urllib.error.URLError as exc:
             raise RuntimeError(f"AniList request failed: {exc}") from exc
+        _ANILIST_RATE_LIMITER.observe_response_headers(headers)
+        reset_after = _rate_limit_reset_seconds(headers)
+        if reset_after is not None:
+            _ANILIST_RATE_LIMITER.defer(reset_after)
         payload = json.loads(raw)
         if payload.get("errors"):
+            if _graphql_errors_include_status(payload["errors"], 429):
+                _ANILIST_RATE_LIMITER.defer(_retry_after_seconds(headers) or reset_after or 60.0)
             raise RuntimeError(f"AniList returned errors: {payload['errors']}")
         return payload.get("data") or {}
 
