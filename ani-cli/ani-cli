@@ -226,6 +226,15 @@ select_quality() {
 
     ! (printf '%s' "$result" | grep -qE "(cc>|tools.fast4speed.rsvp|mp4upload.com|ok\.ru/videoembed|okcdn\.ru)") && unset refr_flag
     ! (printf '%s' "$result" | grep -q "cc>") && unset subs_flag
+    # the referer and subtitle track of the provider that served the episode survive a change of quality
+    if [ -n "$stream_referer" ]; then
+        refr_flag="--referrer=$stream_referer"
+        m3u8_refr="$stream_referer"
+    fi
+    if [ -n "$stream_subtitle" ]; then
+        subtitle="$stream_subtitle"
+        subs_flag="--sub-file=$stream_subtitle"
+    fi
     episode=$(printf "%s" "$result" | cut -d'>' -f2)
 }
 
@@ -259,7 +268,8 @@ prefer_playable_links() {
     printf '%s\n' "$1"
 }
 
-# GET $@ through curl_cffi with a real browser TLS fingerprint; 127 if unavailable, 2 on a Cloudflare challenge
+# GET $@ through curl_cffi with a real browser TLS fingerprint; 127 if unavailable, 2 on a Cloudflare
+# challenge, 3 when the host cannot be reached at all
 impersonate_curl() {
     _impersonate_python="$(ani_watch_python || true)"
     [ -n "$_impersonate_python" ] || return 127
@@ -316,8 +326,14 @@ headers.setdefault(
 )
 
 try:
-    response = requests.get(url, headers=headers, timeout=timeout, impersonate="chrome124", allow_redirects=True)
-except Exception:
+    # a dead host should cost seconds, not the whole transfer timeout, before failover moves on;
+    # curl_cffi adds the two parts into the total, which stays what the caller asked for
+    connect_timeout = min(8.0, timeout)
+    response = requests.get(url, headers=headers, timeout=(connect_timeout, timeout - connect_timeout), impersonate="chrome124", allow_redirects=True)
+except Exception as exc:
+    # unresolvable, refusing, or silent hosts would fail plain curl the same way
+    if any(marker in str(exc) for marker in ("curl: (6)", "curl: (7)", "Connection timed out", "Resolving timed out")):
+        raise SystemExit(3)
     raise SystemExit(1)
 
 text = response.text.replace("\r", "")
@@ -339,7 +355,8 @@ PY
 }
 
 # fetches $2.. with browser impersonation, falling back to plain curl with retries
-# $1 is the provider label used in the error text stored in provider_last_error
+# $1 is the provider label used in the error text stored in provider_last_error;
+# returns 2 on a Cloudflare challenge and 3 when the host cannot be reached at all
 provider_curl() {
     _provider_label="$1"
     shift
@@ -353,6 +370,10 @@ provider_curl() {
     if [ "$_provider_status" -eq 2 ]; then
         provider_last_error="$_provider_label returned a Cloudflare browser challenge"
         return 2
+    fi
+    if [ "$_provider_status" -eq 3 ]; then
+        provider_last_error="$_provider_label could not be reached"
+        return 3
     fi
 
     _provider_retries=2
@@ -372,6 +393,16 @@ provider_curl() {
     done
     provider_last_error="$_provider_label returned an empty response"
     return 1
+}
+
+# the failure text for provider $1 given the status $2 of its last provider_curl; $3 is the reason
+# when the site answered but not with what was needed
+provider_status_error() {
+    case "$2" in
+        2) printf '%s returned a Cloudflare browser challenge' "$1" ;;
+        3) printf '%s could not be reached' "$1" ;;
+        *) printf '%s %s' "$1" "$3" ;;
+    esac
 }
 
 anidb_curl() {
@@ -716,6 +747,51 @@ hls_localize_playlist() {
     # a local playlist makes mpv drop http from the nested protocol whitelist
     hls_lavf_flag="--demuxer-lavf-o-append=protocol_whitelist=file,crypto,data,http,https,tcp,tls"
     return 0
+}
+
+# print the uri of the audio rendition in language family $1 (ja or en) of the master playlist on
+# stdin; a Japanese request falls back to the master's default rendition
+hls_audio_rendition() {
+    awk -v wanted="$1" '
+BEGIN { families["ja"] = " ja jpn jp "; families["en"] = " en eng en-us " }
+/^#EXT-X-MEDIA:/ && /TYPE=AUDIO/ {
+    uri = ""
+    language = ""
+    if (match($0, /URI="[^"]*"/)) uri = substr($0, RSTART + 5, RLENGTH - 6)
+    if (match($0, /LANGUAGE="[^"]*"/)) language = tolower(substr($0, RSTART + 10, RLENGTH - 11))
+    if (uri == "") next
+    if (language != "" && index(families[wanted], " " language " ")) { print uri; found = 1; exit }
+    if (/DEFAULT=YES/ && fallback == "") fallback = uri
+}
+END { if (!found && wanted == "ja" && fallback != "") print fallback }
+'
+}
+
+# A master that carries every dub as its own audio rendition makes the player probe all of them
+# before the first frame, which takes up to a minute. The provider picks the video variant and sets
+# stream_audio_url to the one rendition wanted; hand the player a local master with just those two.
+hls_attach_audio() {
+    [ -n "$stream_audio_url" ] || return 0
+    case "$episode" in
+        http://* | https://*) ;;
+        *) return 0 ;;
+    esac
+    if ! hls_local_playlist_supported; then
+        # a player that only takes a url still gets every rendition through the provider's master
+        [ -n "$stream_master_url" ] && episode="$stream_master_url"
+        return 0
+    fi
+    hls_prune_playlists
+    _audio_dir="$(mktemp -d "${TMPDIR:-/tmp}/ani-cli-hls.XXXXXX")" || return 0
+    {
+        printf '#EXTM3U\n#EXT-X-VERSION:3\n'
+        printf '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="audio",DEFAULT=YES,AUTOSELECT=YES,URI="%s"\n' "$stream_audio_url"
+        printf '#EXT-X-STREAM-INF:BANDWIDTH=1,AUDIO="audio"\n%s\n' "$episode"
+    } >"$_audio_dir/stream.m3u8"
+    hls_playlist_file="$_audio_dir/stream.m3u8"
+    episode="$hls_playlist_file"
+    # a local playlist makes mpv drop http from the nested protocol whitelist
+    hls_lavf_flag="--demuxer-lavf-o-append=protocol_whitelist=file,crypto,data,http,https,tcp,tls"
 }
 
 anidb_fetch_episode_links() {
@@ -1071,6 +1147,672 @@ hianime_fetch_episode_links() {
     hls_playlist_links "$_hianime_master" "$_hianime_playlist"
 }
 
+# megaplay.buzz is the player behind hianime's Vidstream-2 server. It is addressed straight by
+# MAL or AniList id, so it keeps working while hianime.at is down, and its video hosts are not
+# the ones the ZokoAnime server streams from.
+
+megaplay_curl() {
+    provider_curl "megaplay.buzz" "$@"
+    _megaplay_status=$?
+    megaplay_last_error="$provider_last_error"
+    return "$_megaplay_status"
+}
+
+# hex of the string $1 zero padded to $2 bytes, the way the player pads its key
+megaplay_hex() {
+    _megaplay_hex="$(printf '%s' "$1" | od -v -An -tx1 | tr -d ' \n')"
+    while [ "${#_megaplay_hex}" -lt $(($2 * 2)) ]; do
+        _megaplay_hex="${_megaplay_hex}00"
+    done
+    printf '%s' "$_megaplay_hex" | cut -c "1-$(($2 * 2))"
+}
+
+# getSources ships the playlist as base64url(aes-256-cbc(json)); print the playlist url
+# decrypted from the blob $1 with the key string $2 and iv string $3
+megaplay_decrypt_file() {
+    case "$((${#1} % 4))" in
+        2) _megaplay_pad="==" ;;
+        3) _megaplay_pad="=" ;;
+        *) _megaplay_pad="" ;;
+    esac
+    printf '%s%s' "$1" "$_megaplay_pad" | tr '_-' '/+' |
+        openssl enc -d -aes-256-cbc -a -A -K "$(megaplay_hex "$2" 32)" -iv "$(megaplay_hex "$3" 16)" 2>/dev/null |
+        sed 's|\\/|/|g' | sed -nE 's|.*"file":"([^"]*\.m3u8[^"]*)".*|\1|p' | head -n 1
+}
+
+# the key and iv are the trustAesKey/trustAesIv defaults of the player's newclient.min.js;
+# when the built-in pair stops decrypting, read the current pair out of the script the page $1 loads
+megaplay_refresh_key() {
+    _megaplay_js_url="$(printf '%s' "$1" | sed -nE 's|.*src="([^"]*newclient[^"]*\.js[^"]*)".*|\1|p' | head -n 1)"
+    case "$_megaplay_js_url" in
+        "") _megaplay_js_url="${megaplay_base}/lib/newclient.min.js" ;;
+        //*) _megaplay_js_url="https:${_megaplay_js_url}" ;;
+        /*) _megaplay_js_url="${megaplay_base}${_megaplay_js_url}" ;;
+    esac
+    _megaplay_js="$(megaplay_curl "$_megaplay_js_url" -A "$megaplay_agent" -H "Referer: ${megaplay_base}/" --max-time 15)"
+    _megaplay_new_key="$(printf '%s' "$_megaplay_js" | sed -nE 's/.*\["trustAesKey","TRUST_AES_KEY"\],"([^"]*)".*/\1/p' | head -n 1)"
+    _megaplay_new_iv="$(printf '%s' "$_megaplay_js" | sed -nE 's/.*\["trustAesIv","TRUST_AES_IV"\],"([^"]*)".*/\1/p' | head -n 1)"
+    [ -n "$_megaplay_new_key" ] && [ -n "$_megaplay_new_iv" ] || return 1
+    megaplay_key="$_megaplay_new_key"
+    megaplay_iv="$_megaplay_new_iv"
+}
+
+# print the encrypted blob, any plain playlist url, and the preferred subtitle url of a
+# getSources answer on lines 1, 2 and 3
+megaplay_source_fields() {
+    _megaplay_python="$(ani_watch_python || true)"
+    [ -n "$_megaplay_python" ] || return 1
+    printf '%s' "$1" | "$_megaplay_python" -c '
+import json
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+if not isinstance(payload, dict):
+    raise SystemExit(1)
+
+encrypted = payload.get("enc") if isinstance(payload.get("enc"), str) else ""
+plain = ""
+sources = payload.get("sources")
+for source in sources if isinstance(sources, list) else [sources]:
+    if isinstance(source, dict) and ".m3u8" in str(source.get("file") or ""):
+        plain = str(source["file"])
+        break
+
+english_tracks = []
+default_tracks = []
+other_tracks = []
+tracks = payload.get("tracks")
+for track in tracks if isinstance(tracks, list) else []:
+    if not isinstance(track, dict):
+        continue
+    url = track.get("file")
+    kind = str(track.get("kind") or "captions").casefold()
+    if not isinstance(url, str) or ".vtt" not in url or kind not in ("captions", "subtitles"):
+        continue
+    if str(track.get("label") or "").casefold().startswith("english"):
+        english_tracks.append(url)
+    elif track.get("default"):
+        default_tracks.append(url)
+    else:
+        other_tracks.append(url)
+
+subtitle = ""
+for group in (english_tracks, default_tracks, other_tracks):
+    if group:
+        subtitle = group[0]
+        break
+
+print(encrypted)
+print(plain)
+print(subtitle)
+' 2>/dev/null
+}
+
+# resolve $ep_no of the selected show on megaplay.buzz, print its quality links and set megaplay_sub_link
+megaplay_fetch_episode_links() {
+    if ! allanime_show_ids; then
+        megaplay_last_error="AllAnime did not return a MAL or AniList id for this show"
+        return 1
+    fi
+    _megaplay_lang="sub"
+    [ "$mode" = "dub" ] && _megaplay_lang="dub"
+
+    # MAL ids map more completely than AniList ids, so they go first
+    _megaplay_embed=""
+    _megaplay_page=""
+    _megaplay_file_id=""
+    _megaplay_error_code=""
+    _megaplay_status=0
+    for _megaplay_path in ${show_mal_id:+"mal/$show_mal_id"} ${show_anilist_id:+"ani/$show_anilist_id"}; do
+        _megaplay_embed="${megaplay_base}/stream/${_megaplay_path}/${ep_no}/${_megaplay_lang}"
+        # the embed answers an error page to requests without a referer
+        _megaplay_page="$(megaplay_curl "$_megaplay_embed" -A "$megaplay_agent" -H "Referer: ${megaplay_base}/" --max-time 15)"
+        _megaplay_status=$?
+        _megaplay_file_id="$(printf '%s' "$_megaplay_page" | sed -nE 's|.*data-id="([0-9]+)".*|\1|p' | head -n 1)"
+        [ -n "$_megaplay_file_id" ] && break
+        # a site that is down fails the other id the same way
+        [ "$_megaplay_status" -eq 2 ] || [ "$_megaplay_status" -eq 3 ] && break
+        _megaplay_code="$(printf '%s' "$_megaplay_page" | sed -nE 's|.*Error Code:[[:space:]]*(<span>)?([0-9]+).*|\2|p' | head -n 1)"
+        [ -n "$_megaplay_code" ] && _megaplay_error_code="$_megaplay_code"
+    done
+    if [ -z "$_megaplay_file_id" ]; then
+        case "$_megaplay_error_code" in
+            404) megaplay_last_error="megaplay.buzz has no ${mode} source for episode ${ep_no}" ;;
+            "") megaplay_last_error="$(provider_status_error "megaplay.buzz" "$_megaplay_status" "did not return a player")" ;;
+            *) megaplay_last_error="megaplay.buzz refused the episode (error ${_megaplay_error_code})" ;;
+        esac
+        return 1
+    fi
+
+    _megaplay_query="id=${_megaplay_file_id}"
+    _megaplay_master=""
+    _megaplay_attempt=0
+    while [ "$_megaplay_attempt" -lt 2 ]; do
+        _megaplay_attempt=$((_megaplay_attempt + 1))
+        _megaplay_sources="$(megaplay_curl "${megaplay_base}/stream/getSources?${_megaplay_query}" -A "$megaplay_agent" -H "Referer: $_megaplay_embed" -H "X-Requested-With: XMLHttpRequest" -H "Accept: application/json" --max-time 15)"
+        _megaplay_fields="$(megaplay_source_fields "$_megaplay_sources" || true)"
+        _megaplay_blob="$(printf '%s\n' "$_megaplay_fields" | sed -n '1p')"
+        _megaplay_master="$(printf '%s\n' "$_megaplay_fields" | sed -n '2p')"
+        megaplay_sub_link="$(printf '%s\n' "$_megaplay_fields" | sed -n '3p')"
+        if [ -z "$_megaplay_master" ] && [ -n "$_megaplay_blob" ]; then
+            _megaplay_master="$(megaplay_decrypt_file "$_megaplay_blob" "$megaplay_key" "$megaplay_iv")"
+            if [ -z "$_megaplay_master" ] && megaplay_refresh_key "$_megaplay_page"; then
+                _megaplay_master="$(megaplay_decrypt_file "$_megaplay_blob" "$megaplay_key" "$megaplay_iv")"
+            fi
+        fi
+        # the tiktok cdn hides every segment behind an image the player cannot demux; bcdn is the plain one
+        case "$_megaplay_master" in
+            *akirax.buzz/* | *tiktokcdn.com/* | *ibyteimg.com/*)
+                if [ "$_megaplay_attempt" -lt 2 ]; then
+                    _megaplay_query="id=${_megaplay_file_id}&s=bcdn"
+                    continue
+                fi
+                megaplay_last_error="megaplay.buzz only offered image-wrapped segments"
+                return 1
+                ;;
+        esac
+        break
+    done
+    if [ -z "$_megaplay_master" ]; then
+        if [ -z "$_megaplay_sources" ]; then
+            megaplay_last_error="megaplay.buzz returned no sources"
+        elif [ -n "$_megaplay_blob" ]; then
+            megaplay_last_error="megaplay.buzz sources could not be decrypted"
+        else
+            megaplay_last_error="megaplay.buzz sources did not include a playlist"
+        fi
+        return 1
+    fi
+
+    # subtitle hosts rotate and some crawl; every host serves the same files, so ask the playlist's host
+    _megaplay_host="$(printf '%s' "$_megaplay_master" | sed -nE 's|^(https?://[^/]+)/.*|\1|p')"
+    case "$megaplay_sub_link" in
+        http*://*/anime/*) [ -n "$_megaplay_host" ] && megaplay_sub_link="${_megaplay_host}/anime/${megaplay_sub_link#*/anime/}" ;;
+    esac
+
+    _megaplay_playlist="$(megaplay_curl "$_megaplay_master" -A "$megaplay_agent" -H "Referer: ${megaplay_base}/" --max-time 15)"
+    if ! printf '%s' "$_megaplay_playlist" | grep -q "EXTM3U"; then
+        megaplay_last_error="megaplay.buzz playlist was not valid HLS"
+        return 1
+    fi
+    hls_playlist_links "$_megaplay_master" "$_megaplay_playlist"
+}
+
+# zokoanime.video is the player behind hianime's HD-1 server. Addressed straight by MAL id it serves
+# the same episodes as hianime.at without hianime.at's search, episode list or server pages.
+
+zokoanime_curl() {
+    provider_curl "zokoanime.video" "$@"
+    _zokoanime_status=$?
+    zokoanime_last_error="$provider_last_error"
+    return "$_zokoanime_status"
+}
+
+# resolve $ep_no of the selected show on zokoanime.video, print its quality links and set zokoanime_sub_link
+zokoanime_fetch_episode_links() {
+    if ! allanime_show_ids || [ -z "$show_mal_id" ]; then
+        zokoanime_last_error="AllAnime did not return a MAL id for this show"
+        return 1
+    fi
+    _zokoanime_lang="sub"
+    [ "$mode" = "dub" ] && _zokoanime_lang="dub"
+
+    _zokoanime_page="$(zokoanime_curl "${zokoanime_base}/stream/mal/${show_mal_id}/${ep_no}/${_zokoanime_lang}" -A "$scraper_agent" --max-time 20)"
+    _zokoanime_status=$?
+    _zokoanime_blob="$(printf '%s' "$_zokoanime_page" | sed -nE 's|.*window\.__P="([^"]*)".*|\1|p' | head -n 1)"
+    if [ -z "$_zokoanime_blob" ]; then
+        # the same status cards hianime.at's HD-1 embed shows
+        if printf '%s' "$_zokoanime_page" | grep -q '<span>// Encoding</span>'; then
+            zokoanime_last_error="zokoanime.video is still transcoding episode ${ep_no}, try again in a few minutes"
+        elif printf '%s' "$_zokoanime_page" | grep -q '<span>// Error</span>'; then
+            zokoanime_last_error="zokoanime.video has no ${mode} source for episode ${ep_no}"
+        else
+            zokoanime_last_error="$(provider_status_error "zokoanime.video" "$_zokoanime_status" "did not expose a player config")"
+        fi
+        return 1
+    fi
+
+    _zokoanime_media="$(hianime_media_fields "$(hianime_deobfuscate "$_zokoanime_blob")" || true)"
+    _zokoanime_master="$(printf '%s\n' "$_zokoanime_media" | sed -n '1p')"
+    zokoanime_sub_link="$(printf '%s\n' "$_zokoanime_media" | sed -n '2p')"
+    if [ -z "$_zokoanime_master" ]; then
+        zokoanime_last_error="zokoanime.video did not expose an HLS playlist"
+        return 1
+    fi
+
+    _zokoanime_playlist="$(zokoanime_curl "$_zokoanime_master" -A "$scraper_agent" -H "Referer: ${zokoanime_base}/" --max-time 20)"
+    if ! printf '%s' "$_zokoanime_playlist" | grep -q "EXTM3U"; then
+        zokoanime_last_error="zokoanime.video playlist was not valid HLS"
+        return 1
+    fi
+    hls_playlist_links "$_zokoanime_master" "$_zokoanime_playlist"
+}
+
+# anizone.to serves its own multi-audio releases from its own CDN, so it keeps playing when the
+# whole hianime family is down. Its catalogue is named with AniDB titles, which ani.zip maps from
+# the show's AniList or MAL id, so the show is matched on an exact title rather than a guess.
+
+anizone_curl() {
+    provider_curl "anizone.to" "$@"
+    _anizone_status=$?
+    anizone_last_error="$provider_last_error"
+    return "$_anizone_status"
+}
+
+# run the anizone parser named $1 over stdin with the remaining arguments
+anizone_parse() {
+    _anizone_python="$(ani_watch_python || true)"
+    [ -n "$_anizone_python" ] || return 1
+    "$_anizone_python" -c '
+import json
+import re
+import sys
+import unicodedata
+
+ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
+
+
+def js_unescape(text):
+    def replace(match):
+        code = match.group(1)
+        if code[0] in "ux" and len(code) > 1:
+            return chr(int(code[1:], 16))
+        return ESCAPES.get(code, code)
+
+    return re.sub(r"\\(u[0-9a-fA-F]{4}|x[0-9a-fA-F]{2}|.)", replace, text, flags=re.S)
+
+
+def embedded(page, prefix):
+    for match in re.finditer(prefix + r"JSON\.parse\(\x27(.*?)\x27\)", page, re.S):
+        try:
+            yield json.loads(js_unescape(match.group(1)))
+        except ValueError:
+            continue
+
+
+def norm(title):
+    # AniDB writes apostrophes as backticks, other sites as typographic quotes
+    title = unicodedata.normalize("NFKC", title or "").casefold().replace(chr(0x60), chr(0x27)).replace(chr(0x2019), chr(0x27))
+    folded = re.sub(r"[^a-z0-9]+", "", unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode())
+    if len(folded) >= 2:
+        return folded
+    # keep titles written in other scripts, and never let an empty title match anything
+    return re.sub(r"[\W_]+", "", title)
+
+
+command = sys.argv[1]
+page = sys.stdin.read()
+
+if command == "quote":
+    from urllib.parse import quote
+
+    print(quote(page.strip()))
+
+elif command == "titles":
+    # line 1: year of the first episode, then every AniDB title, most useful first
+    try:
+        payload = json.loads(page)
+    except ValueError:
+        raise SystemExit(1)
+    titles = payload.get("titles") or {}
+    if not isinstance(titles, dict):
+        raise SystemExit(1)
+    ordered = [titles[key] for key in ("x-jat", "en", "ja") if titles.get(key)]
+    ordered += [value for key, value in titles.items() if value and key not in ("x-jat", "en", "ja")]
+    episodes = payload.get("episodes") or {}
+    first = episodes.get("1") if isinstance(episodes, dict) else None
+    airdate = str((first or {}).get("airdate") or (first or {}).get("airDate") or "")
+    print(airdate[:4])
+    for title in ordered:
+        print(str(title).replace("\n", " "))
+
+elif command == "match":
+    # print the slug of the search result carrying one of the wanted titles, else a lone same-year show
+    wanted_lines = sys.argv[2].splitlines()
+    year = wanted_lines[0].strip() if wanted_lines else ""
+    wanted = {norm(title) for title in wanted_lines[1:]} - {""}
+    items = []
+    for value in embedded(page, r"items:\s*"):
+        if isinstance(value, list):
+            items.extend(item for item in value if isinstance(item, dict))
+    exact = []
+    for item in items:
+        names = {norm(str(name)) for name in (item.get("title_list") or {}).values()}
+        names.add(norm(str(item.get("main_title") or "")))
+        if wanted & (names - {""}) and item.get("slug"):
+            exact.append(item)
+    # entries sharing a title (a series and its special, say) are told apart by the year
+    exact.sort(key=lambda item: str(item.get("start_year")) != year)
+    if exact:
+        print(exact[0]["slug"])
+        raise SystemExit(0)
+    if year:
+        kinds = ("TV Series", "Web", "Movie", "OVA", "ONA", "TV Special")
+        same_year = [item for item in items if str(item.get("start_year")) == year and item.get("type") in kinds and item.get("slug")]
+        if len(same_year) == 1:
+            print(same_year[0]["slug"])
+            raise SystemExit(0)
+    raise SystemExit(1)
+
+elif command == "player":
+    # line 1: master playlist; line 2: full English subtitles, not signs and songs
+    for player in embedded(page, r"vidstackPlayer\("):
+        if not isinstance(player, dict) or ".m3u8" not in str(player.get("src") or ""):
+            continue
+        subtitle = ""
+        tracks = [track for track in player.get("subtitles") or [] if isinstance(track, dict) and track.get("file")]
+        english = [track for track in tracks if str(track.get("language") or "").casefold().startswith("en")]
+        # the forced flag marks the default track here, so only the title tells a partial track apart
+        full = [track for track in english if not re.search(r"forced|sign|song|dubtitle|\(cc\)|caption", str(track.get("title") or ""), re.I)]
+        full.sort(key=lambda track: not track.get("default"))
+        for group in (full, english):
+            if group:
+                subtitle = str(group[0]["file"])
+                break
+        print(player["src"])
+        print(subtitle)
+        raise SystemExit(0)
+    raise SystemExit(1)
+
+' "$@" 2>/dev/null
+}
+
+# resolve $ep_no of the selected show on anizone.to, print its quality links and set anizone_audio_url and anizone_sub_link
+anizone_fetch_episode_links() {
+    if ! allanime_show_ids; then
+        anizone_last_error="AllAnime did not return a MAL or AniList id for this show"
+        return 1
+    fi
+
+    _anizone_map=""
+    _anizone_status=0
+    if [ -n "$show_anilist_id" ]; then
+        _anizone_map="$(anizone_curl "https://api.ani.zip/mappings?anilist_id=${show_anilist_id}" -A "$scraper_agent" --max-time 15)"
+        _anizone_status=$?
+    fi
+    if ! printf '%s' "$_anizone_map" | grep -q '"titles"' && [ -n "$show_mal_id" ]; then
+        _anizone_map="$(anizone_curl "https://api.ani.zip/mappings?mal_id=${show_mal_id}" -A "$scraper_agent" --max-time 15)"
+        _anizone_status=$?
+    fi
+    _anizone_titles="$(printf '%s' "$_anizone_map" | anizone_parse titles || true)"
+    if [ -z "$(printf '%s\n' "$_anizone_titles" | sed '1d')" ]; then
+        anizone_last_error="$(provider_status_error "ani.zip" "$_anizone_status" "did not return the show's AniDB titles")"
+        return 1
+    fi
+
+    # AniDB names seasons "Title (2026)" and some ani.zip titles end in " S2"; search the bare name too
+    _anizone_queries="$(printf '%s\n' "$_anizone_titles" | sed '1d' | head -n 3 |
+        awk '{ print; bare = $0; sub(/[[:space:]]+\((19|20)[0-9][0-9]\)$/, "", bare); sub(/[[:space:]]+S[0-9]+$/, "", bare); if (bare != $0) print bare }' |
+        grep '[A-Za-z]' | awk '!seen[$0]++' | head -n 4)"
+    _anizone_slug=""
+    while IFS= read -r _anizone_query; do
+        [ -n "$_anizone_query" ] || continue
+        _anizone_search="$(anizone_curl "https://anizone.to/anime?search=$(printf '%s' "$_anizone_query" | anizone_parse quote)" -A "$scraper_agent" --max-time 20)"
+        _anizone_status=$?
+        # a site that is down fails every query the same way
+        [ "$_anizone_status" -eq 2 ] || [ "$_anizone_status" -eq 3 ] && break
+        _anizone_slug="$(printf '%s' "$_anizone_search" | anizone_parse match "$_anizone_titles" || true)"
+        [ -n "$_anizone_slug" ] && break
+    done <<EOF
+$_anizone_queries
+EOF
+    if [ -z "$_anizone_slug" ]; then
+        anizone_last_error="$(provider_status_error "anizone.to" "$_anizone_status" "did not list this show")"
+        return 1
+    fi
+
+    _anizone_page="$(anizone_curl "https://anizone.to/anime/${_anizone_slug}/${ep_no}" -A "$scraper_agent" --max-time 20)"
+    _anizone_status=$?
+    _anizone_player="$(printf '%s' "$_anizone_page" | anizone_parse player || true)"
+    _anizone_master="$(printf '%s\n' "$_anizone_player" | sed -n '1p')"
+    if [ -z "$_anizone_master" ]; then
+        anizone_last_error="$(provider_status_error "anizone.to" "$_anizone_status" "has no episode ${ep_no} for this show")"
+        return 1
+    fi
+    anizone_sub_link="$(printf '%s\n' "$_anizone_player" | sed -n '2p')"
+
+    _anizone_playlist="$(anizone_curl "$_anizone_master" -A "$scraper_agent" --max-time 20)"
+    if ! printf '%s' "$_anizone_playlist" | grep -q "EXTM3U"; then
+        anizone_last_error="anizone.to playlist was not valid HLS"
+        return 1
+    fi
+
+    # every dub of a release is a separate audio rendition of one master
+    _anizone_lang="ja"
+    [ "$mode" = "dub" ] && _anizone_lang="en"
+    _anizone_audio="$(printf '%s\n' "$_anizone_playlist" | hls_audio_rendition "$_anizone_lang")"
+    if [ -z "$_anizone_audio" ]; then
+        if [ "$mode" = "dub" ]; then
+            anizone_last_error="anizone.to has no English dub for episode ${ep_no}"
+        else
+            anizone_last_error="anizone.to playlist has no Japanese audio"
+        fi
+        return 1
+    fi
+    anizone_audio_url="$(hls_resolve_url "$_anizone_master" "$_anizone_audio")"
+    anizone_master_url="$_anizone_master"
+    hls_playlist_links "$_anizone_master" "$_anizone_playlist"
+}
+
+# kaa.lt (KickAssAnime) streams its own multi-audio releases from krussdomi.com, a second source
+# independent of both the hianime family and anizone.to. It publishes no MAL or AniList ids, so a show
+# only counts as found when it carries AllAnime's own romaji or English title and aired the same year.
+
+kickassanime_curl() {
+    provider_curl "kaa.lt" "$@"
+    _kickassanime_status=$?
+    kickassanime_last_error="$provider_last_error"
+    return "$_kickassanime_status"
+}
+
+# keep the selected AllAnime show's name, English name and first-air date in show_titles_json, once per show
+allanime_show_titles() {
+    [ -n "$id" ] || return 1
+    if [ "$show_titles_for" != "$id" ]; then
+        show_titles_for="$id"
+        #shellcheck disable=SC2016
+        _show_titles_gql='query ($showId: String!) { show( _id: $showId ) { _id name englishName airedStart }}'
+        show_titles_json="$(curl -e "$allanime_api_refr" -s --connect-timeout 5 --max-time 15 -H "Content-Type: application/json" -H "Origin: ${allanime_api_refr}" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$id\"},\"query\":\"$_show_titles_gql\"}" -A "$agent")"
+        printf '%s' "$show_titles_json" | grep -q '"name"' || show_titles_for=""
+    fi
+    [ -n "$show_titles_for" ]
+}
+
+# run the kickassanime parser named $1 over stdin with the remaining arguments
+kickassanime_parse() {
+    _kickassanime_python="$(ani_watch_python || true)"
+    [ -n "$_kickassanime_python" ] || return 1
+    "$_kickassanime_python" -c '
+import html
+import json
+import re
+import sys
+import unicodedata
+
+
+def norm(title):
+    title = unicodedata.normalize("NFKD", str(title or "")).encode("ascii", "ignore").decode().casefold()
+    return re.sub(r"[^a-z0-9]+", "", title.replace("&", "and"))
+
+
+def show_of(text):
+    try:
+        show = ((json.loads(text).get("data") or {}).get("show")) or {}
+    except (ValueError, AttributeError):
+        raise SystemExit(1)
+    return show if isinstance(show, dict) else {}
+
+
+def value(entry):
+    # astro serialises every prop as [0, value] or, for arrays, [1, [entries]]
+    if isinstance(entry, list) and len(entry) == 2 and entry[0] in (0, 1):
+        inner = entry[1]
+        if entry[0] == 1 and isinstance(inner, list):
+            return [value(item) for item in inner]
+        if isinstance(inner, dict):
+            return {key: value(item) for key, item in inner.items()}
+        return inner
+    if isinstance(entry, list) and len(entry) == 1:
+        return None
+    return entry
+
+
+command = sys.argv[1]
+page = sys.stdin.read()
+
+if command == "queries":
+    show = show_of(page)
+    for name in (show.get("name"), show.get("englishName")):
+        if name and re.search(r"[A-Za-z]", str(name)):
+            print(str(name).replace("\n", " "))
+
+elif command == "match":
+    show = show_of(sys.argv[2])
+    wanted = {norm(show.get("name")), norm(show.get("englishName"))} - {""}
+    year = (show.get("airedStart") or {}).get("year") if isinstance(show.get("airedStart"), dict) else None
+    try:
+        results = json.loads(page).get("result") or []
+    except (ValueError, AttributeError):
+        raise SystemExit(1)
+    exact = [item for item in results if isinstance(item, dict) and item.get("slug") and ({norm(item.get("title")), norm(item.get("title_en"))} - {""}) & wanted]
+    if year:
+        # a remake shares its title with the original, so the year has to agree whenever both are known
+        exact = [item for item in exact if not item.get("year") or str(item.get("year")) == str(year)]
+    if not exact:
+        raise SystemExit(1)
+    print(exact[0]["slug"])
+
+elif command == "episode":
+    # "slug <id>" when the episode is on this page of the listing, "page <n>" when it is on another
+    wanted = sys.argv[2]
+    try:
+        listing = json.loads(page)
+    except ValueError:
+        raise SystemExit(1)
+    for item in listing.get("result") or []:
+        if isinstance(item, dict) and str(item.get("episode_string")) == wanted and item.get("slug"):
+            print("slug", item["slug"])
+            raise SystemExit(0)
+    try:
+        number = float(wanted)
+    except ValueError:
+        raise SystemExit(1)
+    for listed in listing.get("pages") or []:
+        if not isinstance(listed, dict) or listed.get("number") == listing.get("current_page"):
+            continue
+        if any(float(episode) == number for episode in listed.get("eps") or []):
+            print("page", listed["number"])
+            raise SystemExit(0)
+    raise SystemExit(1)
+
+elif command == "server":
+    # VidStreaming is the HLS player; the other servers serve DASH or nothing
+    try:
+        servers = json.loads(page).get("servers") or []
+    except (ValueError, AttributeError):
+        raise SystemExit(1)
+    for server in servers:
+        source = str((server or {}).get("src") or "")
+        if "source=vidstream" in source or str((server or {}).get("name") or "").casefold() == "vidstreaming":
+            print(source)
+            raise SystemExit(0)
+    raise SystemExit(1)
+
+elif command == "player":
+    # line 1: master playlist; line 2: English subtitles
+    match = re.search(r"<astro-island[^>]*component-url=\"[^\"]*VidstackPlayer[^\"]*\"[^>]*props=\"([^\"]*)\"", page) or re.search(r"<astro-island[^>]*props=\"([^\"]*)\"", page)
+    if not match:
+        raise SystemExit(1)
+    try:
+        props = json.loads(html.unescape(match.group(1)))
+    except ValueError:
+        raise SystemExit(1)
+    manifest = value(props.get("manifest"))
+    if not isinstance(manifest, str) or ".m3u8" not in manifest:
+        raise SystemExit(1)
+    subtitle = ""
+    for track in value(props.get("subtitles")) or []:
+        if isinstance(track, dict) and str(track.get("language") or "").casefold().startswith("en") and track.get("src"):
+            subtitle = str(track["src"])
+            break
+    print(manifest)
+    print(subtitle)
+' "$@" 2>/dev/null
+}
+
+# resolve $ep_no of the selected show on kaa.lt, print its quality links and set
+# kickassanime_audio_url, kickassanime_master_url and kickassanime_sub_link
+kickassanime_fetch_episode_links() {
+    if ! allanime_show_titles; then
+        kickassanime_last_error="AllAnime did not return the show's titles"
+        return 1
+    fi
+
+    _kickassanime_slug=""
+    _kickassanime_status=0
+    while IFS= read -r _kickassanime_query; do
+        [ -n "$_kickassanime_query" ] || continue
+        _kickassanime_body="{\"query\":\"$(printf '%s' "$_kickassanime_query" | sed 's/[\\"]/\\&/g')\",\"page\":1}"
+        # the search is a POST, which provider_curl does not speak; plain curl passes kaa.lt
+        _kickassanime_results="$(curl -s --connect-timeout 8 --max-time 20 -X POST -A "$scraper_agent" -H "Content-Type: application/json" -H "Referer: ${kickassanime_base}/" -H "Origin: ${kickassanime_base}" --data "$_kickassanime_body" "${kickassanime_base}/api/fsearch")"
+        _kickassanime_status=$?
+        [ "$_kickassanime_status" -eq 6 ] || [ "$_kickassanime_status" -eq 7 ] || [ "$_kickassanime_status" -eq 28 ] && _kickassanime_status=3 && break
+        printf '%s' "$_kickassanime_results" | grep -qiE '<title>Just a moment|cf_chl' && _kickassanime_status=2 && break
+        _kickassanime_slug="$(printf '%s' "$_kickassanime_results" | kickassanime_parse match "$show_titles_json" || true)"
+        [ -n "$_kickassanime_slug" ] && break
+    done <<EOF
+$(printf '%s' "$show_titles_json" | kickassanime_parse queries)
+EOF
+    if [ -z "$_kickassanime_slug" ]; then
+        kickassanime_last_error="$(provider_status_error "kaa.lt" "$_kickassanime_status" "did not list this show")"
+        return 1
+    fi
+
+    # a dub is its own en-US release, or else an English audio track of the Japanese one
+    _kickassanime_audio_lang="ja"
+    _kickassanime_locales="ja-JP"
+    if [ "$mode" = "dub" ]; then
+        _kickassanime_audio_lang="en"
+        _kickassanime_locales="en-US ja-JP"
+    fi
+    kickassanime_last_error=""
+    for _kickassanime_locale in $_kickassanime_locales; do
+        _kickassanime_listing_url="${kickassanime_base}/api/show/${_kickassanime_slug}/episodes?ep=1&lang=${_kickassanime_locale}"
+        _kickassanime_found="$(kickassanime_curl "$_kickassanime_listing_url" -A "$scraper_agent" -H "Referer: ${kickassanime_base}/" --max-time 20 | kickassanime_parse episode "$ep_no" || true)"
+        case "$_kickassanime_found" in
+            page\ *)
+                _kickassanime_found="$(kickassanime_curl "${_kickassanime_listing_url}&page=${_kickassanime_found#page }" -A "$scraper_agent" -H "Referer: ${kickassanime_base}/" --max-time 20 | kickassanime_parse episode "$ep_no" || true)"
+                ;;
+        esac
+        case "$_kickassanime_found" in
+            slug\ *) ;;
+            *) continue ;;
+        esac
+
+        _kickassanime_server="$(kickassanime_curl "${kickassanime_base}/api/show/${_kickassanime_slug}/episode/ep-${ep_no}-${_kickassanime_found#slug }" -A "$scraper_agent" -H "Referer: ${kickassanime_base}/" --max-time 20 | kickassanime_parse server || true)"
+        [ -n "$_kickassanime_server" ] || continue
+        _kickassanime_player="$(kickassanime_curl "$_kickassanime_server" -A "$scraper_agent" -H "Referer: ${kickassanime_base}/" --max-time 20 | kickassanime_parse player || true)"
+        _kickassanime_master="$(printf '%s\n' "$_kickassanime_player" | sed -n '1p')"
+        [ -n "$_kickassanime_master" ] || continue
+
+        _kickassanime_playlist="$(kickassanime_curl "$_kickassanime_master" -A "$scraper_agent" -H "Referer: ${kickassanime_origin}/" --max-time 20)"
+        printf '%s' "$_kickassanime_playlist" | grep -q "EXTM3U" || continue
+        _kickassanime_audio="$(printf '%s\n' "$_kickassanime_playlist" | hls_audio_rendition "$_kickassanime_audio_lang")"
+        [ -n "$_kickassanime_audio" ] || continue
+
+        kickassanime_sub_link="$(printf '%s\n' "$_kickassanime_player" | sed -n '2p')"
+        kickassanime_audio_url="$(hls_resolve_url "$_kickassanime_master" "$_kickassanime_audio")"
+        kickassanime_master_url="$_kickassanime_master"
+        hls_playlist_links "$_kickassanime_master" "$_kickassanime_playlist"
+        return 0
+    done
+    kickassanime_last_error="kaa.lt has no ${mode} stream for episode ${ep_no}"
+    return 1
+}
+
 ani_watch_python() {
     if [ -n "${ANI_CLI_PYTHON:-}" ] && [ -x "$ANI_CLI_PYTHON" ]; then
         printf '%s' "$ANI_CLI_PYTHON"
@@ -1141,33 +1883,424 @@ hianime_select_episode_url() {
     return 0
 }
 
-# tries anidb.app first and falls back to hianime.at so a single provider outage is not fatal
+# resolves the requested episode through megaplay.buzz and selects the desired quality into $episode
+megaplay_select_episode_url() {
+    unset episode links subtitle subs_flag refr_flag m3u8_refr result
+    megaplay_last_error=""
+    megaplay_sub_link=""
+
+    megaplay_links_file="$(mktemp)"
+    megaplay_fetch_episode_links >"$megaplay_links_file" || true
+    links="$(cat "$megaplay_links_file")"
+    rm -f "$megaplay_links_file"
+    [ -n "$links" ] || return 1
+
+    select_quality "$quality"
+    if [ -z "$episode" ]; then
+        megaplay_last_error="megaplay.buzz returned streams, but no playable quality matched"
+        return 1
+    fi
+    # the playlists, segments and subtitles all refuse requests without the player's referer
+    refr_flag="--referrer=${megaplay_base}/"
+    m3u8_refr="${megaplay_base}/"
+    if [ -n "$megaplay_sub_link" ]; then
+        subtitle="$megaplay_sub_link"
+        subs_flag="--sub-file=$megaplay_sub_link"
+    fi
+    # segments carry image and script file extensions that newer FFmpeg builds refuse by default,
+    # and the video hosts rate limit a player that reads ahead too greedily
+    stream_player_flags="--demuxer-lavf-o-append=extension_picky=0 --cache-secs=120"
+    printf "\033[1;32m%s\033[0m Links Fetched\n" "megaplay.buzz" 1>&2
+    return 0
+}
+
+# resolves the requested episode through zokoanime.video and selects the desired quality into $episode
+zokoanime_select_episode_url() {
+    unset episode links subtitle subs_flag refr_flag m3u8_refr result
+    zokoanime_last_error=""
+    zokoanime_sub_link=""
+
+    zokoanime_links_file="$(mktemp)"
+    zokoanime_fetch_episode_links >"$zokoanime_links_file" || true
+    links="$(cat "$zokoanime_links_file")"
+    rm -f "$zokoanime_links_file"
+    [ -n "$links" ] || return 1
+
+    select_quality "$quality"
+    if [ -z "$episode" ]; then
+        zokoanime_last_error="zokoanime.video returned streams, but no playable quality matched"
+        return 1
+    fi
+    # the stream host rejects requests that do not carry the embed site as referer
+    refr_flag="--referrer=${zokoanime_base}/"
+    m3u8_refr="${zokoanime_base}/"
+    if [ -n "$zokoanime_sub_link" ]; then
+        subtitle="$zokoanime_sub_link"
+        subs_flag="--sub-file=$zokoanime_sub_link"
+    fi
+    printf "\033[1;32m%s\033[0m Links Fetched\n" "zokoanime.video" 1>&2
+    return 0
+}
+
+# resolves the requested episode through anizone.to and selects the desired quality into $episode
+anizone_select_episode_url() {
+    unset episode links subtitle subs_flag refr_flag m3u8_refr result
+    anizone_last_error=""
+    anizone_sub_link=""
+    anizone_audio_url=""
+    anizone_master_url=""
+
+    anizone_links_file="$(mktemp)"
+    anizone_fetch_episode_links >"$anizone_links_file" || true
+    links="$(cat "$anizone_links_file")"
+    rm -f "$anizone_links_file"
+    [ -n "$links" ] || return 1
+
+    select_quality "$quality"
+    if [ -z "$episode" ]; then
+        anizone_last_error="anizone.to returned streams, but no playable quality matched"
+        return 1
+    fi
+    # the video variants carry no audio of their own; hls_attach_audio adds the chosen language
+    stream_audio_url="$anizone_audio_url"
+    stream_master_url="$anizone_master_url"
+    # the subtitles translate the Japanese audio, so a dub plays without them
+    if [ "$mode" != "dub" ] && [ -n "$anizone_sub_link" ]; then
+        subtitle="$anizone_sub_link"
+        subs_flag="--sub-file=$anizone_sub_link"
+    fi
+    printf "\033[1;32m%s\033[0m Links Fetched\n" "anizone.to" 1>&2
+    return 0
+}
+
+# resolves the requested episode through kaa.lt and selects the desired quality into $episode
+kickassanime_select_episode_url() {
+    unset episode links subtitle subs_flag refr_flag m3u8_refr result
+    kickassanime_last_error=""
+    kickassanime_sub_link=""
+    kickassanime_audio_url=""
+    kickassanime_master_url=""
+
+    kickassanime_links_file="$(mktemp)"
+    kickassanime_fetch_episode_links >"$kickassanime_links_file" || true
+    links="$(cat "$kickassanime_links_file")"
+    rm -f "$kickassanime_links_file"
+    [ -n "$links" ] || return 1
+
+    select_quality "$quality"
+    if [ -z "$episode" ]; then
+        kickassanime_last_error="kaa.lt returned streams, but no playable quality matched"
+        return 1
+    fi
+    refr_flag="--referrer=${kickassanime_origin}/"
+    m3u8_refr="${kickassanime_origin}/"
+    # the segment and subtitle hosts refuse requests that do not come from the player's origin,
+    # and the segments carry image file extensions that newer FFmpeg builds refuse by default
+    stream_origin="$kickassanime_origin"
+    stream_player_flags="--http-header-fields=Origin:${kickassanime_origin} --demuxer-lavf-o-append=extension_picky=0"
+    # the video variants carry no audio of their own; hls_attach_audio adds the chosen language
+    stream_audio_url="$kickassanime_audio_url"
+    stream_master_url="$kickassanime_master_url"
+    # the subtitles translate the Japanese audio, so a dub plays without them
+    if [ "$mode" != "dub" ] && [ -n "$kickassanime_sub_link" ]; then
+        subtitle="$kickassanime_sub_link"
+        subs_flag="--sub-file=$kickassanime_sub_link"
+    fi
+    printf "\033[1;32m%s\033[0m Links Fetched\n" "kaa.lt" 1>&2
+    return 0
+}
+
+# PLAYBACK FAILOVER
+
+# the ids of an AllAnime show never change, so they are kept across runs
+allanime_show_ids_file() {
+    _show_ids_home="${XDG_CACHE_HOME:-}"
+    [ -z "$_show_ids_home" ] && [ -n "${HOME:-}" ] && _show_ids_home="$HOME/.cache"
+    [ -n "$_show_ids_home" ] || return 1
+    printf '%s' "$_show_ids_home/ani-watchlist/allanime-show-ids.tsv"
+}
+
+# look up the MAL and AniList ids of the selected AllAnime show $id into show_mal_id and
+# show_anilist_id, so id-keyed providers never have to guess the show from a title
+allanime_show_ids() {
+    [ -n "$id" ] || return 1
+    if [ "$show_ids_for" != "$id" ]; then
+        show_ids_for="$id"
+        show_mal_id=""
+        show_anilist_id=""
+        _show_ids_file="$(allanime_show_ids_file || true)"
+        if [ -n "$_show_ids_file" ] && [ -r "$_show_ids_file" ]; then
+            _show_ids_line="$(awk -F '\t' -v id="$id" '$1 == id { print $2 "\t" $3; exit }' "$_show_ids_file")"
+            show_mal_id="$(printf '%s' "$_show_ids_line" | cut -f1)"
+            show_anilist_id="$(printf '%s' "$_show_ids_line" | cut -f2)"
+        fi
+        _show_ids_tries=0
+        while [ -z "$show_mal_id$show_anilist_id" ] && [ "$_show_ids_tries" -lt 2 ]; do
+            _show_ids_tries=$((_show_ids_tries + 1))
+            #shellcheck disable=SC2016
+            _show_ids_gql='query ($showId: String!) { show( _id: $showId ) { _id malId aniListId }}'
+            _show_ids="$(curl -e "$allanime_api_refr" -s --connect-timeout 5 --max-time 15 -H "Content-Type: application/json" -H "Origin: ${allanime_api_refr}" -X POST "${allanime_api}/api" --data "{\"variables\":{\"showId\":\"$id\"},\"query\":\"$_show_ids_gql\"}" -A "$agent")"
+            show_mal_id="$(printf '%s' "$_show_ids" | sed -nE 's|.*"malId":"?([0-9]+).*|\1|p' | head -n 1)"
+            show_anilist_id="$(printf '%s' "$_show_ids" | sed -nE 's|.*"aniListId":"?([0-9]+).*|\1|p' | head -n 1)"
+            if [ -n "$show_mal_id$show_anilist_id" ]; then
+                if [ -n "$_show_ids_file" ] && mkdir -p "${_show_ids_file%/*}" 2>/dev/null; then
+                    printf '%s\t%s\t%s\n' "$id" "$show_mal_id" "$show_anilist_id" >>"$_show_ids_file" 2>/dev/null
+                fi
+                break
+            fi
+            [ "$_show_ids_tries" -lt 2 ] || break
+            # AllAnime throttles bursts of requests; a short wait is worth it, a long one is not
+            _show_ids_wait="$(printf '%s' "$_show_ids" | sed -nE 's|.*try again in[[:space:]]+([0-9]+)[[:space:]]+second.*|\1|p' | head -n 1)"
+            [ -n "$_show_ids_wait" ] && [ "$_show_ids_wait" -le 5 ] || break
+            sleep "$_show_ids_wait"
+        done
+        # a failed lookup is tried again on the next episode rather than remembered
+        [ -n "$show_mal_id$show_anilist_id" ] || show_ids_for=""
+    fi
+    [ -n "$show_mal_id$show_anilist_id" ]
+}
+
+# resolve a playlist entry $2 against the playlist url $1, including root- and protocol-relative entries
+hls_resolve_url() {
+    case "$2" in
+        http://* | https://*) printf '%s' "$2" ;;
+        //*) printf '%s:%s' "${1%%://*}" "$2" ;;
+        /*) printf '%s' "$1" | sed -E 's|^(https?://[^/]*).*|\1|' && printf '%s' "$2" ;;
+        *) printf '%s%s' "${1%/*}/" "$2" ;;
+    esac
+}
+
+# print the first variant of a master playlist, or the first media url (init segment
+# first) of a media playlist, read from stdin; relative entries stay unresolved
+hls_first_entry() {
+    awk '
+/^#EXT-X-MAP:/ && match($0, /URI="[^"]*"/) { print substr($0, RSTART + 5, RLENGTH - 6); exit }
+/^#/ { next }
+/^[[:space:]]*$/ { next }
+{ sub(/[[:space:]]+$/, ""); print; exit }
+'
+}
+
+# GET $1 the way the player will ask for it; $2 is the referer, $3 an optional curl range.
+# The body goes to the file $4, and the HTTP status is printed.
+stream_check_get() {
+    set -- "$1" "$2" "$3" "$4" -s -L -o "$4" -w '%{http_code}' --connect-timeout 5 --max-time 12 -A libmpv
+    [ -n "$2" ] && set -- "$@" -H "Referer: $2"
+    [ -n "$stream_origin" ] && set -- "$@" -H "Origin: $stream_origin"
+    [ -n "$3" ] && set -- "$@" -r "$3"
+    _check_target="$1"
+    shift 4
+    curl "$@" "$_check_target" 2>/dev/null
+}
+
+# A provider can resolve a stream whose media host is dead or refuses the player,
+# which would otherwise end the failover with a player that shows nothing. Fetch
+# the selected playlist and the first bytes of its first segment (or of the mp4)
+# with the player's headers. Returns 1 and sets playback_check_error when the host
+# does not answer with media; anything that cannot be judged counts as healthy.
+playback_stream_reachable() {
+    playback_check_error=""
+    [ "$playback_check_enabled" = "1" ] || return 0
+    case "$episode" in
+        http://* | https://*) ;;
+        *) return 0 ;;
+    esac
+    _check_refr="$m3u8_refr"
+    if [ -z "$_check_refr" ] && [ -n "$refr_flag" ]; then
+        _check_refr="${refr_flag#--referrer=}"
+    fi
+    _check_file="$(mktemp)" || return 0
+    _check_url="$episode"
+    _check_hops=0
+    while :; do
+        case "$_check_url" in
+            *.m3u8 | *.m3u8\?* | *.m3u8#* | *m3u8*) ;;
+            *) break ;;
+        esac
+        _check_code="$(stream_check_get "$_check_url" "$_check_refr" "" "$_check_file")"
+        case "$_check_code" in
+            2??) ;;
+            000) playback_check_error="the playlist host did not answer" ;;
+            *) playback_check_error="the playlist host answered HTTP ${_check_code}" ;;
+        esac
+        if [ -z "$playback_check_error" ] && ! grep -q "#EXTM3U" "$_check_file"; then
+            playback_check_error="the playlist host did not return HLS"
+        fi
+        if [ -n "$playback_check_error" ]; then
+            rm -f "$_check_file"
+            return 1
+        fi
+        _check_entry="$(hls_first_entry <"$_check_file")"
+        if [ -z "$_check_entry" ]; then
+            playback_check_error="the playlist lists no media"
+            rm -f "$_check_file"
+            return 1
+        fi
+        _check_url="$(hls_resolve_url "$_check_url" "$_check_entry")"
+        # a master playlist points at a variant playlist, which points at the media
+        grep -q "#EXT-X-STREAM-INF" "$_check_file" || break
+        _check_hops=$((_check_hops + 1))
+        [ "$_check_hops" -lt 3 ] || break
+    done
+
+    _check_code="$(stream_check_get "$_check_url" "$_check_refr" "0-4095" "$_check_file")"
+    case "$_check_code" in
+        2??) ;;
+        000) playback_check_error="the media host did not answer" ;;
+        *) playback_check_error="the media host answered HTTP ${_check_code}" ;;
+    esac
+    if [ -z "$playback_check_error" ]; then
+        if [ ! -s "$_check_file" ]; then
+            playback_check_error="the media host returned no data"
+        elif head -c 512 "$_check_file" | tr '[:upper:]' '[:lower:]' | grep -qE '<(!doctype|html|head|body)'; then
+            playback_check_error="the media host returned a web page instead of video"
+        fi
+    fi
+    rm -f "$_check_file"
+    [ -z "$playback_check_error" ]
+}
+
+# a provider can pin each quality to its own media host, so when the chosen quality's host is
+# dead another quality of the same provider may still play; switch $episode to the first that does
+playback_try_other_qualities() {
+    _first_episode="$episode"
+    _first_error="$playback_check_error"
+    _first_quality="$(printf '%s\n' "$links" | grep -F " >$_first_episode" | head -n 1 | sed 's| >.*||')"
+    _other_links="$(printf '%s\n' "$links" | grep -vE '^(subtitle|m3u8_refr) >' | grep -E ' >https?://' | grep -vF " >$_first_episode")"
+    while IFS= read -r _other_link; do
+        [ -n "$_other_link" ] || continue
+        episode="${_other_link#* >}"
+        if playback_stream_reachable; then
+            printf "\33[2K\r\033[1;33m%s\033[0m\n" "The ${_first_quality:-selected} stream did not answer (${_first_error}), playing ${_other_link%% >*} instead." 1>&2
+            return 0
+        fi
+    done <<EOF
+$_other_links
+EOF
+    episode="$_first_episode"
+    playback_check_error="$_first_error"
+    return 1
+}
+
+# the first stream that only failed the reachability check is kept as a last resort,
+# so the check can never leave playback worse off than handing that stream to the player
+playback_keep_spare() {
+    playback_spare_label="$1"
+    playback_spare_episode="$episode"
+    playback_spare_links="$links"
+    playback_spare_subtitle="$subtitle"
+    playback_spare_subs_flag="$subs_flag"
+    playback_spare_refr_flag="$refr_flag"
+    playback_spare_m3u8_refr="$m3u8_refr"
+    playback_spare_player_flags="$stream_player_flags"
+    playback_spare_audio_url="$stream_audio_url"
+    playback_spare_master_url="$stream_master_url"
+    playback_spare_origin="$stream_origin"
+}
+
+playback_use_spare() {
+    episode="$playback_spare_episode"
+    links="$playback_spare_links"
+    subtitle="$playback_spare_subtitle"
+    subs_flag="$playback_spare_subs_flag"
+    refr_flag="$playback_spare_refr_flag"
+    m3u8_refr="$playback_spare_m3u8_refr"
+    stream_player_flags="$playback_spare_player_flags"
+    stream_audio_url="$playback_spare_audio_url"
+    stream_master_url="$playback_spare_master_url"
+    stream_origin="$playback_spare_origin"
+}
+
+# remember the chosen provider's referer and subtitle track for change_quality
+playback_remember_stream() {
+    stream_referer="$m3u8_refr"
+    if [ -z "$stream_referer" ] && [ -n "$refr_flag" ]; then
+        stream_referer="${refr_flag#--referrer=}"
+    fi
+    stream_subtitle="$subtitle"
+}
+
+playback_provider_label() {
+    case "$1" in
+        anidb) printf '%s' "anidb.app" ;;
+        hianime) printf '%s' "hianime.at" ;;
+        megaplay) printf '%s' "megaplay.buzz" ;;
+        zokoanime) printf '%s' "zokoanime.video" ;;
+        anizone) printf '%s' "anizone.to" ;;
+        kickassanime) printf '%s' "kaa.lt" ;;
+        *) printf '%s' "$1" ;;
+    esac
+}
+
+playback_provider_enabled() {
+    case "$1" in
+        anidb) [ "$anidb_enabled" = "1" ] ;;
+        hianime) [ "$hianime_enabled" = "1" ] ;;
+        megaplay) [ "$megaplay_enabled" = "1" ] ;;
+        zokoanime) [ "$zokoanime_enabled" = "1" ] ;;
+        anizone) [ "$anizone_enabled" = "1" ] ;;
+        kickassanime) [ "$kickassanime_enabled" = "1" ] ;;
+        *) return 1 ;;
+    esac
+}
+
+playback_provider_error() {
+    case "$1" in
+        anidb) _playback_error="$anidb_last_error" ;;
+        hianime) _playback_error="$hianime_last_error" ;;
+        megaplay) _playback_error="$megaplay_last_error" ;;
+        zokoanime) _playback_error="$zokoanime_last_error" ;;
+        anizone) _playback_error="$anizone_last_error" ;;
+        kickassanime) _playback_error="$kickassanime_last_error" ;;
+        *) _playback_error="" ;;
+    esac
+    printf '%s' "${_playback_error:-no playable sources returned}"
+}
+
+# tries every enabled provider in $playback_providers order so a single outage is not fatal
 get_episode_url() {
     unset episode links subtitle subs_flag refr_flag m3u8_refr result
+    unset stream_player_flags stream_origin stream_referer stream_subtitle stream_audio_url stream_master_url
     anidb_last_error=""
     hianime_last_error=""
+    megaplay_last_error=""
+    zokoanime_last_error=""
+    anizone_last_error=""
+    kickassanime_last_error=""
+    playback_failures=""
+    playback_notice=""
+    playback_spare_label=""
 
     printf "%s" "$ep_list" | grep -q "^$ep_no$" || die "Episode not released!"
 
-    if [ "$anidb_enabled" = "1" ]; then
-        anidb_select_episode_url && return 0
-        [ -n "$anidb_last_error" ] || anidb_last_error="no playable sources returned"
-        if [ "$hianime_enabled" = "1" ]; then
-            printf "\33[2K\r\033[1;33m%s\033[0m\n" "anidb.app playback failed: ${anidb_last_error}. Trying hianime.at..." 1>&2
+    for _playback_provider in $playback_providers; do
+        playback_provider_enabled "$_playback_provider" || continue
+        _playback_label="$(playback_provider_label "$_playback_provider")"
+        [ -n "$playback_notice" ] && printf "\33[2K\r\033[1;33m%s\033[0m\n" "${playback_notice} Trying ${_playback_label}..." 1>&2
+        # player options belong to the provider that set them
+        unset stream_player_flags stream_origin stream_audio_url stream_master_url
+        if "${_playback_provider}_select_episode_url"; then
+            if playback_stream_reachable || playback_try_other_qualities; then
+                playback_remember_stream
+                return 0
+            fi
+            [ -n "$playback_spare_label" ] || playback_keep_spare "$_playback_label"
+            _playback_error="$playback_check_error"
+        else
+            _playback_error="$(playback_provider_error "$_playback_provider")"
         fi
-    fi
+        playback_failures="${playback_failures}${playback_failures:+ }${_playback_label}: ${_playback_error}."
+        playback_notice="${_playback_label} playback failed: ${_playback_error}."
+    done
 
-    if [ "$hianime_enabled" = "1" ]; then
-        hianime_select_episode_url && return 0
-        [ -n "$hianime_last_error" ] || hianime_last_error="no playable sources returned"
+    if [ -n "$playback_spare_label" ]; then
+        playback_use_spare
+        playback_remember_stream
+        printf "\33[2K\r\033[1;33m%s\033[0m\n" "${playback_notice} No other provider worked, so playing the ${playback_spare_label} stream anyway..." 1>&2
+        return 0
     fi
-
-    if [ -n "$anidb_last_error" ] && [ -n "$hianime_last_error" ]; then
-        die "Playback failed. anidb.app: ${anidb_last_error}. hianime.at: ${hianime_last_error}."
-    fi
-    [ -n "$anidb_last_error" ] && die "anidb.app playback failed: ${anidb_last_error}."
-    [ -n "$hianime_last_error" ] && die "hianime.at playback failed: ${hianime_last_error}."
-    die "Playback failed: no playback provider is enabled."
+    [ -n "$playback_failures" ] || die "Playback failed: no playback provider is enabled."
+    die "Playback failed. ${playback_failures}"
 }
 
 # search the query and give results
@@ -1301,12 +2434,39 @@ update_history() {
     mv "${histfile}.new" "$histfile"
 }
 
+# download the provider's own multi-audio master $1 into the file $2 with the audio language playback
+# would pick, since a local playlist that only names one track cannot carry the stream's headers
+download_multi_audio() {
+    _download_audio='^(ja|jpn)'
+    [ "$mode" = "dub" ] && _download_audio='^(en|eng)'
+    set -- "$1" "$2" -f "bv*+ba[language~='${_download_audio}']/b" --merge-output-format mp4
+    [ -n "$m3u8_refr" ] && set -- "$@" --referer "$m3u8_refr"
+    [ -n "$stream_origin" ] && set -- "$@" --add-header "Origin:$stream_origin"
+    _download_master="$1"
+    _download_file="$2"
+    shift 2
+    yt-dlp "$@" "$_download_master" --no-skip-unavailable-fragments --fragment-retries infinite -N 16 -o "$_download_file"
+}
+
+# fetch $subtitle into the file $1; subtitle hosts refuse requests without the stream's headers
+download_subtitle() {
+    set -- -s -o "$1"
+    [ -n "$m3u8_refr" ] && set -- "$@" -e "$m3u8_refr"
+    [ -n "$stream_origin" ] && set -- "$@" -H "Origin: $stream_origin"
+    curl "$@" "$subtitle"
+}
+
 download() {
-    # download subtitle if it's set
-    [ -n "$subtitle" ] && curl -s "$subtitle" -o "$download_dir/$2.vtt"
+    # download subtitle if it's set, keeping its format's extension (ass and srt as well as vtt)
+    if [ -n "$subtitle" ]; then
+        _subtitle_ext="$(printf '%s' "${subtitle%%[?#]*}" | sed -nE 's#.*\.(vtt|ass|srt)$#\1#p')"
+        download_subtitle "$download_dir/$2.${_subtitle_ext:-vtt}"
+    fi
     case $1 in
         *m3u8*)
-            if [ -f "$1" ]; then
+            if [ -n "$stream_audio_url" ] && [ -n "$stream_master_url" ] && command -v "yt-dlp" >/dev/null; then
+                download_multi_audio "$stream_master_url" "$download_dir/$2.mp4"
+            elif [ -f "$1" ]; then
                 # a locally rewritten playlist: ffmpeg has to be allowed to follow
                 # it out to the segment host, and rejects http-only flags for it
                 ffmpeg -extension_picky 0 -protocol_whitelist file,crypto,data,http,https,tcp,tls -loglevel error -stats -i "$1" -c copy "$download_dir/$2.mp4"
@@ -1336,6 +2496,7 @@ play_episode() {
     [ -n "${ANI_WATCH_MPV_EXTRA_ARGS:-}" ] && mpv_extra_flags="$ANI_WATCH_MPV_EXTRA_ARGS"
     [ -z "$episode" ] && get_episode_url
     hls_localize_playlist
+    hls_attach_audio
     # shellcheck disable=SC2086
     case "$player_function" in
         debug)
@@ -1344,9 +2505,9 @@ play_episode() {
             ;;
         mpv*)
             if [ "$no_detach" = 0 ]; then
-                ani_watch_run_detached $player_function $skip_flag $ipc_flag $wid_flag $mpv_extra_flags $hls_lavf_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag
+                ani_watch_run_detached $player_function $skip_flag $ipc_flag $wid_flag $mpv_extra_flags $hls_lavf_flag $stream_player_flags --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag
             else
-                ani_watch_run_foreground $player_function $skip_flag $ipc_flag $wid_flag $mpv_extra_flags $hls_lavf_flag $subs_flag $refr_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
+                ani_watch_run_foreground $player_function $skip_flag $ipc_flag $wid_flag $mpv_extra_flags $hls_lavf_flag $stream_player_flags $subs_flag $refr_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode"
                 mpv_exitcode=$?
                 [ "$exit_after_play" = 1 ] && [ -z "$range" ] && exit "$mpv_exitcode"
             fi
@@ -1357,14 +2518,15 @@ play_episode() {
             [ -n "$subs_flag" ] && subs_flag="--mpv-${subs_flag#--}"
             [ -n "$refr_flag" ] && refr_flag="--mpv-${refr_flag#--}"
             [ -n "$hls_lavf_flag" ] && hls_lavf_flag="--mpv-${hls_lavf_flag#--}"
+            iina_stream_flags="$(printf '%s' "$stream_player_flags" | sed 's/--/--mpv-/g')"
             if pgrep -f "IINA" >/dev/null 2>&1; then
                 # omit --keep-running when an IINA instance exists to prevent hanging
-                ani_watch_run_detached $player_function --no-stdin --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $hls_lavf_flag "$episode"
+                ani_watch_run_detached $player_function --no-stdin --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $hls_lavf_flag $iina_stream_flags "$episode"
             else
-                ani_watch_run_detached $player_function --no-stdin --keep-running --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $hls_lavf_flag "$episode"
+                ani_watch_run_detached $player_function --no-stdin --keep-running --mpv-force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $hls_lavf_flag $iina_stream_flags "$episode"
             fi
             ;;
-        flatpak_mpv) ani_watch_run_detached flatpak run io.mpv.Mpv $ipc_flag $wid_flag $mpv_extra_flags $hls_lavf_flag --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag ;;
+        flatpak_mpv) ani_watch_run_detached flatpak run io.mpv.Mpv $ipc_flag $wid_flag $mpv_extra_flags $hls_lavf_flag $stream_player_flags --force-media-title="${allanime_title}Episode ${ep_no}" "$episode" $subs_flag $refr_flag ;;
         vlc*)
             vlc_refr="${refr_flag#--referrer=}"
             [ "$vlc_refr" = "$refr_flag" ] && vlc_refr="$allanime_refr"
@@ -1373,7 +2535,7 @@ play_episode() {
             [ -n "$subtitle" ] && vlc_subs_flag=":input-slave=$subtitle"
             ani_watch_run_detached $player_function --http-referrer="$vlc_refr" --play-and-exit --meta-title="${allanime_title}Episode ${ep_no}" "$episode" $vlc_subs_flag
             ;;
-        *yncpla*) ani_watch_run_detached $player_function "$episode" -- --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $hls_lavf_flag ;;
+        *yncpla*) ani_watch_run_detached $player_function "$episode" -- --force-media-title="${allanime_title}Episode ${ep_no}" $subs_flag $refr_flag $hls_lavf_flag $stream_player_flags ;;
         download) ani_watch_run_foreground "$player_function" "$episode" "${allanime_title}Episode ${ep_no}" "$subtitle" ;;
         catt) ani_watch_run_detached catt cast "$episode" -s "$subtitle" ;;
         iSH)
@@ -1426,8 +2588,23 @@ scraper_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHT
 anidb_agent="$scraper_agent"
 hianime_agent="$scraper_agent"
 hianime_base="${ANI_CLI_HIANIME_BASE:-https://hianime.at}"
+megaplay_agent="$scraper_agent"
+megaplay_base="${ANI_CLI_MEGAPLAY_BASE:-https://megaplay.buzz}"
+# trustAesKey and trustAesIv of the player's newclient.min.js; megaplay_refresh_key reads new ones if they rotate
+megaplay_key='i?LMTAx0Q6,:}50U'
+megaplay_iv="W0;27ToaUpl_P%'c"
+zokoanime_base="${ANI_CLI_ZOKOANIME_BASE:-https://zokoanime.video}"
+kickassanime_base="${ANI_CLI_KICKASSANIME_BASE:-https://kaa.lt}"
+kickassanime_origin="https://krussdomi.com"
 anidb_enabled="${ANI_CLI_ANIDB:-1}"
 hianime_enabled="${ANI_CLI_HIANIME:-1}"
+megaplay_enabled="${ANI_CLI_MEGAPLAY:-1}"
+zokoanime_enabled="${ANI_CLI_ZOKOANIME:-1}"
+anizone_enabled="${ANI_CLI_ANIZONE:-1}"
+kickassanime_enabled="${ANI_CLI_KICKASSANIME:-1}"
+# failover order: anidb.app and hianime.at always come first
+playback_providers="anidb hianime megaplay zokoanime anizone kickassanime"
+playback_check_enabled="${ANI_CLI_STREAM_CHECK:-1}"
 hls_fix_enabled="${ANI_CLI_HLS_FIX:-1}"
 hls_playlist_file=""
 hls_lavf_flag=""
