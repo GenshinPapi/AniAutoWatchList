@@ -2051,7 +2051,9 @@ allanime_show_ids() {
             [ "$_show_ids_tries" -lt 2 ] || break
             # AllAnime throttles bursts of requests; a short wait is worth it, a long one is not
             _show_ids_wait="$(printf '%s' "$_show_ids" | sed -nE 's|.*try again in[[:space:]]+([0-9]+)[[:space:]]+second.*|\1|p' | head -n 1)"
-            [ -n "$_show_ids_wait" ] && [ "$_show_ids_wait" -le 5 ] || break
+            if [ -z "$_show_ids_wait" ] || [ "$_show_ids_wait" -gt 5 ]; then
+                break
+            fi
             sleep "$_show_ids_wait"
         done
         # a failed lookup is tried again on the next episode rather than remembered
