@@ -19,6 +19,7 @@ This project does not bypass DRM, paywalls, or login systems, and does not use E
 - Continue button in the GUI for launching a selected episode through ani-cli
 - Automatic playback failover across anidb.app, hianime.at, megaplay.buzz, zokoanime.video, anizone.to and kaa.lt, so one provider or video host going down does not stop playback
 - Automatic repair of image-wrapped HLS segments that mpv, VLC, and ffmpeg otherwise refuse to play
+- Automatic pairing of separate HLS audio tracks with the chosen video quality, so releases that ship their audio apart from the video do not play silent
 - Startup update check against the GitHub `main` branch
 - Global AniList title search with suggestions and card results
 - Related seasons on anime detail pages
@@ -415,6 +416,22 @@ seconds rather than retried. Set `ANI_CLI_STREAM_CHECK=0` to skip the check.
 - `-d` downloads from anizone.to and kaa.lt hand yt-dlp the provider's full master with the same headers
   and let it pick the audio language playback would use; subtitles keep their own `.ass`, `.srt` or
   `.vtt` extension.
+
+### Separate audio tracks
+
+Some releases keep their audio out of the video: the master playlist lists Japanese and English as
+separate `EXT-X-MEDIA` audio renditions, and every quality variant is video only. Overgeared episodes
+2-4 and The Laid-Off Cheat-Granting Mage on hianime.at are examples (see ani-cli issue #1960). Handing
+the player just the chosen quality plays it in silence, while neighbouring episodes with muxed audio
+play normally, so the failure looks random.
+
+ani-cli keeps the rendition that matches the mode from the master: Japanese for sub and English for
+dub, or the master's own default when the tracks carry no language. It then hands mpv a local playlist
+that pairs the chosen quality with that track, the same way anizone.to and kaa.lt are played. Masters
+whose audio is muxed into the video are left exactly as they were. Downloads hand yt-dlp the full master
+and let it pick the same audio language. Android intents, `catt`, iSH and `--debug` cannot open a local
+playlist, so they get the provider's full master instead, whose default track already matches the
+server they came from.
 
 ### Image-wrapped segments
 

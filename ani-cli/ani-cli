@@ -586,11 +586,19 @@ if fallback:
     printf '%s' "$_anidb_embed" | sed 's|\\/|/|g'
 }
 
-# turns an HLS master playlist into the "quality >url" lines select_quality expects
+# turns an HLS master playlist into the "quality >url" lines select_quality expects. When the master
+# keeps its audio in separate renditions, every variant is video only; the rendition for $mode is
+# left in hls_links_audio_url so the player is not handed a silent stream.
 hls_playlist_links() {
     _hls_playlist_url="$1"
     _hls_playlist="$2"
     _hls_base_url="${_hls_playlist_url%/*}/"
+    _hls_audio_lang="ja"
+    [ "$mode" = "dub" ] && _hls_audio_lang="en"
+    _hls_audio="$(printf '%s\n' "$_hls_playlist" | hls_audio_rendition "$_hls_audio_lang" any)"
+    hls_links_audio_url=""
+    hls_links_master_url="$_hls_playlist_url"
+    [ -n "$_hls_audio" ] && hls_links_audio_url="$(hls_resolve_url "$_hls_playlist_url" "$_hls_audio")"
 
     printf '%s' "$_hls_playlist" | awk -v base="$_hls_base_url" '
 /^#EXT-X-STREAM/ {
@@ -750,9 +758,10 @@ hls_localize_playlist() {
 }
 
 # print the uri of the audio rendition in language family $1 (ja or en) of the master playlist on
-# stdin; a Japanese request falls back to the master's default rendition
+# stdin; a Japanese request, or any request when $2 is "any", falls back to the master's default
+# rendition. A rendition without a uri is muxed into the video variant and is never printed.
 hls_audio_rendition() {
-    awk -v wanted="$1" '
+    awk -v wanted="$1" -v any="$2" '
 BEGIN { families["ja"] = " ja jpn jp "; families["en"] = " en eng en-us " }
 /^#EXT-X-MEDIA:/ && /TYPE=AUDIO/ {
     uri = ""
@@ -763,13 +772,15 @@ BEGIN { families["ja"] = " ja jpn jp "; families["en"] = " en eng en-us " }
     if (language != "" && index(families[wanted], " " language " ")) { print uri; found = 1; exit }
     if (/DEFAULT=YES/ && fallback == "") fallback = uri
 }
-END { if (!found && wanted == "ja" && fallback != "") print fallback }
+END { if (!found && (wanted == "ja" || any == "any") && fallback != "") print fallback }
 '
 }
 
-# A master that carries every dub as its own audio rendition makes the player probe all of them
-# before the first frame, which takes up to a minute. The provider picks the video variant and sets
-# stream_audio_url to the one rendition wanted; hand the player a local master with just those two.
+# A master that keeps its audio in separate renditions plays silent from a bare video variant, and
+# one that carries every dub as its own rendition makes the player probe all of them before the first
+# frame, which takes up to a minute. stream_audio_url holds the one rendition wanted (chosen by the
+# provider or by playback_adopt_master_audio); hand the player a local master with just the selected
+# variant and that track.
 hls_attach_audio() {
     [ -n "$stream_audio_url" ] || return 0
     case "$episode" in
@@ -2213,6 +2224,17 @@ playback_use_spare() {
     stream_origin="$playback_spare_origin"
 }
 
+# a master that keeps its audio in separate renditions leaves every variant silent. Providers that
+# pick a rendition themselves set stream_audio_url; every other provider gets the one its master
+# named, which hls_attach_audio then plays alongside the chosen variant.
+playback_adopt_master_audio() {
+    if [ -n "$stream_audio_url" ] || [ -z "$hls_links_audio_url" ]; then
+        return 0
+    fi
+    stream_audio_url="$hls_links_audio_url"
+    stream_master_url="$hls_links_master_url"
+}
+
 # remember the chosen provider's referer and subtitle track for change_quality
 playback_remember_stream() {
     stream_referer="$m3u8_refr"
@@ -2280,8 +2302,9 @@ get_episode_url() {
         _playback_label="$(playback_provider_label "$_playback_provider")"
         [ -n "$playback_notice" ] && printf "\33[2K\r\033[1;33m%s\033[0m\n" "${playback_notice} Trying ${_playback_label}..." 1>&2
         # player options belong to the provider that set them
-        unset stream_player_flags stream_origin stream_audio_url stream_master_url
+        unset stream_player_flags stream_origin stream_audio_url stream_master_url hls_links_audio_url hls_links_master_url
         if "${_playback_provider}_select_episode_url"; then
+            playback_adopt_master_audio
             if playback_stream_reachable || playback_try_other_qualities; then
                 playback_remember_stream
                 return 0
@@ -2441,7 +2464,9 @@ update_history() {
 download_multi_audio() {
     _download_audio='^(ja|jpn)'
     [ "$mode" = "dub" ] && _download_audio='^(en|eng)'
-    set -- "$1" "$2" -f "bv*+ba[language~='${_download_audio}']/b" --merge-output-format mp4
+    # a master that names no codecs leaves yt-dlp unsure whether the video carries audio already,
+    # and without --audio-multistreams it then drops the separate track from the merge
+    set -- "$1" "$2" -f "bv*+ba[language~='${_download_audio}']/b" --audio-multistreams --merge-output-format mp4
     [ -n "$m3u8_refr" ] && set -- "$@" --referer "$m3u8_refr"
     [ -n "$stream_origin" ] && set -- "$@" --add-header "Origin:$stream_origin"
     _download_master="$1"

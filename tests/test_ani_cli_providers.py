@@ -1229,3 +1229,194 @@ def test_anizone_match_breaks_a_shared_title_by_year(ani_cli_functions: Path) ->
     ) + "') })</script>"
     assert anizone_parse(ani_cli_functions, "match", shared, "2021\nExample Title").strip() == "tv"
     assert anizone_parse(ani_cli_functions, "match", shared, "2019\nExample Title").strip() == "ova"
+
+
+# Overgeared episode 2 as hianime.at and zokoanime.video serve it: every variant is video only and
+# the audio comes from separate renditions, Japanese by default on the sub server, English on dub
+SPLIT_AUDIO_SUB_MASTER = "\n".join(
+    [
+        "#EXTM3U",
+        "#EXT-X-VERSION:4",
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="Japanese",LANGUAGE="ja",DEFAULT=YES,AUTOSELECT=YES,URI="aud/a0/index.m3u8"',
+        '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aud",NAME="English",LANGUAGE="en",DEFAULT=NO,AUTOSELECT=YES,URI="aud/a1/index.m3u8"',
+        '#EXT-X-STREAM-INF:BANDWIDTH=900000,RESOLUTION=640x360,AUDIO="aud"',
+        "360/index.m3u8",
+        '#EXT-X-STREAM-INF:BANDWIDTH=5300000,RESOLUTION=1920x1080,AUDIO="aud"',
+        "1080/index.m3u8",
+    ]
+)
+SPLIT_AUDIO_DUB_MASTER = SPLIT_AUDIO_SUB_MASTER.replace('LANGUAGE="ja",DEFAULT=YES', 'LANGUAGE="ja",DEFAULT=NO').replace(
+    'LANGUAGE="en",DEFAULT=NO', 'LANGUAGE="en",DEFAULT=YES'
+)
+MUXED_MASTER = "#EXTM3U\n#EXT-X-VERSION:4\n#EXT-X-STREAM-INF:BANDWIDTH=5300000,RESOLUTION=1920x1080\n1080/index.m3u8"
+SPLIT_BASE = "https://hls.example/p/abc"
+
+
+def playlist_links_state(functions: Path, master: str, mode: str) -> list[str]:
+    script = f"""
+mode={mode}
+links="$(hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{master}')"
+hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{master}' >/dev/null
+printf '%s\\n%s\\n%s\\n' "$(printf '%s\\n' "$links" | head -n 1)" "$hls_links_audio_url" "$hls_links_master_url"
+"""
+    return run_function(functions, script).splitlines()
+
+
+def test_hls_audio_rendition_can_fall_back_to_the_default_track(ani_cli_functions: Path) -> None:
+    unlabelled = '#EXTM3U\n#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="main",DEFAULT=YES,URI="main/index.m3u8"'
+    assert audio_rendition(ani_cli_functions, unlabelled, "en") == ""
+    assert audio_rendition(ani_cli_functions, unlabelled, "en any") == "main/index.m3u8"
+    # a default rendition without a uri is muxed into the variant, which already has sound
+    muxed_default = "\n".join(
+        [
+            "#EXTM3U",
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="Japanese",LANGUAGE="ja",DEFAULT=YES',
+            '#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="a",NAME="German",LANGUAGE="de",URI="de/index.m3u8"',
+        ]
+    )
+    assert audio_rendition(ani_cli_functions, muxed_default, "ja any") == ""
+    assert audio_rendition(ani_cli_functions, muxed_default, "en any") == ""
+
+
+def test_hls_playlist_links_keeps_the_separate_audio_for_the_mode(ani_cli_functions: Path) -> None:
+    assert playlist_links_state(ani_cli_functions, SPLIT_AUDIO_SUB_MASTER, "sub") == [
+        f"1080p >{SPLIT_BASE}/1080/index.m3u8",
+        f"{SPLIT_BASE}/aud/a0/index.m3u8",
+        f"{SPLIT_BASE}/master.m3u8",
+    ]
+    assert playlist_links_state(ani_cli_functions, SPLIT_AUDIO_DUB_MASTER, "dub")[1] == f"{SPLIT_BASE}/aud/a1/index.m3u8"
+
+
+def test_hls_playlist_links_leaves_muxed_masters_alone(ani_cli_functions: Path) -> None:
+    state = playlist_links_state(ani_cli_functions, MUXED_MASTER, "sub")
+    assert state[0] == f"1080p >{SPLIT_BASE}/1080/index.m3u8"
+    assert state[1] == ""
+
+
+def adoption_run(functions: Path, stubs: str) -> subprocess.CompletedProcess[str]:
+    return run_failover(
+        functions,
+        stubs + "\nplayback_stream_reachable() { playback_check_error=''; return 0; }\n",
+        "printf '%s|%s|%s' \"$episode\" \"$stream_audio_url\" \"$stream_master_url\"",
+    )
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="POSIX shell not available")
+def test_failover_attaches_the_separate_audio_of_a_providers_master(ani_cli_functions: Path) -> None:
+    result = adoption_run(
+        ani_cli_functions,
+        f"""
+anidb_select_episode_url() {{ anidb_last_error="down"; return 1; }}
+hianime_select_episode_url() {{
+    links="$(hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{SPLIT_AUDIO_SUB_MASTER}')"
+    hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{SPLIT_AUDIO_SUB_MASTER}' >/dev/null
+    select_quality best
+    return 0
+}}
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == f"{SPLIT_BASE}/1080/index.m3u8|{SPLIT_BASE}/aud/a0/index.m3u8|{SPLIT_BASE}/master.m3u8"
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="POSIX shell not available")
+def test_failover_keeps_a_providers_own_audio_choice(ani_cli_functions: Path) -> None:
+    result = adoption_run(
+        ani_cli_functions,
+        f"""
+anidb_select_episode_url() {{ anidb_last_error="down"; return 1; }}
+hianime_select_episode_url() {{
+    hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{SPLIT_AUDIO_SUB_MASTER}' >/dev/null
+    episode="{SPLIT_BASE}/1080/index.m3u8"
+    stream_audio_url="https://own.example/chosen.m3u8"
+    stream_master_url="https://own.example/master.m3u8"
+    return 0
+}}
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split("|")[1:] == ["https://own.example/chosen.m3u8", "https://own.example/master.m3u8"]
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="POSIX shell not available")
+def test_failover_does_not_carry_a_failed_providers_audio_to_the_next(ani_cli_functions: Path) -> None:
+    result = adoption_run(
+        ani_cli_functions,
+        f"""
+anidb_select_episode_url() {{
+    hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{SPLIT_AUDIO_SUB_MASTER}' >/dev/null
+    anidb_last_error="no playable quality"
+    return 1
+}}
+hianime_select_episode_url() {{
+    links="$(hls_playlist_links 'https://muxed.example/master.m3u8' '{MUXED_MASTER}')"
+    hls_playlist_links 'https://muxed.example/master.m3u8' '{MUXED_MASTER}' >/dev/null
+    select_quality best
+    return 0
+}}
+""",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "https://muxed.example/1080/index.m3u8||"
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="POSIX shell not available")
+def test_zokoanime_split_audio_episode_plays_with_its_japanese_track(ani_cli_functions: Path, tmp_path: Path) -> None:
+    config = obfuscate({"src": f"{SPLIT_BASE}/master.m3u8", "subtitles": []})
+    master = tmp_path / "master.m3u8"
+    master.write_text(SPLIT_AUDIO_SUB_MASTER, encoding="utf-8")
+    script = f"""
+ep_list='1
+2'
+ep_no=2
+mode=sub
+quality=best
+playback_providers='zokoanime'
+zokoanime_enabled=1
+playback_check_enabled=1
+zokoanime_base='https://zoko.example'
+scraper_agent='test-agent'
+allanime_show_ids() {{ show_mal_id=64340; show_anilist_id=212888; }}
+zokoanime_curl() {{
+    case "$1" in
+        */stream/mal/64340/2/sub) printf '<script>window.__P="%s";</script>' '{config}' ;;
+        */master.m3u8) cat '{master}' ;;
+    esac
+}}
+playback_stream_reachable() {{ playback_check_error=''; return 0; }}
+get_episode_url
+TMPDIR='{tmp_path}'
+player_function=mpv
+hls_attach_audio
+printf '%s\\n' "$hls_lavf_flag"
+cat "$episode"
+"""
+    result = subprocess.run(["sh", "-c", f". {ani_cli_functions}\n{script}"], capture_output=True, text=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    lines = result.stdout.splitlines()
+    assert lines[0] == "--demuxer-lavf-o-append=protocol_whitelist=file,crypto,data,http,https,tcp,tls"
+    playlist = "\n".join(lines[1:])
+    # the player gets the 1080p video together with the Japanese track instead of silence
+    assert f'URI="{SPLIT_BASE}/aud/a0/index.m3u8"' in playlist
+    assert playlist.rstrip().endswith(f"{SPLIT_BASE}/1080/index.m3u8")
+
+
+@pytest.mark.skipif(shutil.which("sh") is None, reason="POSIX shell not available")
+def test_split_audio_downloads_merge_the_separate_track(ani_cli_functions: Path, tmp_path: Path) -> None:
+    # a hyphen is not allowed in a POSIX function name, so the downloader is stubbed on PATH
+    stub = tmp_path / "yt-dlp"
+    stub.write_text('#!/bin/sh\nfor arg in "$@"; do printf \'%s\\n\' "$arg"; done\n', encoding="utf-8")
+    stub.chmod(0o755)
+    script = f"""
+PATH='{tmp_path}':"$PATH"
+mode=dub
+m3u8_refr='https://zoko.example/'
+stream_origin=''
+download_multi_audio 'https://hls.example/p/abc/master.m3u8' './Overgeared Episode 2.mp4'
+"""
+    args = run_function(ani_cli_functions, script).splitlines()
+    assert args[: args.index("--merge-output-format")] == ["-f", "bv*+ba[language~='^(en|eng)']/b", "--audio-multistreams"]
+    # without --audio-multistreams yt-dlp drops a separate track when the master names no codecs
+    assert args[args.index("--referer") + 1] == "https://zoko.example/"
+    assert "https://hls.example/p/abc/master.m3u8" in args
+    assert args[args.index("-o") + 1] == "./Overgeared Episode 2.mp4"
