@@ -721,6 +721,7 @@ def test_launch_episode_can_log_output_and_hand_back_the_process(monkeypatch, tm
 
     monkeypatch.delenv("ANI_WATCH_MPV_EXTRA_ARGS", raising=False)
     monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(launcher.shutil, "which", lambda name: "/home/me/.local/bin/ani-cli" if name == "ani-cli" else None)
     monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
     log_path = tmp_path / "player.log"
 
