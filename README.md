@@ -100,7 +100,7 @@ By default, an episode is marked watched when the player exits successfully. Pla
 
 Playback resolves stream links through anidb.app first and falls back through hianime.at, megaplay.buzz, zokoanime.video, anizone.to and kaa.lt until one of them serves the episode. See [Playback providers](#playback-providers).
 
-In the GUI detail page, select an episode and click **Continue** to choose **Sub** or **Dub** and open ani-cli for that title and episode. Continue uses selected metadata to resolve the intended AllAnime show when it can do so confidently, then opens that show through ani-cli. If the metadata match is not confident enough, it falls back to the normal ani-cli title search. Dub launches use ani-cli's `--dub` option; if no dub is found for the selected episode, the GUI offers to search sub instead.
+In the GUI detail page, select an episode and click **Continue** to choose **Sub** or **Dub**. The episode plays in the app's own player window (see [Player window](#player-window)); **Sub in terminal** and **Dub in terminal** keep the classic flow, which opens ani-cli and its menu in a terminal. Continue uses selected metadata to resolve the intended AllAnime show when it can do so confidently, then opens that show through ani-cli. If the metadata match is not confident enough, it falls back to the normal ani-cli title search. Dub launches use ani-cli's `--dub` option; if no dub is found for the selected episode, the GUI offers to search sub instead.
 
 The anime detail page also includes a **Watch Party** menu. Hosting a watch party starts the selected episode, opens a host control window, and generates a share link. Guests can paste the link into **Watch Party > Join Watch Party** or run:
 
@@ -248,7 +248,7 @@ The GUI includes:
 - Episode checklist
 - Automatic released episode list refresh from AllAnime
 - Startup cleanup for duplicate watchlist rows that refer to the same anime
-- Continue selected episode through ani-cli
+- Continue selected episode in the built-in player window, or through ani-cli in a terminal
 - Notes editor
 - Metadata refresh
 - AniList match selection
@@ -259,6 +259,33 @@ Type in the top search box to fetch AniList title suggestions. Press Enter to sh
 Each discovery, search-result, and related-title card shows AniList's weighted community score as a gold star rating on a five-point scale, replacing the less useful score/trend statistics. The same rating appears on watchlist cards and anime detail pages; unrated titles are identified clearly. Existing AniList-linked entries have missing ratings filled in with a small batched request when the Watchlist or a detail page is first opened.
 
 Each discovery, search-result, and related-title card has a status menu for adding the anime directly to Watching, Completed, Dropped, On Hold, or Plan to Watch. When the title is already present, the menu shows its current status and can move it to another section without creating a duplicate. Clicking the card's cover, title, or metadata area opens the normal watchlist detail and episode view once that anime has been added; the status menu and AniList button remain independent actions.
+
+### Player window
+
+**Continue > Sub** and **Continue > Dub** play the episode inside the app, in the same kind of window a
+watch party uses: mpv draws into the window, and the controls below the video drive it.
+
+- **Prev** and **Next** step through the watchlist's episode list; **-10s** and **+10s** skip.
+- The middle button is **Pause**/**Play** while an episode plays, **Retry** after a failure, and
+  **Replay** once the episode has ended.
+- **Fullscreen**, F11 or a double-click on the video fills the screen; Escape leaves it. Space and the
+  arrow keys pause and skip while the window has focus, and mpv's own keys and on-screen controls work
+  inside the video.
+- The line under the title shows what ani-cli is doing (the provider it is trying, the one that served
+  the episode, or the reason it failed) instead of hiding it in a terminal.
+
+ani-cli still finds the stream and records progress through its usual hooks, so tracking is the same as
+in the terminal: moving to another episode or closing the window quits mpv normally, which counts as a
+finished viewing under the default `tracking.mark_watched_after_seconds = 0`. The detail page's
+checkmarks refresh as soon as an episode ends. Continue on another episode reuses the open window, a
+playing episode counts as activity for the **Still watching?** prompt, and quitting the app stops
+playback first. Closing the window while ani-cli is still looking for a stream ends ani-cli and
+everything it started.
+
+On Wayland the window pins mpv to X11 the way the watch party does. Set
+`ANI_WATCH_PLAYER_DISABLE_EMBED=1` to let mpv open a window of its own instead; the controls keep working
+through mpv's IPC socket. ani-cli's output for the last episode is kept in
+`~/.local/state/ani-watchlist/logs/player.log`.
 
 Use **Refresh Metadata** on the Watchlist page after a JSON/XML import to update AniList details and cover art for every entry. The refresh runs in the background, displays progress, and reports titles that could not be linked confidently so they can be handled with the detail page's match selector.
 

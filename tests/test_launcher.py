@@ -699,3 +699,48 @@ def test_configured_mpv_arguments_win_for_both_players(monkeypatch) -> None:
 
     launcher.launch_episode("One Piece", "1090", prefer_terminal=False)
     assert seen["mpv_extra"] == "--video-sync=display-resample --hwdec=auto"
+
+
+def test_build_ani_cli_command_can_play_until_the_player_exits() -> None:
+    command = launcher.build_ani_cli_command("Frieren", "5", "/bin/ani-cli", allanime_id="abc", exit_after_play=True)
+
+    # the player window follows the episode through ani-cli's own lifetime
+    assert command == ["/bin/ani-cli", "--exit-after-play", "--allanime-id", "abc", "--episode", "5", "Frieren"]
+
+
+def test_launch_episode_can_log_output_and_hand_back_the_process(monkeypatch, tmp_path) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeProcess:
+        pid = 4324
+
+    def fake_popen(command: list[str], *, start_new_session: bool, env: dict[str, str], stdout=None, stderr=None):
+        seen.update(command=command, env=env, stdout=stdout, stderr=stderr)
+        stdout.write(b"hianime.at Links Fetched\n")
+        return FakeProcess()
+
+    monkeypatch.delenv("ANI_WATCH_MPV_EXTRA_ARGS", raising=False)
+    monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+    monkeypatch.setattr(launcher.subprocess, "Popen", fake_popen)
+    log_path = tmp_path / "player.log"
+
+    result = launcher.launch_episode(
+        "Frieren",
+        "5",
+        prefer_terminal=False,
+        mpv_ipc_path="/tmp/player.sock",
+        mpv_wid=4242,
+        exit_after_play=True,
+        log_path=log_path,
+        extra_mpv_args="--no-terminal",
+    )
+
+    assert isinstance(result.process, FakeProcess)
+    assert "--exit-after-play" in result.command
+    assert seen["stderr"] == launcher.subprocess.STDOUT
+    # the parent's copy of the log handle is closed once ani-cli has its own
+    assert seen["stdout"].closed
+    assert log_path.read_bytes() == b"hianime.at Links Fetched\n"
+    env = seen["env"]
+    assert env["ANI_WATCH_MPV_WID"] == "4242"
+    assert env["ANI_WATCH_MPV_EXTRA_ARGS"] == f"{launcher.EMBEDDED_MPV_EXTRA_ARGS} --no-terminal"

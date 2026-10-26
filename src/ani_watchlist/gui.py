@@ -67,6 +67,7 @@ from .party import (
     party_ipc_path,
     start_host_session,
 )
+from .player_window import EpisodePlayer, PlayerShow
 from .providers.anilist import AniListProvider
 from .timefmt import local_time
 from .transfer import (
@@ -406,6 +407,7 @@ class WatchlistApp:
         self.party_fullscreen_observer_stop: threading.Event | None = None
         self.party_fullscreen_observer_thread: threading.Thread | None = None
         self.party_mpv_fullscreen_state: bool | None = None
+        self.player: EpisodePlayer | None = None
         self.card_widgets: dict[int, tk.Frame] = {}
         self.grid_columns = 1
         self.library_render_signature: tuple[object, ...] | None = None
@@ -1058,6 +1060,13 @@ class WatchlistApp:
         )
         continue_menu.add_command(label="Sub", command=lambda: self.continue_selected_episode("sub"))
         continue_menu.add_command(label="Dub", command=lambda: self.continue_selected_episode("dub"))
+        continue_menu.add_separator()
+        continue_menu.add_command(
+            label="Sub in terminal", command=lambda: self.continue_selected_episode("sub", in_terminal=True)
+        )
+        continue_menu.add_command(
+            label="Dub in terminal", command=lambda: self.continue_selected_episode("dub", in_terminal=True)
+        )
         continue_button.configure(menu=continue_menu)
         continue_button.grid(row=0, column=0, padx=(0, 8), pady=4, sticky="w")
         party_button = ttk.Menubutton(actions, text="Watch Party", style="Dark.TMenubutton")
@@ -1549,6 +1558,14 @@ class WatchlistApp:
             except Exception:
                 pass
         self.dismiss_idle_prompt()
+        player = getattr(self, "player", None)
+        if player is not None:
+            # quit mpv normally so ani-cli still records how far the episode got
+            self.player = None
+            try:
+                player.shutdown()
+            except Exception:
+                pass
         self.party_join_polling = False
         self.stop_party_fullscreen_observer()
         self.stop_party_playback()
@@ -1617,7 +1634,7 @@ class WatchlistApp:
                 self.refresh_library(preserve_scroll=True)
             elif self.current_page == "detail":
                 focused = self.safe_focus_get()
-                if focused is not self.notes and self.party_playback_controller is None:
+                if focused is not self.notes and self.party_playback_controller is None and not self.player_is_playing():
                     self.load_detail()
                 self.refresh_activity()
         finally:
@@ -3178,7 +3195,7 @@ class WatchlistApp:
         self.last_label.configure(text=f"Last watched: {local_time(anime['last_watched_at'])}")
         self.anilist_label.configure(text=f"AniList ID: {anime['anilist_id'] or '-'}")
         if not self.launch_label.cget("text"):
-            self.launch_label.configure(text="Select an episode, then Continue to open ani-cli.")
+            self.launch_label.configure(text="Select an episode, then Continue to play it.")
         if self.safe_focus_get() is not self.notes:
             self.notes.delete("1.0", tk.END)
             self.notes.insert("1.0", anime["notes"] or "")
@@ -3294,7 +3311,7 @@ class WatchlistApp:
         mark_episode(self.conn, self.selected_anime_id, episode, not bool(current["watched"]))
         self.load_detail()
 
-    def continue_selected_episode(self, mode: str = "sub") -> None:
+    def continue_selected_episode(self, mode: str = "sub", *, in_terminal: bool = False) -> None:
         if self.selected_anime_id is None:
             return
         anime = get_anime_by_id(self.conn, self.selected_anime_id)
@@ -3373,8 +3390,25 @@ class WatchlistApp:
                         return
                     launch_mode = "sub"
                     target = resolve_target(launch_mode)
+        launch_title = target.title if target is not None else title
+        mode_label = "dub" if launch_mode == "dub" else "sub"
+        if not in_terminal:
+            self.open_player(
+                PlayerShow(
+                    anime_id=int(anime["id"]),
+                    title=title_for_message,
+                    launch_title=launch_title,
+                    mode=launch_mode,
+                    allanime_id=target.show_id if target is not None else None,
+                ),
+                episode,
+            )
+            self.launch_label.configure(
+                text=f"Playing {title_for_message} episode {episode} ({mode_label}) in the player window.",
+                fg=COLORS["muted"],
+            )
+            return
         try:
-            launch_title = target.title if target is not None else title
             result = launch_episode(
                 launch_title,
                 episode,
@@ -3386,11 +3420,53 @@ class WatchlistApp:
             messagebox.showwarning("ani-cli launch failed", str(exc))
             return
         target = "terminal" if result.used_terminal else "background process"
-        mode_label = "dub" if launch_mode == "dub" else "sub"
         self.launch_label.configure(
             text=f"Opened {title_for_message} episode {episode} ({mode_label}) in {target}.",
             fg=COLORS["muted"],
         )
+
+    def open_player(self, show: PlayerShow, episode: str) -> None:
+        """Play an episode in the app's own player window, reusing one that is already open."""
+        player = self.player
+        if player is not None and not player.closed:
+            player.load(show, episode)
+            return
+        player = EpisodePlayer(
+            self.root,
+            show,
+            colors=COLORS,
+            log_dir=get_paths().log_dir,
+            run_on_ui=self.run_on_ui,
+            episodes_for=self.player_episode_keys,
+            on_episode_end=self.player_episode_ended,
+            on_activity=self.note_playback_activity,
+            on_close=self.player_closed,
+        )
+        self.player = player
+        player.raise_window()
+        player.play(episode)
+
+    def player_episode_keys(self, anime_id: int) -> list[str]:
+        return [str(row["episode_key"]) for row in episodes_for_anime(self.conn, anime_id)]
+
+    def player_episode_ended(self, anime_id: int) -> None:
+        # ani-cli has recorded the episode by the time it exits, so the checkmarks can catch up
+        if self.shutting_down:
+            return
+        if self.current_page == "detail" and self.selected_anime_id == anime_id:
+            self.load_detail()
+
+    def player_closed(self, player: EpisodePlayer) -> None:
+        if self.player is player:
+            self.player = None
+
+    def player_is_playing(self) -> bool:
+        player = getattr(self, "player", None)
+        return player is not None and not player.closed and player.state in ("loading", "playing", "paused")
+
+    def note_playback_activity(self) -> None:
+        # watching never touches the app's own windows, so a playing episode keeps the idle prompt away
+        self.last_user_activity_ms = monotonic_ms()
 
     def detail_party_episode_key(self) -> str | None:
         if self.selected_anime_id is None:

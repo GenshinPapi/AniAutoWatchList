@@ -7,7 +7,7 @@ import subprocess
 import re
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -63,6 +63,8 @@ class LaunchResult:
     command: list[str]
     pid: int
     used_terminal: bool
+    # kept so a caller that owns the playback, like the player window, can follow it to the end
+    process: subprocess.Popen | None = field(default=None, compare=False, repr=False)
 
 
 @dataclass(frozen=True)
@@ -206,6 +208,7 @@ def build_ani_cli_command(
     mode: str = "sub",
     allanime_id: str | None = None,
     detach_player: bool = False,
+    exit_after_play: bool = False,
 ) -> list[str]:
     cleaned_title = title.strip()
     cleaned_episode = str(episode).strip()
@@ -216,7 +219,10 @@ def build_ani_cli_command(
     if not cleaned_episode:
         raise LaunchError("episode is empty")
     command = [ani_cli or resolve_ani_cli()]
-    if not detach_player:
+    if exit_after_play:
+        # plays in the foreground and ends with the player's exit code
+        command.append("--exit-after-play")
+    elif not detach_player:
         command.append("--no-detach")
     if cleaned_allanime_id:
         command.extend(["--allanime-id", cleaned_allanime_id])
@@ -740,6 +746,9 @@ def launch_episode(
     mpv_wid: int | str | None = None,
     detach_player: bool = False,
     quiet: bool = False,
+    exit_after_play: bool = False,
+    log_path: str | Path | None = None,
+    extra_mpv_args: str | None = None,
 ) -> LaunchResult:
     command = build_ani_cli_command(
         title,
@@ -747,6 +756,7 @@ def launch_episode(
         mode=mode,
         allanime_id=allanime_id,
         detach_player=detach_player,
+        exit_after_play=exit_after_play,
     )
     used_terminal = False
     if prefer_terminal:
@@ -760,6 +770,8 @@ def launch_episode(
         mpv_extra_args = with_mpv_embed_args(mpv_extra_args)
     else:
         mpv_extra_args = DEFAULT_MPV_EXTRA_ARGS if configured_extra_args is None else configured_extra_args
+    if extra_mpv_args:
+        mpv_extra_args = f"{mpv_extra_args} {extra_mpv_args}".strip()
     if mpv_ipc_path or mpv_wid or mpv_extra_args:
         env = os.environ.copy()
         if mpv_ipc_path:
@@ -768,13 +780,22 @@ def launch_episode(
             env["ANI_WATCH_MPV_WID"] = str(mpv_wid)
         if mpv_extra_args:
             env["ANI_WATCH_MPV_EXTRA_ARGS"] = mpv_extra_args
+    log_handle = None
     try:
         stdout = subprocess.DEVNULL if quiet else None
         stderr = subprocess.DEVNULL if quiet else None
+        if log_path is not None:
+            # ani-cli's progress and failure messages, for a caller that shows them itself
+            log_handle = open(log_path, "wb")
+            stdout = log_handle
+            stderr = subprocess.STDOUT
         if env is None:
             process = subprocess.Popen(command, start_new_session=True, stdout=stdout, stderr=stderr)
         else:
             process = subprocess.Popen(command, start_new_session=True, env=env, stdout=stdout, stderr=stderr)
     except OSError as exc:
         raise LaunchError(str(exc)) from exc
-    return LaunchResult(command=command, pid=process.pid, used_terminal=used_terminal)
+    finally:
+        if log_handle is not None:
+            log_handle.close()
+    return LaunchResult(command=command, pid=process.pid, used_terminal=used_terminal, process=process)
