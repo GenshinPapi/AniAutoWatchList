@@ -236,7 +236,7 @@ The GUI includes:
 - Genre/tag filter for Most Popular
 - Discovery tabs load 100 titles at a time and fetch the next batch as you page forward
 - Long card titles can be scrolled inside the fixed-size cards
-- 7-day release schedule tab
+- 7-day release schedule tab, optionally limited to the shows on your watchlist
 - Status tabs
 - Cover grid
 - Search/filter box
@@ -259,6 +259,12 @@ Type in the top search box to fetch AniList title suggestions. Press Enter to sh
 Each discovery, search-result, and related-title card shows AniList's weighted community score as a gold star rating on a five-point scale, replacing the less useful score/trend statistics. The same rating appears on watchlist cards and anime detail pages; unrated titles are identified clearly. Existing AniList-linked entries have missing ratings filled in with a small batched request when the Watchlist or a detail page is first opened.
 
 Each discovery, search-result, and related-title card has a status menu for adding the anime directly to Watching, Completed, Dropped, On Hold, or Plan to Watch. When the title is already present, the menu shows its current status and can move it to another section without creating a duplicate. Clicking the card's cover, title, or metadata area opens the normal watchlist detail and episode view once that anime has been added; the status menu and AniList button remain independent actions.
+
+The **Schedule** tab lists the coming week's episodes for every airing show AniList tracks. Tick **Only my
+watchlist** in its header to show just the shows on your watchlist, under any status, so the week is not
+crowded with titles you do not follow. Shows are recognised by their AniList link, or by title for an entry
+that has never been linked. The choice is remembered between launches as `schedule.watchlist_only` in
+`config.toml`.
 
 ### Player window
 

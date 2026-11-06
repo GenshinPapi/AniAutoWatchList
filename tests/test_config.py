@@ -18,3 +18,15 @@ def test_cloud_config_can_enable_auto_backup_without_losing_existing_sections(ap
     assert config.cloud.google_drive_auto_backup is True
     assert config.metadata.search_on_new_title is False
     assert config.anilist.enabled is False
+
+
+def test_schedule_watchlist_filter_is_off_until_turned_on(app_env) -> None:
+    assert load_config().schedule.watchlist_only is False
+
+    set_config_value("schedule.watchlist_only", "true")
+    config = load_config()
+
+    assert config.schedule.watchlist_only is True
+    # the rewrite keeps the sections that were already there
+    assert config.metadata.search_on_new_title is False
+    assert config.anilist.enabled is False

@@ -202,3 +202,20 @@ def test_close_app_stops_the_player_before_the_database_closes(monkeypatch) -> N
 
     assert events == ["backed up", "player stopped", "database closed", "root quit", "root destroyed"]
     assert app.player is None
+
+
+def test_schedule_watchlist_toggle_is_remembered_and_redraws_the_week(app_env) -> None:
+    from ani_watchlist.config import load_config
+
+    app = object.__new__(WatchlistApp)
+    choice = SimpleNamespace(value=True)
+    app.schedule_watchlist_only = SimpleNamespace(get=lambda: choice.value)
+    renders: list[bool] = []
+    app.render_schedule = lambda: renders.append(choice.value)
+
+    app.toggle_schedule_watchlist_only()
+    assert load_config().schedule.watchlist_only is True
+    choice.value = False
+    app.toggle_schedule_watchlist_only()
+    assert load_config().schedule.watchlist_only is False
+    assert renders == [True, False]

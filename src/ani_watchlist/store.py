@@ -179,6 +179,22 @@ def get_anime_by_anilist_id(conn: sqlite3.Connection, anilist_id: str | int | No
     return conn.execute("SELECT * FROM anime WHERE anilist_id = ? ORDER BY id LIMIT 1", (media_id,)).fetchone()
 
 
+def watchlist_anilist_ids(conn: sqlite3.Connection) -> set[int]:
+    return {int(row[0]) for row in conn.execute("SELECT anilist_id FROM anime WHERE anilist_id IS NOT NULL")}
+
+
+def unlinked_anime_title_keys(conn: sqlite3.Connection) -> set[str]:
+    """Title match keys of the entries never linked to AniList, which can only be recognised by name."""
+    keys: set[str] = set()
+    for row in conn.execute("SELECT display_title, source_title, canonical_title FROM anime WHERE anilist_id IS NULL"):
+        keys |= _anime_title_match_keys(row)
+    return keys
+
+
+def title_match_keys(*titles: object) -> set[str]:
+    return _title_match_keys(*titles)
+
+
 def get_or_create_anime(
     conn: sqlite3.Connection,
     title: str,

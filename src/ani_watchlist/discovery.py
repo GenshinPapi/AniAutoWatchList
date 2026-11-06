@@ -8,7 +8,7 @@ from typing import Any
 
 from .config import AppConfig, load_config
 from .providers.anilist import AniListProvider, display_title_from_media
-from .store import now_iso
+from .store import now_iso, title_match_keys, unlinked_anime_title_keys, watchlist_anilist_ids
 
 
 TRENDING_CACHE_KEY = "anilist_trending_v3"
@@ -246,6 +246,25 @@ def _normalize_schedule_item(item: dict[str, Any], provider: AniListProvider | N
         "local_time": local_time,
         "media": normalized_media,
     }
+
+
+def schedule_items_in_watchlist(conn: sqlite3.Connection, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The releases of shows on the watchlist, whatever their status there."""
+    linked_ids = watchlist_anilist_ids(conn)
+    # only entries never linked to AniList are matched by name: a linked entry with another id is a
+    # different show, such as an earlier season with the same name
+    unlinked_keys = unlinked_anime_title_keys(conn)
+    kept = []
+    for item in items:
+        media = item.get("media") if isinstance(item.get("media"), dict) else {}
+        media_id = str(item.get("media_id") or media.get("id") or "")
+        if media_id.isdigit() and int(media_id) in linked_ids:
+            kept.append(item)
+        elif unlinked_keys and unlinked_keys & title_match_keys(
+            media.get("display_title"), media.get("english_title"), media.get("romaji_title")
+        ):
+            kept.append(item)
+    return kept
 
 
 def cache_row(conn: sqlite3.Connection, cache_key: str) -> sqlite3.Row | None:

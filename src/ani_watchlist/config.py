@@ -33,6 +33,9 @@ temporary_block_cooldown_seconds = 600
 [cloud]
 google_drive_auto_backup = false
 google_drive_timeout_seconds = 20
+
+[schedule]
+watchlist_only = false
 """
 
 
@@ -63,11 +66,17 @@ class CloudConfig:
 
 
 @dataclass(frozen=True)
+class ScheduleConfig:
+    watchlist_only: bool = False
+
+
+@dataclass(frozen=True)
 class AppConfig:
     tracking: TrackingConfig = TrackingConfig()
     metadata: MetadataConfig = MetadataConfig()
     anilist: AniListConfig = AniListConfig()
     cloud: CloudConfig = CloudConfig()
+    schedule: ScheduleConfig = ScheduleConfig()
 
 
 def ensure_config(path: Path | None = None) -> Path:
@@ -93,6 +102,7 @@ def load_config(path: Path | None = None) -> AppConfig:
     metadata = raw.get("metadata", {})
     anilist = raw.get("anilist", {})
     cloud = raw.get("cloud", {})
+    schedule = raw.get("schedule", {})
     return AppConfig(
         tracking=TrackingConfig(
             mark_watched_after_seconds=int(tracking.get("mark_watched_after_seconds", 0)),
@@ -113,6 +123,9 @@ def load_config(path: Path | None = None) -> AppConfig:
         cloud=CloudConfig(
             google_drive_auto_backup=bool(cloud.get("google_drive_auto_backup", False)),
             google_drive_timeout_seconds=max(5, int(cloud.get("google_drive_timeout_seconds", 20))),
+        ),
+        schedule=ScheduleConfig(
+            watchlist_only=bool(schedule.get("watchlist_only", False)),
         ),
     )
 
@@ -153,7 +166,7 @@ def _format_toml_value(value: Any) -> str:
 def write_raw_config(raw: dict[str, Any], path: Path | None = None) -> Path:
     cfg_path = ensure_config(path)
     lines: list[str] = []
-    for section in ("tracking", "metadata", "anilist", "cloud"):
+    for section in ("tracking", "metadata", "anilist", "cloud", "schedule"):
         values = raw.get(section, {})
         if not isinstance(values, dict):
             continue

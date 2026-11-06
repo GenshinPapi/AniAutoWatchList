@@ -39,6 +39,7 @@ from .discovery import (
     refresh_discovery,
     refresh_popular,
     related_media,
+    schedule_items_in_watchlist,
     search_media,
 )
 from .launcher import (
@@ -947,11 +948,25 @@ class WatchlistApp:
         header.grid(row=0, column=0, sticky="ew", padx=18, pady=(16, 8))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Release Schedule", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        self.schedule_watchlist_only = tk.BooleanVar(value=load_config().schedule.watchlist_only)
+        tk.Checkbutton(
+            header,
+            text="Only my watchlist",
+            variable=self.schedule_watchlist_only,
+            command=self.toggle_schedule_watchlist_only,
+            bg=COLORS["bg"],
+            fg=COLORS["text"],
+            activebackground=COLORS["bg"],
+            activeforeground=COLORS["text"],
+            selectcolor=COLORS["entry"],
+            relief="flat",
+            cursor="hand2",
+        ).grid(row=0, column=1, padx=(8, 0), sticky="e")
         ttk.Button(header, text="Refresh", style="Dark.TButton", command=lambda: self.start_discovery_refresh(force=True)).grid(
-            row=0, column=1, padx=(8, 0), sticky="e"
+            row=0, column=2, padx=(8, 0), sticky="e"
         )
         self.schedule_status_label = tk.Label(header, text="", bg=COLORS["bg"], fg=COLORS["muted"], anchor="e")
-        self.schedule_status_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.schedule_status_label.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
         body = tk.Frame(page, bg=COLORS["bg"])
         body.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 16))
@@ -2911,6 +2926,8 @@ class WatchlistApp:
         for child in self.schedule_frame.winfo_children():
             child.destroy()
         items = list(((self.discovery_data.get("schedule") or {}).get("items")) or [])
+        if self.schedule_watchlist_only.get():
+            items = schedule_items_in_watchlist(self.conn, items)
         grouped: dict[str, list[dict[str, object]]] = {}
         for item in items:
             grouped.setdefault(str(item.get("local_day") or "-"), []).append(item)
@@ -2941,6 +2958,15 @@ class WatchlistApp:
             for row_idx, item in enumerate(entries, start=1):
                 self.create_schedule_row(panel, item).grid(row=row_idx, column=0, sticky="ew", padx=8, pady=(4, 6))
         self._update_schedule_scroll_region()
+
+    def toggle_schedule_watchlist_only(self) -> None:
+        enabled = bool(self.schedule_watchlist_only.get())
+        try:
+            set_config_value("schedule.watchlist_only", "true" if enabled else "false")
+        except (OSError, ValueError, KeyError):
+            # the filter still applies for this session when the config file cannot be written
+            pass
+        self.render_schedule()
 
     def create_schedule_row(self, parent: tk.Frame, item: dict[str, object]) -> tk.Frame:
         media = item.get("media") if isinstance(item.get("media"), dict) else {}

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from ani_watchlist.discovery import (
     MEDIA_LIST_BATCH_LIMIT,
     POPULAR_CACHE_KEY,
@@ -20,9 +22,12 @@ from ani_watchlist.discovery import (
     search_media,
     refresh_top_airing,
     refresh_trending,
+    schedule_items_in_watchlist,
 )
+from ani_watchlist import discovery
 from ani_watchlist.config import AniListConfig, AppConfig
 from ani_watchlist.db import initialize
+from ani_watchlist.store import get_or_create_anime, update_anime_fields
 from ani_watchlist.providers.anilist import AniListProvider
 
 
@@ -268,3 +273,39 @@ def test_append_discovery_media_page_extends_existing_cache(app_env) -> None:
     assert len(second["items"]) == MEDIA_LIST_BATCH_LIMIT * 2
     assert second["items"][MEDIA_LIST_BATCH_LIMIT]["id"] == 71
     assert second["next_page"] == 3
+
+
+def schedule_item(media_id: int, title: str) -> dict[str, object]:
+    return {"media_id": media_id, "episode": 4, "local_day": "2026-11-06", "media": {"id": media_id, "display_title": title}}
+
+
+def test_schedule_watchlist_filter_keeps_only_shows_on_the_watchlist(app_env) -> None:
+    conn = initialize()
+    frieren, _ = get_or_create_anime(conn, "Frieren", status="plan_to_watch")
+    update_anime_fields(conn, frieren["id"], anilist_id=154587)
+    season_one, _ = get_or_create_anime(conn, "Overgeared", status="completed")
+    update_anime_fields(conn, season_one["id"], anilist_id=111)
+    get_or_create_anime(conn, "Dandadan")  # never linked to AniList
+    items = [
+        schedule_item(154587, "Frieren: Beyond Journey's End"),
+        schedule_item(222, "Overgeared"),
+        schedule_item(333, "Dandadan"),
+        schedule_item(444, "One Piece"),
+    ]
+
+    kept = schedule_items_in_watchlist(conn, items)
+
+    # Frieren by its AniList id whatever its status, Dandadan by title because it was never linked;
+    # the other "Overgeared" is a different show from the linked one, and One Piece is not on the list
+    assert [item["media_id"] for item in kept] == [154587, 333]
+
+
+def test_schedule_watchlist_filter_needs_no_title_lookups_when_every_entry_is_linked(app_env, monkeypatch) -> None:
+    conn = initialize()
+    frieren, _ = get_or_create_anime(conn, "Frieren")
+    update_anime_fields(conn, frieren["id"], anilist_id=154587)
+    monkeypatch.setattr(discovery, "title_match_keys", lambda *_args: pytest.fail("no title lookup expected"))
+
+    kept = schedule_items_in_watchlist(conn, [schedule_item(154587, "Frieren"), schedule_item(9, "Another Show")])
+
+    assert [item["media_id"] for item in kept] == [154587]
