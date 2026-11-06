@@ -28,9 +28,9 @@ COLORS = {"bg": "#101114", "text": "#f1f3f6", "muted": "#a9b0bb", "border": "#2d
 # graphics libraries add once mpv starts
 ANI_CLI_OUTPUT = (
     "\x1b[2K\r\x1b[1;34mChecking dependencies...\x1b[0m\n"
-    "\x1b[A\x1b[K\x1b7\x1b[2K\r\x1b[1;33manidb.app playback failed: anidb.app did not return a matching anime."
-    " Trying hianime.at...\x1b[0m\n"
-    "\x1b[1;32mhianime.at\x1b[0m Links Fetched\n"
+    "\x1b[A\x1b[K\x1b7\x1b[2K\r\x1b[1;33mhianime.at playback failed: hianime.at did not return a matching anime."
+    " Trying megaplay.buzz...\x1b[0m\n"
+    "\x1b[1;32mmegaplay.buzz\x1b[0m Links Fetched\n"
     "libEGL warning: DRI3 error: Could not get DRI3 device\n"
     "Failed to open VDPAU backend libvdpau_nvidia.so: cannot open shared object file: No such file or directory\n"
 )
@@ -50,13 +50,13 @@ def test_format_playback_clock_reads_like_a_player() -> None:
 
 
 def test_status_line_skips_escape_codes_and_library_noise() -> None:
-    assert ani_cli_status_line(ANI_CLI_OUTPUT) == "hianime.at Links Fetched"
+    assert ani_cli_status_line(ANI_CLI_OUTPUT) == "megaplay.buzz Links Fetched"
     assert ani_cli_status_line(NOT_RELEASED) == "Episode not released!"
     assert ani_cli_status_line("\x1b[2K\r\x1b[1;34mChecking dependencies...\x1b[0m\n/usr/bin/dmenu\n") is None
 
 
 def test_provider_comes_from_the_links_fetched_line() -> None:
-    assert ani_cli_provider(ANI_CLI_OUTPUT) == "hianime.at"
+    assert ani_cli_provider(ANI_CLI_OUTPUT) == "megaplay.buzz"
     assert ani_cli_provider(NOT_RELEASED) is None
 
 
@@ -278,7 +278,7 @@ class Rig:
 
 def test_play_runs_ani_cli_until_the_episode_ends_and_shows_progress(tmp_path, monkeypatch) -> None:
     rig = Rig(tmp_path, monkeypatch)
-    rig.next_output = "\x1b[2K\r\x1b[1;33manidb.app playback failed: down. Trying hianime.at...\x1b[0m\n"
+    rig.next_output = "\x1b[2K\r\x1b[1;33mhianime.at playback failed: down. Trying megaplay.buzz...\x1b[0m\n"
     rig.player.play("2")
 
     assert rig.player.status_label.cget("text") == "Finding a stream for episode 2..."
@@ -290,7 +290,7 @@ def test_play_runs_ani_cli_until_the_episode_ends_and_shows_progress(tmp_path, m
     assert Path(call["log_path"]).name == "player.log"
     assert str(call["mpv_ipc_path"]).endswith(".sock")
     # ani-cli's failover messages show while it is still looking for a stream
-    assert rig.pump(lambda: "Trying hianime.at" in str(rig.player.status_label.cget("text")))
+    assert rig.pump(lambda: "Trying megaplay.buzz" in str(rig.player.status_label.cget("text")))
     assert rig.player.episode_label.cget("text") == "Episode 2 · Sub"
 
 
@@ -313,7 +313,7 @@ def test_the_controls_drive_mpv_and_a_finished_episode_offers_replay(tmp_path, m
     rig.player.play("2")
     mpv = rig.start_mpv()
 
-    assert rig.player.status_label.cget("text") == "Playing episode 2 from hianime.at."
+    assert rig.player.status_label.cget("text") == "Playing episode 2 from megaplay.buzz."
     assert rig.player.time_label.cget("text") == "00:12 / 23:40"
     assert rig.player.play_button.cget("text") == "Pause"
     assert rig.activity > 0

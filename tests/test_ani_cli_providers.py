@@ -69,13 +69,13 @@ def playback_provider_order() -> list[str]:
     return line.split("=", 1)[1].strip().strip('"').split()
 
 
-def test_playback_tries_anidb_before_hianime() -> None:
+def test_playback_tries_hianime_first() -> None:
     source = ani_cli_source()
-    # the original two providers keep the front of the failover chain, in their original order
-    assert playback_provider_order()[:2] == ["anidb", "hianime"]
+    assert playback_provider_order()[0] == "hianime"
     body = source.split("get_episode_url() {", 1)[1].split("\n}\n", 1)[0]
     assert '"${_playback_provider}_select_episode_url"' in body
-    assert 'anidb_enabled="${ANI_CLI_ANIDB:-1}"' in source
+    # anidb.app shut down for good, so it is gone from the chain rather than switched off
+    assert "anidb" not in source
     assert 'hianime_enabled="${ANI_CLI_HIANIME:-1}"' in source
     assert 'hianime_base="${ANI_CLI_HIANIME_BASE:-https://hianime.at}"' in source
 
@@ -409,9 +409,9 @@ ep_list='1
 2'
 ep_no=2
 quality=best
-playback_providers='anidb hianime'
-anidb_enabled=1
+playback_providers='hianime megaplay'
 hianime_enabled=1
+megaplay_enabled=1
 playback_check_enabled=1
 """
 
@@ -426,14 +426,14 @@ def test_failover_moves_to_the_next_provider_and_explains_why(ani_cli_functions:
     result = run_failover(
         ani_cli_functions,
         """
-anidb_select_episode_url() { anidb_last_error="anidb.app is down for maintenance"; return 1; }
-hianime_select_episode_url() { episode="https://cdn.example/720.m3u8"; m3u8_refr="https://embed.example/"; subtitle="https://cdn.example/en.vtt"; return 0; }
+hianime_select_episode_url() { hianime_last_error="hianime.at did not return a matching anime"; return 1; }
+megaplay_select_episode_url() { episode="https://cdn.example/720.m3u8"; m3u8_refr="https://embed.example/"; subtitle="https://cdn.example/en.vtt"; return 0; }
 playback_stream_reachable() { playback_check_error=""; return 0; }
 """,
         "printf '%s|%s|%s' \"$episode\" \"$stream_referer\" \"$stream_subtitle\"",
     )
     assert result.returncode == 0, result.stderr
-    assert "anidb.app playback failed: anidb.app is down for maintenance. Trying hianime.at..." in result.stderr
+    assert "hianime.at playback failed: hianime.at did not return a matching anime. Trying megaplay.buzz..." in result.stderr
     assert result.stdout == "https://cdn.example/720.m3u8|https://embed.example/|https://cdn.example/en.vtt"
 
 
@@ -442,8 +442,8 @@ def test_failover_skips_a_provider_whose_stream_host_is_dead(ani_cli_functions: 
     result = run_failover(
         ani_cli_functions,
         """
-anidb_select_episode_url() { episode="https://dead.example/a.m3u8"; return 0; }
-hianime_select_episode_url() { episode="https://alive.example/b.m3u8"; return 0; }
+hianime_select_episode_url() { episode="https://dead.example/a.m3u8"; return 0; }
+megaplay_select_episode_url() { episode="https://alive.example/b.m3u8"; return 0; }
 playback_stream_reachable() {
     case "$episode" in *dead*) playback_check_error="the media host answered HTTP 403"; return 1 ;; esac
     playback_check_error=""
@@ -452,7 +452,7 @@ playback_stream_reachable() {
         "printf '%s' \"$episode\"",
     )
     assert result.returncode == 0, result.stderr
-    assert "anidb.app playback failed: the media host answered HTTP 403. Trying hianime.at..." in result.stderr
+    assert "hianime.at playback failed: the media host answered HTTP 403. Trying megaplay.buzz..." in result.stderr
     assert result.stdout == "https://alive.example/b.m3u8"
 
 
@@ -461,14 +461,14 @@ def test_failover_never_ends_worse_than_the_first_resolved_stream(ani_cli_functi
     result = run_failover(
         ani_cli_functions,
         """
-anidb_select_episode_url() { episode="https://first.example/a.m3u8"; refr_flag="--referrer=https://first.example/"; stream_player_flags="--cache-secs=120"; return 0; }
-hianime_select_episode_url() { episode="https://second.example/b.m3u8"; return 0; }
+hianime_select_episode_url() { episode="https://first.example/a.m3u8"; refr_flag="--referrer=https://first.example/"; stream_player_flags="--cache-secs=120"; return 0; }
+megaplay_select_episode_url() { episode="https://second.example/b.m3u8"; return 0; }
 playback_stream_reachable() { playback_check_error="the media host did not answer"; return 1; }
 """,
         "printf '%s|%s|%s' \"$episode\" \"$refr_flag\" \"$stream_player_flags\"",
     )
     assert result.returncode == 0, result.stderr
-    assert "playing the anidb.app stream anyway" in result.stderr
+    assert "playing the hianime.at stream anyway" in result.stderr
     assert result.stdout == "https://first.example/a.m3u8|--referrer=https://first.example/|--cache-secs=120"
 
 
@@ -477,14 +477,14 @@ def test_failover_names_every_provider_when_all_fail(ani_cli_functions: Path) ->
     result = run_failover(
         ani_cli_functions,
         """
-anidb_select_episode_url() { anidb_last_error="anidb.app is down for maintenance"; return 1; }
 hianime_select_episode_url() { hianime_last_error="hianime.at did not return a matching anime"; return 1; }
+megaplay_select_episode_url() { megaplay_last_error="megaplay.buzz does not have episode 2"; return 1; }
 """,
     )
     assert result.returncode == 1
     assert (
-        "Playback failed. anidb.app: anidb.app is down for maintenance. "
-        "hianime.at: hianime.at did not return a matching anime." in result.stderr
+        "Playback failed. hianime.at: hianime.at did not return a matching anime. "
+        "megaplay.buzz: megaplay.buzz does not have episode 2." in result.stderr
     )
 
 
@@ -493,15 +493,15 @@ def test_disabled_providers_are_skipped(ani_cli_functions: Path) -> None:
     result = run_failover(
         ani_cli_functions,
         """
-anidb_enabled=0
-anidb_select_episode_url() { printf 'anidb was called' >&2; return 1; }
-hianime_select_episode_url() { episode="https://alive.example/b.m3u8"; return 0; }
+hianime_enabled=0
+hianime_select_episode_url() { printf 'hianime was called' >&2; return 1; }
+megaplay_select_episode_url() { episode="https://alive.example/b.m3u8"; return 0; }
 playback_stream_reachable() { playback_check_error=""; return 0; }
 """,
         "printf '%s' \"$episode\"",
     )
     assert result.returncode == 0, result.stderr
-    assert "anidb was called" not in result.stderr
+    assert "hianime was called" not in result.stderr
     assert result.stdout == "https://alive.example/b.m3u8"
 
 
@@ -510,8 +510,8 @@ def test_change_quality_keeps_the_providers_referer_and_subtitles(ani_cli_functi
     result = run_failover(
         ani_cli_functions,
         """
-anidb_select_episode_url() { anidb_last_error="down"; return 1; }
-hianime_select_episode_url() {
+hianime_select_episode_url() { hianime_last_error="down"; return 1; }
+megaplay_select_episode_url() {
     links='1080p >https://cdn.example/1080.m3u8
 720p >https://cdn.example/720.m3u8'
     select_quality best
@@ -546,8 +546,8 @@ def megaplay_encrypt(payload: dict[str, object], key: str = MEGAPLAY_KEY, iv: st
     return base64.urlsafe_b64encode(blob).decode().rstrip("=")
 
 
-def test_playback_failover_order_keeps_existing_providers_first() -> None:
-    assert playback_provider_order() == ["anidb", "hianime", "megaplay", "zokoanime", "anizone", "kickassanime"]
+def test_playback_failover_order_puts_hianime_first() -> None:
+    assert playback_provider_order() == ["hianime", "megaplay", "zokoanime", "anizone", "kickassanime"]
     source = ani_cli_source()
     for variable in ("ANI_CLI_MEGAPLAY", "ANI_CLI_ZOKOANIME", "ANI_CLI_ANIZONE", "ANI_CLI_KICKASSANIME"):
         assert f'"${{{variable}:-1}}"' in source
@@ -780,13 +780,13 @@ def test_failover_tries_the_providers_other_qualities_before_moving_on(ani_cli_f
     result = run_failover(
         ani_cli_functions,
         """
-anidb_select_episode_url() {
+hianime_select_episode_url() {
     links='1080p >https://dead-host.example/1080.m3u8
 720p >https://live-host.example/720.m3u8'
     episode="https://dead-host.example/1080.m3u8"
     return 0
 }
-hianime_select_episode_url() { printf 'hianime was called' >&2; return 1; }
+megaplay_select_episode_url() { printf 'megaplay was called' >&2; return 1; }
 playback_stream_reachable() {
     case "$episode" in *dead-host*) playback_check_error="the media host did not answer"; return 1 ;; esac
     playback_check_error=""
@@ -796,7 +796,7 @@ playback_stream_reachable() {
     )
     assert result.returncode == 0, result.stderr
     assert "The 1080p stream did not answer (the media host did not answer), playing 720p instead." in result.stderr
-    assert "hianime was called" not in result.stderr
+    assert "megaplay was called" not in result.stderr
     assert result.stdout == "https://live-host.example/720.m3u8"
 
 
@@ -1306,8 +1306,8 @@ def test_failover_attaches_the_separate_audio_of_a_providers_master(ani_cli_func
     result = adoption_run(
         ani_cli_functions,
         f"""
-anidb_select_episode_url() {{ anidb_last_error="down"; return 1; }}
-hianime_select_episode_url() {{
+hianime_select_episode_url() {{ hianime_last_error="down"; return 1; }}
+megaplay_select_episode_url() {{
     links="$(hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{SPLIT_AUDIO_SUB_MASTER}')"
     hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{SPLIT_AUDIO_SUB_MASTER}' >/dev/null
     select_quality best
@@ -1324,8 +1324,8 @@ def test_failover_keeps_a_providers_own_audio_choice(ani_cli_functions: Path) ->
     result = adoption_run(
         ani_cli_functions,
         f"""
-anidb_select_episode_url() {{ anidb_last_error="down"; return 1; }}
-hianime_select_episode_url() {{
+hianime_select_episode_url() {{ hianime_last_error="down"; return 1; }}
+megaplay_select_episode_url() {{
     hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{SPLIT_AUDIO_SUB_MASTER}' >/dev/null
     episode="{SPLIT_BASE}/1080/index.m3u8"
     stream_audio_url="https://own.example/chosen.m3u8"
@@ -1343,12 +1343,12 @@ def test_failover_does_not_carry_a_failed_providers_audio_to_the_next(ani_cli_fu
     result = adoption_run(
         ani_cli_functions,
         f"""
-anidb_select_episode_url() {{
+hianime_select_episode_url() {{
     hls_playlist_links '{SPLIT_BASE}/master.m3u8' '{SPLIT_AUDIO_SUB_MASTER}' >/dev/null
-    anidb_last_error="no playable quality"
+    hianime_last_error="no playable quality"
     return 1
 }}
-hianime_select_episode_url() {{
+megaplay_select_episode_url() {{
     links="$(hls_playlist_links 'https://muxed.example/master.m3u8' '{MUXED_MASTER}')"
     hls_playlist_links 'https://muxed.example/master.m3u8' '{MUXED_MASTER}' >/dev/null
     select_quality best

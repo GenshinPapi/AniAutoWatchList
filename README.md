@@ -6,7 +6,7 @@ It keeps ani-cli's normal playback path intact. The patched ani-cli script only 
 
 ## Safety
 
-This project does not bypass DRM, paywalls, or login systems, and does not use EverythingMoe or link-list sites as playback resolvers. Playback resolves against the same class of public source ani-cli already targets: anidb.app first, then hianime.at, then megaplay.buzz, zokoanime.video, anizone.to and kaa.lt as further fallbacks. AniList is used only for metadata and cover art.
+This project does not bypass DRM, paywalls, or login systems, and does not use EverythingMoe or link-list sites as playback resolvers. Playback resolves against the same class of public source ani-cli already targets: hianime.at first, then megaplay.buzz, zokoanime.video, anizone.to and kaa.lt as fallbacks. AniList is used only for metadata and cover art.
 
 ## Features
 
@@ -17,7 +17,7 @@ This project does not bypass DRM, paywalls, or login systems, and does not use E
 - Status tabs: Watching, Completed, Dropped, On Hold, Plan to Watch
 - Episode watched/unwatched tracking
 - Continue button in the GUI for launching a selected episode through ani-cli
-- Automatic playback failover across anidb.app, hianime.at, megaplay.buzz, zokoanime.video, anizone.to and kaa.lt, so one provider or video host going down does not stop playback
+- Automatic playback failover across hianime.at, megaplay.buzz, zokoanime.video, anizone.to and kaa.lt, so one provider or video host going down does not stop playback
 - Automatic repair of image-wrapped HLS segments that mpv, VLC, and ffmpeg otherwise refuse to play
 - Automatic pairing of separate HLS audio tracks with the chosen video quality, so releases that ship their audio apart from the video do not play silent
 - Startup update check against the GitHub `main` branch
@@ -98,7 +98,7 @@ The GUI does not need to be open for tracking to work.
 
 By default, an episode is marked watched when the player exits successfully. Playback failures are recorded but do not mark episodes watched.
 
-Playback resolves stream links through anidb.app first and falls back through hianime.at, megaplay.buzz, zokoanime.video, anizone.to and kaa.lt until one of them serves the episode. See [Playback providers](#playback-providers).
+Playback resolves stream links through hianime.at first and falls back through megaplay.buzz, zokoanime.video, anizone.to and kaa.lt until one of them serves the episode. See [Playback providers](#playback-providers).
 
 In the GUI detail page, select an episode and click **Continue** to choose **Sub** or **Dub**. The episode plays in the app's own player window (see [Player window](#player-window)); **Sub in terminal** and **Dub in terminal** keep the classic flow, which opens ani-cli and its menu in a terminal. Continue uses selected metadata to resolve the intended AllAnime show when it can do so confidently, then opens that show through ani-cli. If the metadata match is not confident enough, it falls back to the normal ani-cli title search. Dub launches use ani-cli's `--dub` option; if no dub is found for the selected episode, the GUI offers to search sub instead.
 
@@ -353,24 +353,24 @@ stream links for an already selected title and episode are resolved by a playbac
 
 They are tried in this order, and the first one that serves the episode plays it:
 
-1. **anidb.app** — the primary provider, unchanged.
-2. **hianime.at** — the original fallback, unchanged.
-3. **megaplay.buzz** — the player behind hianime's Vidstream-2 server, reached directly by MAL or AniList id.
-4. **zokoanime.video** — the player behind hianime's HD-1 server, reached directly by MAL id.
-5. **anizone.to** — an independent site with its own releases and video CDN.
-6. **kaa.lt** (KickAssAnime) — a second independent site, streaming from krussdomi.com's CDN.
+1. **hianime.at** — the primary provider.
+2. **megaplay.buzz** — the player behind hianime's Vidstream-2 server, reached directly by MAL or AniList id.
+3. **zokoanime.video** — the player behind hianime's HD-1 server, reached directly by MAL id.
+4. **anizone.to** — an independent site with its own releases and video CDN.
+5. **kaa.lt** (KickAssAnime) — a second independent site, streaming from krussdomi.com's CDN.
 
-The fallbacks exist because anidb.app periodically goes offline behind a 503 maintenance page, and
-hianime.at has had outages of its own. When a provider fails, the terminal prints why and retries the
-same title and episode on the next one:
+anidb.app, the original primary provider, was removed in November 2026 after three months offline, so
+`ANI_CLI_ANIDB` no longer does anything.
+
+The fallbacks exist because hianime.at has had outages of its own. When a provider fails, the terminal
+prints why and retries the same title and episode on the next one:
 
 ```text
-anidb.app playback failed: anidb.app is down for maintenance. Trying hianime.at...
 hianime.at playback failed: hianime.at did not return a matching anime. Trying megaplay.buzz...
 megaplay.buzz Links Fetched
 ```
 
-The newer fallbacks are chosen to fail independently:
+The fallbacks are chosen to fail independently:
 
 - megaplay.buzz and zokoanime.video serve the same encodes as hianime.at, but without hianime.at's
   search, episode list, or server pages, and each streams from its own video hosts (a Cloudflare-fronted
@@ -496,7 +496,6 @@ playlist, so they keep the original URL.
 These environment variables control provider selection:
 
 ```sh
-ANI_CLI_ANIDB=0              # skip anidb.app
 ANI_CLI_HIANIME=0            # skip hianime.at
 ANI_CLI_MEGAPLAY=0           # skip megaplay.buzz
 ANI_CLI_ZOKOANIME=0          # skip zokoanime.video
@@ -510,14 +509,11 @@ ANI_CLI_STREAM_CHECK=0       # hand the first resolved stream to the player with
 ANI_CLI_HLS_FIX=0            # never rewrite a playlist, even when segments are image-wrapped
 ```
 
-Setting `ANI_CLI_ANIDB=0` is worth doing while anidb.app is in maintenance: it removes one failed round
-trip per episode. Unset it when anidb.app returns.
-
 To try one provider on its own, switch the others off. For example, this plays episode 5 through
 megaplay.buzz only:
 
 ```sh
-ANI_CLI_ANIDB=0 ANI_CLI_HIANIME=0 ANI_CLI_ZOKOANIME=0 ANI_CLI_ANIZONE=0 ANI_CLI_KICKASSANIME=0 ani-cli -e 5 frieren
+ANI_CLI_HIANIME=0 ANI_CLI_ZOKOANIME=0 ANI_CLI_ANIZONE=0 ANI_CLI_KICKASSANIME=0 ani-cli -e 5 frieren
 ```
 
 Do not use `ani-cli -U` against the `~/.local/bin/ani-cli` symlink installed by this project. The bundled script disables that direct upstream self-patcher so the hook integration, embedded-player mpv flags, and mp4 provider fixes are not overwritten. Update through AniAutoWatchList instead.

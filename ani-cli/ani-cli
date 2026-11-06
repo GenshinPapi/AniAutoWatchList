@@ -238,36 +238,6 @@ select_quality() {
     episode=$(printf "%s" "$result" | cut -d'>' -f2)
 }
 
-prefer_playable_links() {
-    _preferred_links="$(printf '%s\n' "$1" | awk '
-{
-    line = $0
-    lower = tolower(line)
-    if (lower ~ /^(subtitle|m3u8_refr)[[:space:]]*>/) {
-        print line
-        next
-    }
-    if (lower ~ /cc>/) {
-        print line
-        next
-    }
-    if (lower ~ /tools\.fast4speed\.rsvp/) {
-        print line
-        next
-    }
-    if (lower ~ /ok\.ru\/videoembed\//) {
-        print line
-        next
-    }
-    if (lower ~ />https?:\/\/[^[:space:]]+\.(mp4|m3u8)([?#][^[:space:]]*)?$/) {
-        print line
-    }
-}
-')"
-    [ -n "$_preferred_links" ] && printf '%s\n' "$_preferred_links" && return 0
-    printf '%s\n' "$1"
-}
-
 # GET $@ through curl_cffi with a real browser TLS fingerprint; 127 if unavailable, 2 on a Cloudflare
 # challenge, 3 when the host cannot be reached at all
 impersonate_curl() {
@@ -405,13 +375,6 @@ provider_status_error() {
     esac
 }
 
-anidb_curl() {
-    provider_curl "anidb.app" "$@"
-    _anidb_status=$?
-    anidb_last_error="$provider_last_error"
-    return "$_anidb_status"
-}
-
 hianime_curl() {
     provider_curl "hianime.at" "$@"
     _hianime_status=$?
@@ -428,162 +391,6 @@ provider_normalize_title() {
     printf '%s' "$1" |
         tr '[:upper:]' '[:lower:]' |
         sed 's/([^)]*)//g;s/[^[:alnum:]]/ /g;s/[[:space:]][[:space:]]*/ /g;s/^ //;s/ $//'
-}
-
-search_anidb() {
-    _anidb_query="$(provider_query_string "$1")"
-    [ -n "$_anidb_query" ] || return 1
-
-    _anidb_page="$(anidb_curl "https://anidb.app/search/suggestions?q=${_anidb_query}" -A "$anidb_agent" --max-time 15)"
-    _anidb_status=$?
-    if [ -z "$_anidb_page" ]; then
-        _anidb_page="$(anidb_curl "https://anidb.app/browse?q=${_anidb_query}" -A "$anidb_agent" --max-time 15)"
-        _anidb_status=$?
-    fi
-    if [ -z "$_anidb_page" ]; then
-        [ "$_anidb_status" -eq 2 ] && return 2
-        return 1
-    fi
-    # anidb.app answers every route with a 503 maintenance page while it is offline
-    printf '%s' "$_anidb_page" | grep -qiE '<title>[^<]*maintenance' && return 3
-
-    printf '%s' "$_anidb_page" |
-        tr '\n' ' ' |
-        sed 's/<a href/\n<a href/g' |
-        sed -nE 's|.*anime/[a-z0-9-]+-([0-9]+)".*alt="([^"]+)".*|\1	\2|p;s|.*href="/anime/[^"]*-([0-9]+)".*>([^<]+)</a>.*|\1	\2|p' |
-        sed 's/&amp;/\&/g;s/&#39;/'"'"'/g;s/&quot;/"/g' |
-        awk -F '\t' 'NF >= 2 && !seen[$1]++ { print $1 "\t" $2 }'
-}
-
-anidb_resolve_id() {
-    _anidb_title="$1"
-    [ -n "$_anidb_title" ] || _anidb_title="$allanime_title"
-    [ -n "$_anidb_title" ] || return 1
-
-    _anidb_results="$(search_anidb "$_anidb_title")"
-    _anidb_status=$?
-    if [ -z "$_anidb_results" ]; then
-        if [ "$_anidb_status" -eq 2 ]; then
-            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
-            return 2
-        elif [ "$_anidb_status" -eq 3 ]; then
-            anidb_last_error="anidb.app is down for maintenance"
-            return 3
-        else
-            anidb_last_error="anidb.app did not return a matching anime"
-            return 1
-        fi
-    fi
-
-    _anidb_want="$(provider_normalize_title "$_anidb_title")"
-    _anidb_first="$(printf '%s\n' "$_anidb_results" | head -n 1 | cut -f1)"
-    while IFS='	' read -r _anidb_id _anidb_name; do
-        [ -n "$_anidb_id" ] || continue
-        _anidb_have="$(provider_normalize_title "$_anidb_name")"
-        [ "$_anidb_have" = "$_anidb_want" ] && printf '%s' "$_anidb_id" && return 0
-    done <<EOF
-$_anidb_results
-EOF
-    [ -n "$_anidb_first" ] && printf '%s' "$_anidb_first"
-}
-
-anidb_episode_id() {
-    _anidb_ep_json="$1"
-    _anidb_ep_no="$2"
-    _anidb_python="$(ani_watch_python || true)"
-    if [ -n "$_anidb_python" ]; then
-        printf '%s' "$_anidb_ep_json" | "$_anidb_python" -c '
-import json
-import sys
-
-episode_no = sys.argv[1]
-try:
-    payload = json.load(sys.stdin)
-except Exception:
-    raise SystemExit(1)
-
-episodes = payload if isinstance(payload, list) else payload.get("episodes", [])
-if not isinstance(episodes, list):
-    raise SystemExit(1)
-
-def same_number(value, wanted):
-    return value is not None and str(value) == wanted
-
-for episode in episodes:
-    if not isinstance(episode, dict):
-        continue
-    if same_number(episode.get("number"), episode_no) or same_number(episode.get("number2"), episode_no):
-        episode_id = episode.get("id")
-        if episode_id is not None:
-            print(episode_id)
-            raise SystemExit(0)
-
-try:
-    relative_index = int(episode_no)
-except ValueError:
-    raise SystemExit(1)
-
-if relative_index < 1 or relative_index > len(episodes):
-    raise SystemExit(1)
-
-episode = episodes[relative_index - 1]
-if isinstance(episode, dict) and episode.get("id") is not None:
-    print(episode["id"])
-    raise SystemExit(0)
-
-raise SystemExit(1)
-' "$_anidb_ep_no" 2>/dev/null && return 0
-    fi
-
-    _anidb_ep_re="$(printf '%s' "$_anidb_ep_no" | sed "s/[.[\\*^\$()+?{}|]/\\\\&/g")"
-    printf '%s' "$_anidb_ep_json" |
-        tr '\n' ' ' |
-        sed 's/},{/}\n{/g' |
-        sed -nE "s|.*\"id\":([0-9]+).*\"number\":${_anidb_ep_re}([,}].*)|\1|p;s|.*\"number\":${_anidb_ep_re}([,}].*).*\"id\":([0-9]+).*|\2|p" |
-        head -n 1
-}
-
-anidb_embed_url() {
-    _anidb_lang_json="$1"
-    _anidb_lang="jpn"
-    [ "$mode" = "dub" ] && _anidb_lang="eng"
-
-    if command -v python3 >/dev/null 2>&1; then
-        printf '%s' "$_anidb_lang_json" | python3 -c '
-import json
-import sys
-
-preferred = sys.argv[1]
-try:
-    payload = json.load(sys.stdin)
-except Exception:
-    raise SystemExit(1)
-
-items = payload if isinstance(payload, list) else payload.get("languages", [])
-if not isinstance(items, list):
-    raise SystemExit(1)
-
-fallback = ""
-for item in items:
-    if not isinstance(item, dict):
-        continue
-    url = item.get("embed_url") or item.get("embedUrl") or item.get("url") or ""
-    if not url:
-        continue
-    if not fallback:
-        fallback = url
-    if item.get("code") == preferred:
-        print(url)
-        raise SystemExit(0)
-
-if fallback:
-    print(fallback)
-' "$_anidb_lang" 2>/dev/null && return 0
-    fi
-
-    _anidb_embed="$(printf '%s' "$_anidb_lang_json" | sed -nE "s|.*\"code\":\"${_anidb_lang}\".*\"embed_url\":\"([^\"]*)\".*|\1|p;s|.*\"embed_url\":\"([^\"]*)\".*\"code\":\"${_anidb_lang}\".*|\1|p" | head -n 1)"
-    [ -z "$_anidb_embed" ] && _anidb_embed="$(printf '%s' "$_anidb_lang_json" | sed -nE 's|.*"embed_url":"([^"]*)".*|\1|p' | head -n 1)"
-    printf '%s' "$_anidb_embed" | sed 's|\\/|/|g'
 }
 
 # turns an HLS master playlist into the "quality >url" lines select_quality expects. When the master
@@ -805,91 +612,7 @@ hls_attach_audio() {
     hls_lavf_flag="--demuxer-lavf-o-append=protocol_whitelist=file,crypto,data,http,https,tcp,tls"
 }
 
-anidb_fetch_episode_links() {
-    _anidb_title="${1:-$title}"
-    [ -n "$_anidb_title" ] || _anidb_title="$allanime_title"
-    [ -n "$_anidb_title" ] || return 1
-
-    _anidb_id="$(anidb_resolve_id "$_anidb_title")"
-    _anidb_status=$?
-    if [ -z "$_anidb_id" ]; then
-        if [ "$_anidb_status" -eq 2 ]; then
-            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
-        elif [ "$_anidb_status" -eq 3 ]; then
-            anidb_last_error="anidb.app is down for maintenance"
-        else
-            anidb_last_error="anidb.app did not return a matching anime"
-        fi
-        return 1
-    fi
-
-    _anidb_ep_json="$(anidb_curl "https://anidb.app/api/frontend/anime/${_anidb_id}/episodes" -A "$anidb_agent" -H "Accept: application/json" --max-time 15)"
-    _anidb_status=$?
-    if [ -z "$_anidb_ep_json" ]; then
-        if [ "$_anidb_status" -eq 2 ]; then
-            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
-        else
-            anidb_last_error="anidb.app did not return episodes for ${_anidb_title}"
-        fi
-        return 1
-    fi
-
-    _anidb_ep_id="$(anidb_episode_id "$_anidb_ep_json" "$ep_no" || true)"
-    if [ -z "$_anidb_ep_id" ]; then
-        anidb_last_error="anidb.app did not expose episode ${ep_no} for ${_anidb_title}"
-        return 1
-    fi
-
-    _anidb_lang_json="$(anidb_curl "https://anidb.app/api/frontend/episode/${_anidb_ep_id}/languages" -A "$anidb_agent" -H "Accept: application/json" --max-time 15)"
-    _anidb_status=$?
-    if [ -z "$_anidb_lang_json" ]; then
-        if [ "$_anidb_status" -eq 2 ]; then
-            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
-        else
-            anidb_last_error="anidb.app did not return streams for episode ${ep_no}"
-        fi
-        return 1
-    fi
-
-    _anidb_embed_url="$(anidb_embed_url "$_anidb_lang_json" || true)"
-    if [ -z "$_anidb_embed_url" ]; then
-        anidb_last_error="anidb.app returned no ${mode} embed for episode ${ep_no}"
-        return 1
-    fi
-
-    _anidb_embed_page="$(anidb_curl "$_anidb_embed_url" -A "$anidb_agent" --max-time 15)"
-    _anidb_status=$?
-    if [ -z "$_anidb_embed_page" ]; then
-        if [ "$_anidb_status" -eq 2 ]; then
-            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
-        else
-            anidb_last_error="anidb.app embed returned an empty response"
-        fi
-        return 1
-    fi
-
-    _anidb_m3u8="$(printf '%s' "$_anidb_embed_page" | sed -nE "s|.*file:[[:space:]]*'([^']*)'.*|\1|p;s|.*file:[[:space:]]*\"([^\"]*)\".*|\1|p" | head -n 1)"
-    _anidb_m3u8="$(printf '%s' "$_anidb_m3u8" | sed 's|\\/|/|g')"
-    if [ -z "$_anidb_m3u8" ]; then
-        anidb_last_error="anidb.app embed did not expose an HLS playlist"
-        return 1
-    fi
-
-    _anidb_m3u8_content="$(anidb_curl "$_anidb_m3u8" -A "$anidb_agent" --max-time 15)"
-    _anidb_status=$?
-    if ! printf '%s' "$_anidb_m3u8_content" | grep -q "EXTM3U"; then
-        if [ "$_anidb_status" -eq 2 ]; then
-            anidb_last_error="anidb.app returned a Cloudflare browser challenge"
-        else
-            anidb_last_error="anidb.app playlist was not valid HLS"
-        fi
-        return 1
-    fi
-
-    hls_playlist_links "$_anidb_m3u8" "$_anidb_m3u8_content"
-}
-
-# hianime.at is the playback fallback used when anidb.app cannot serve an episode.
+# hianime.at is the primary playback provider; the providers after it are fallbacks.
 # Search, the episode list, and every hook still come from the AllAnime path above;
 # only the stream links for the already selected title and episode are resolved here.
 
@@ -1840,29 +1563,6 @@ ani_watch_python() {
     command -v python3 2>/dev/null || return 1
 }
 
-# resolves the requested episode through anidb.app and selects the desired quality into $episode
-anidb_select_episode_url() {
-    unset episode links subtitle subs_flag refr_flag m3u8_refr result
-    anidb_last_error=""
-
-    anidb_links_file="$(mktemp)"
-    anidb_fetch_episode_links "$title" >"$anidb_links_file" || true
-    links="$(cat "$anidb_links_file")"
-    rm -f "$anidb_links_file"
-    [ -n "$links" ] || return 1
-
-    links="$(prefer_playable_links "$links")"
-    select_quality "$quality"
-    if [ -z "$episode" ]; then
-        anidb_last_error="anidb.app returned streams, but no playable quality matched"
-        return 1
-    fi
-    refr_flag="--referrer=https://anidb.app"
-    m3u8_refr="https://anidb.app"
-    printf "\033[1;32m%s\033[0m Links Fetched\n" "anidb.app" 1>&2
-    return 0
-}
-
 # resolves the requested episode through hianime.at and selects the desired quality into $episode
 hianime_select_episode_url() {
     unset episode links subtitle subs_flag refr_flag m3u8_refr result
@@ -2246,7 +1946,6 @@ playback_remember_stream() {
 
 playback_provider_label() {
     case "$1" in
-        anidb) printf '%s' "anidb.app" ;;
         hianime) printf '%s' "hianime.at" ;;
         megaplay) printf '%s' "megaplay.buzz" ;;
         zokoanime) printf '%s' "zokoanime.video" ;;
@@ -2258,7 +1957,6 @@ playback_provider_label() {
 
 playback_provider_enabled() {
     case "$1" in
-        anidb) [ "$anidb_enabled" = "1" ] ;;
         hianime) [ "$hianime_enabled" = "1" ] ;;
         megaplay) [ "$megaplay_enabled" = "1" ] ;;
         zokoanime) [ "$zokoanime_enabled" = "1" ] ;;
@@ -2270,7 +1968,6 @@ playback_provider_enabled() {
 
 playback_provider_error() {
     case "$1" in
-        anidb) _playback_error="$anidb_last_error" ;;
         hianime) _playback_error="$hianime_last_error" ;;
         megaplay) _playback_error="$megaplay_last_error" ;;
         zokoanime) _playback_error="$zokoanime_last_error" ;;
@@ -2285,7 +1982,6 @@ playback_provider_error() {
 get_episode_url() {
     unset episode links subtitle subs_flag refr_flag m3u8_refr result
     unset stream_player_flags stream_origin stream_referer stream_subtitle stream_audio_url stream_master_url
-    anidb_last_error=""
     hianime_last_error=""
     megaplay_last_error=""
     zokoanime_last_error=""
@@ -2612,7 +2308,6 @@ play() {
 # setup
 agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:150.0) Gecko/20100101 Firefox/150.0"
 scraper_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-anidb_agent="$scraper_agent"
 hianime_agent="$scraper_agent"
 hianime_base="${ANI_CLI_HIANIME_BASE:-https://hianime.at}"
 megaplay_agent="$scraper_agent"
@@ -2623,14 +2318,13 @@ megaplay_iv="W0;27ToaUpl_P%'c"
 zokoanime_base="${ANI_CLI_ZOKOANIME_BASE:-https://zokoanime.video}"
 kickassanime_base="${ANI_CLI_KICKASSANIME_BASE:-https://kaa.lt}"
 kickassanime_origin="https://krussdomi.com"
-anidb_enabled="${ANI_CLI_ANIDB:-1}"
 hianime_enabled="${ANI_CLI_HIANIME:-1}"
 megaplay_enabled="${ANI_CLI_MEGAPLAY:-1}"
 zokoanime_enabled="${ANI_CLI_ZOKOANIME:-1}"
 anizone_enabled="${ANI_CLI_ANIZONE:-1}"
 kickassanime_enabled="${ANI_CLI_KICKASSANIME:-1}"
-# failover order: anidb.app and hianime.at always come first
-playback_providers="anidb hianime megaplay zokoanime anizone kickassanime"
+# failover order: hianime.at first, then the fallbacks in this order
+playback_providers="hianime megaplay zokoanime anizone kickassanime"
 playback_check_enabled="${ANI_CLI_STREAM_CHECK:-1}"
 hls_fix_enabled="${ANI_CLI_HLS_FIX:-1}"
 hls_playlist_file=""
